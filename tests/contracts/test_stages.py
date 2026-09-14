@@ -10,6 +10,8 @@ spec = importlib.util.spec_from_file_location("t02_fixtures", Path(__file__).wit
 fixtures = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixtures)
 loan, completion = fixtures.loan, fixtures.completion
+settled, stock, event = fixtures.settled, fixtures.stock, fixtures.event
+from dataclasses import replace as _replace
 MANAGER, BORROWER, FORM = fixtures.MANAGER, fixtures.BORROWER, fixtures.FORM
 
 
@@ -29,7 +31,11 @@ class StageTests(unittest.TestCase):
         self.assertEqual(verify_stage(request, replace(receipt, source=None)), Outcome.UNKNOWN)
 
     def test_todo_mapping_must_match_returned_task_and_actor(self):
-        request = StageRequest(stage_operation_id(loan(), Action.ISSUE), loan(), Action.ISSUE, MANAGER)
+        current, _ = settled(loan(), event(Action.APPROVE), stock())
+        current, _ = settled(current, _replace(event(Action.RESERVE), actor=None,
+                                               evidence_kind="system"), stock())
+        request = StageRequest(stage_operation_id(current, Action.ISSUE), current,
+                               Action.ISSUE, MANAGER)
         done = completion(Action.ISSUE)
         receipt = StageReceipt(request.operation_id, Outcome.VERIFIED, done.source,
                                done.binding, "synthetic-create", "synthetic-read")

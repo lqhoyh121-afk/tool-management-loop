@@ -6,7 +6,36 @@ from uuid import NAMESPACE_URL, uuid5
 
 from .flow import Receipt, WriteIntent
 from .model import (Action, Event, Identity, IdentityBinding, Inventory, Loan,
-                    Resource, Code, Outcome, require, text)
+                    Resource, State, Code, Outcome, require, text)
+
+
+@dataclass(frozen=True)
+class LedgerScope:
+    """Stable whole-ledger location: tenant plus unambiguous parent containers.
+
+    One scope covers every item record of the ledger (multi-table ledgers keep
+    a deterministic joined container key). SingleInstance and check_binding
+    operate on this scope; the per-item record Resource stays a loan-level
+    reference and must never become the exclusivity key.
+    """
+    tenant_id: str
+    container_key: str
+
+    def __post_init__(self):
+        text(self.tenant_id)
+        text(self.container_key)
+
+    @classmethod
+    def from_record(cls, record: Resource) -> "LedgerScope":
+        require(record.kind == "record")
+        return cls(record.tenant_id, record.container_id)
+
+
+def lease_key(scope: LedgerScope) -> str:
+    """Exclusivity key contains ONLY tenant+container scope: no item record id,
+    no runtime account, no working directory. Adapters must key their machine
+    lock on this value."""
+    return f"{scope.tenant_id}::{scope.container_key}"
 
 
 @dataclass(frozen=True)
@@ -27,7 +56,7 @@ class RuntimeBinding:
 def check_binding(binding: RuntimeBinding, loan: Loan):
     require(binding.account.namespace == "contact"
             and binding.account.tenant_id == loan.ref.tenant_id, Code.IDENTITY)
-    require(binding.ledger == loan.item, Code.WRONG_LOAN)
+    require(binding.ledger == LedgerScope.from_record(loan.item), Code.WRONG_LOAN)
     require(binding.config_version == loan.config_version
             and binding.approver == loan.approver and binding.manager == loan.manager,
             Code.CONFIG)
@@ -70,6 +99,13 @@ class StageRequest:
         text(self.operation_id)
         require(self.action in (Action.APPROVE, Action.ISSUE, Action.REQUEST_RETURN,
                                 Action.RETURN, Action.CANCEL), Code.STATE)
+        required = {Action.APPROVE: State.AWAITING_APPROVAL,
+                    Action.ISSUE: State.AWAITING_ISSUE,
+                    Action.REQUEST_RETURN: State.BORROWED,
+                    Action.RETURN: State.AWAITING_RETURN,
+                    Action.CANCEL: (State.AWAITING_APPROVAL, State.RESERVATION_PENDING,
+                                    State.AWAITING_ISSUE)}[self.action]
+        require(self.loan.state in required, Code.STATE)
         expected = (self.loan.approver if self.action == Action.APPROVE else
                     self.loan.borrower if self.action == Action.REQUEST_RETURN else self.loan.manager)
         require(self.actor == expected, Code.WRONG_PERSON)
@@ -171,11 +207,12 @@ class OperationStore(Protocol):
 
 
 class SingleInstance(Protocol):
-    def acquire(self, ledger: Resource, account: Identity) -> str:
-        """Machine-wide exclusive writer, covering ALL users/processes for this ledger.
+    def acquire(self, scope: LedgerScope, account: Identity) -> str:
+        """Machine-wide exclusive writer keyed by lease_key(scope), ALL users/processes.
 
         Second instance raises SECOND_INSTANCE_BLOCKED even with a different runtime
-        directory or account. Lease held for entire running lifetime. No TTL takeover.
+        directory, account or item record view. Lease held for entire running
+        lifetime. No TTL takeover. Different scopes get independent leases.
         Startup with unresolved journal: reconcile first. Cross-machine unsupported.
         """
         ...

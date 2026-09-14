@@ -6,24 +6,37 @@ from dataclasses import replace
 
 from contracts.flow import Receipt, verify
 from contracts.model import Code, Outcome, require
-from contracts.ports import check_binding
+from contracts.ports import StageRequest, check_binding, lease_key
 
 
 class SyntheticLease:
     def __init__(self):
-        self.held = None
+        self.held = {}
 
-    def acquire(self, ledger, account):
-        require(self.held is None, Code.INSTANCE)
-        self.held = "synthetic-lease"
-        return self.held
+    def acquire(self, scope, account):
+        key = lease_key(scope)
+        require(key not in self.held, Code.INSTANCE)
+        self.held[key] = "synthetic-lease-" + key
+        return self.held[key]
 
     def assert_held(self, lease):
-        require(self.held is not None and lease == self.held, Code.INSTANCE)
+        require(lease in self.held.values(), Code.INSTANCE)
 
     def release(self, lease):
         self.assert_held(lease)
-        self.held = None
+        self.held = {key: value for key, value in self.held.items() if value != lease}
+
+
+def _intent_refs(intent):
+    """Both WriteIntent and StageRequest: (loan ref, item ref or None)."""
+    if isinstance(intent, StageRequest):
+        return intent.loan.ref, None
+    return intent.before.ref, intent.before.item
+
+
+def _resolved(receipt):
+    return receipt is not None and receipt.outcome in (
+        Outcome.VERIFIED, Outcome.NOT_APPLIED, Outcome.NOT_SENT)
 
 
 class SyntheticJournal:
@@ -34,10 +47,13 @@ class SyntheticJournal:
         if intent.operation_id in self.entries:
             require(self.entries[intent.operation_id][0] == intent, Code.OP_CONFLICT)
             return
+        new_loan_ref, new_item_ref = _intent_refs(intent)
         for old, receipt in self.entries.values():
-            if (old.before.ref == intent.before.ref or old.stock_before.ref == intent.stock_before.ref):
-                require(receipt is not None and receipt.outcome in
-                        (Outcome.VERIFIED, Outcome.NOT_APPLIED, Outcome.NOT_SENT), Code.UNKNOWN)
+            old_loan_ref, old_item_ref = _intent_refs(old)
+            shares_target = (old_loan_ref == new_loan_ref
+                             or (new_item_ref is not None and old_item_ref == new_item_ref))
+            if shares_target:
+                require(_resolved(receipt), Code.UNKNOWN)
         self.entries[intent.operation_id] = (intent, None)
 
     def load(self, operation_id):

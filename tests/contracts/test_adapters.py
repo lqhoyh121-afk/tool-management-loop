@@ -13,7 +13,7 @@ import unittest
 
 from contracts.flow import plan, verify, operation_id
 from contracts.model import Action, Code, ContractError, Outcome, State
-from contracts.ports import RuntimeBinding
+from contracts.ports import LedgerScope, RuntimeBinding
 fixture_spec = importlib.util.spec_from_file_location("t02_fixtures", Path(__file__).with_name("fixtures.py"))
 fixtures = importlib.util.module_from_spec(fixture_spec)
 fixture_spec.loader.exec_module(fixtures)
@@ -30,8 +30,9 @@ class AdapterTests(unittest.TestCase):
     def setUp(self):
         self.journal = SyntheticJournal()
         self.leases = SyntheticLease()
-        self.lease = self.leases.acquire(ITEM, MANAGER)
-        self.binding = RuntimeBinding(MANAGER, ITEM, "synthetic-config-v1", MANAGER,
+        self.lease = self.leases.acquire(LedgerScope.from_record(ITEM), MANAGER)
+        self.binding = RuntimeBinding(MANAGER, LedgerScope.from_record(ITEM),
+                                      "synthetic-config-v1", MANAGER,
                                       MANAGER, "synthetic-readback", True, True, True, True)
         self.writer = SyntheticWriter(loan(), stock(), self.journal, self.leases)
 
@@ -112,7 +113,8 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.writer.writes, 0)
 
     def test_second_instance_and_lost_lease_fail_closed(self):
-        self.blocked(Code.INSTANCE, lambda: self.leases.acquire(ITEM, BORROWER))
+        self.blocked(Code.INSTANCE, lambda: self.leases.acquire(
+            LedgerScope.from_record(ITEM), BORROWER))
         self.leases.release(self.lease)
         intent = plan(loan(), event(Action.APPROVE), stock())
         self.blocked(Code.INSTANCE, lambda: self.writer.submit(intent, self.binding, self.lease))

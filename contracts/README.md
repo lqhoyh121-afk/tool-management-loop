@@ -21,12 +21,13 @@ Python类型定义为唯一字段清单（`model.py`、`ports.py`）。存储/�
 | Identity | namespace、tenant_id、user_id | contact为通讯录；todo为待办内部ID。同字符串不同命名空间也不是同人；不得用姓名、modifierId或创建人替代实际完成者 |
 | Resource | kind、tenant_id、container_id、resource_id | kind=record/form/todo；container_id是适配器保存的完整父资源定位（多维表须含Base和表的无歧义定位），不是名称；全引用相等才同目标 |
 | IdentityBinding | contact、internal、task、creation_evidence、readback_evidence | task限定映射：保存create executors精确通讯录参数、创建响应taskId、初始唯一内部执行者及完成活动回读。不能跨task缓存套用 |
+| LedgerScope | tenant_id、container_key | 整套主账的稳定定位：租户+无歧义父容器（多表主账用确定拼接键）。RuntimeBinding.ledger与SingleInstance排他都按此scope；单条物资record Resource只是借用级引用，绝不作为排他键 |
 | Loan | ref、item、borrower、approver、manager、quantity、tracked、physical_ids、due_at、config_version | ref为原借用申请记录，item为一种工具主账记录；角色在创建配置中固定；需追踪时编号数=数量且不重复；缺编号停止待补充 |
 | Loan处理字段 | state、return_ref、consumed_events、application_evidence | 归还记录独立引用原借用；只整笔归还。consumed_events存已接受源事件键，不存扫描时间；application_evidence保存可信申请证据定位，缺失时plan拒绝推进 |
 | Inventory | ref、available/reserved/borrowed、三组对应IDs、revision | 预留从available移到reserved；借出reserved移到borrowed；归还borrowed移回available；取消只释放reserved；全组ID不能重叠 |
 | Event | action、event_id、loan_ref、source、actor、occurred_at、config_version、evidence_kind、verified、evidence_ref | 源系统可信事件；event_id须包含源资源限定，使一张借用单的不同来源间也不碰撞；必须持久稳定。evidence_ref是受保护的证据定位，不是日志里的PII；原单/阶段关联必须由适配器核验 |
 | Event附加字段 | binding、return_ref、quantity、physical_ids | 确认事件必有task身份映射；申请/归还需实际数量及编号；归还还需独立原记录引用 |
-| RuntimeBinding | account、ledger、config_version、approver、manager、evidence_ref及4个显式核验项 | 4项为普通人主账拒绝、受限入口、管理账号读写、本人确认；缺项默认False，底层每次调用check_binding |
+| RuntimeBinding | account、ledger(LedgerScope)、config_version、approver、manager、evidence_ref及4个显式核验项 | 4项为普通人主账拒绝、受限入口、管理账号读写、本人确认；缺项默认False，底层每次调用check_binding；ledger按主账scope判断，同主账不同物资记录均接受，跨主账/跨表拒绝WRONG_LOAN |
 | WriteIntent | operation_id、before/after、stock_before/stock_after、event | 原状态、预期状态及证据；只描述一动作，生成不等于写入 |
 | Receipt | operation_id、outcome、readback_evidence、loan、inventory | 完整独立回读才verified；不得只凭HTTP/CLI成功或服务端受理报成功 |
 | StageRequest/StageReceipt | operation_id、loan/action/actor；结果source/binding及创建/回读证据 | 为该原单/阶段建立受限入口或独立待办；创建同样要操作防重和回查 |
@@ -47,6 +48,18 @@ Python类型定义为唯一字段清单（`model.py`、`ports.py`）。存储/�
 | 尚未借出的三种状态 | cancel | 指定管理人在受限入口明确取消 | cancelled；有预留则reserved→available，无预留不改库存 |
 
 其余转换拒绝，包括拒绝后借出、借出后取消、没有归还申请直接确认归还。不自动超时释放。库存不足或条件冲突报RESERVATION_CONFLICT，保持reservation_pending并显式挂起；不生成写意图、不创建借出确认。读到条件变化后可重新规划尚未发送的动作，不能重写已经prepare的原意图。
+
+### 3.1 阶段入口前态约束（含StageRequest构造校验）
+
+| Action | 允许的业务前态 | 说明 |
+|---|---|---|
+| approve | awaiting_approval | 表单承载同意/拒绝 |
+| confirm_issue | awaiting_issue_confirmation | 预留成功后才允许创建借出确认；未审批/预留失败/数量不足一律不建 |
+| request_return | borrowed | 未借出不建归还申请入口 |
+| confirm_return | awaiting_return_confirmation | 无归还申请不建归还确认待办 |
+| cancel | awaiting_approval、reservation_pending、awaiting_issue_confirmation | 终态（rejected/cancelled/closed/borrowed）一律拒绝INVALID_STATE |
+
+StageRequest在构造时即校验前态与角色；阶段资源已发出不受plan状态检查追溯约束，所以入口必须前置拦截。apply阶段由T04绑定原申请入口，不经StageRequest。
 
 `plan`只返回预期。所有写入（包括拒绝/取消/审批状态）都需回读才发布新状态。`verify`核operation_id、完整Loan、库存数量/编号/目标，库存revision为新读取得到的条件令牌，不能要求新revision等于写前revision。归还回写未定保持旧业务状态 + unknown，T06此时也暂停催借用人。
 
@@ -86,6 +99,10 @@ Python类型定义为唯一字段清单（`model.py`、`ports.py`）。存储/�
 
 StageRequest的operation_id调用`stage_operation_id(loan,action)`，由原单完整引用、`create_stage`及阶段确定生成并持久保存；同原单同阶段只建一次。`verify_stage`校验创建和回读证据及TODO映射，受理不明保持unknown；首版不凭缺失查询将创建判为not_applied。approve入口同时承载同意/拒绝。ISSUE/RETURN为两个独立task，StageReceipt需要task限定IdentityBinding；表单无需todo绑定。confirmed来源须与已持久的阶段绑定一致。建立阶段入口不会推进业务状态。申请原入口由T04绑定，T03读取已有申请；不创建第二份借用申请来“导入”。
 
+### 5.1 排他与主账范围
+
+`SingleInstance.acquire(scope, account)`以`lease_key(scope)=tenant_id::container_key`为唯一排他键：不含物资recordId、运行账号或工作目录。同主账另一物资记录、另一账号、另一目录的第二个实例同样被拒；不同主账scope互不阻塞，各持独立lease。`OperationStore`同时接受WriteIntent和StageRequest：按原单引用（及写意图的物资引用）拦截未决冲突，混合阶段/业务意图同样受检，不能只支持一种。SyntheticJournal是合成参考实现。
+
 ## 6. 提醒与配置：主控一次确认项
 
 **建议，尚未启用：**Asia/Shanghai每天09:00，启动晚于09:00则只补当天一次；不补历史日、不补已错过的提前一天提醒。到期日不算逾期，次日起每天一次。提前提醒键=`原单+before_due+预计归还业务日期`；逾期键=`原单+overdue+当天业务日期`。只在borrowed发送，待归还确认立即暂停，不催管理人。发送unknown按原键回查，不能换日期键绕过同单尚未厘清的发送。
@@ -98,7 +115,7 @@ StageRequest的operation_id调用`stage_operation_id(loan,action)`，由原单�
 
 ```text
 python -B -m unittest discover -s tests/contracts -p "test_*.py" -v
-python -B -m unittest discover -s tests -p "test_*.py" -v
+python -B scripts/repo_checks.py
 python -B scripts/repo_guard.py
 python -B scripts/repo_guard.py --staged
 git diff --check

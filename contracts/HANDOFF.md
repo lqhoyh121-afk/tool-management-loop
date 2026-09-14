@@ -20,6 +20,9 @@ Refs #2
 | 写入意图 | 稳定operation_id、原态与期望态、库存前后值、源事件；不同负载不得复用同ID；未知先查，部分成功不重放整笔 |
 | 注入接口 | ReadPort、WritePort、StagePort、OperationStore、SingleInstance；RuntimeBinding每次底层写核验 |
 | 纯函数 | accept_application、plan、verify、operation_id、check_binding、stage_operation_id、verify_stage、business_date |
+| 主账范围 | LedgerScope(tenant+container_key)；check_binding按主账scope判断，同主账不同物资接受、跨主账/表拒绝；lease_key仅由scope构成，不含物资recordId/账号/目录 |
+| 阶段前态 | StageRequest构造即校验：approve→awaiting_approval、confirm_issue→awaiting_issue_confirmation、request_return→borrowed、confirm_return→awaiting_return_confirmation、cancel→三种未借出态；终态一律INVALID_STATE |
+| 混合意图 | OperationStore.prepare/load同时支持WriteIntent与StageRequest；按原单引用及物资引用拦未决冲突，SyntheticJournal为合成参考 |
 | 规则边界 | VERSION=0.1.0，RULE_COVERAGE=not_covered，来源可引用；无制度规则引擎或合规结论 |
 
 字段和每个错误/恢复规则详见[contracts/README.md](README.md)，类型定义见model.py、flow.py、ports.py。
@@ -30,8 +33,8 @@ Refs #2
 
 | 命令 | 实际结果 |
 |---|---|
-| `python -B -m unittest discover -s tests/contracts -p "test_*.py" -v` | 42项通过，0失败/错误/跳过；含纯规则与合成接口集成 |
-| `python -B -m unittest discover -s tests -p "test_*.py" -v` | 39项通过，0失败/错误/跳过；原bootstrap和guard回归，与上一行分别统计 |
+| `python -B -m unittest discover -s tests/contracts -p "test_*.py" -v` | 51项通过，0失败/错误/跳过；含审查修正回归（test_review_fixes.py 9项） |
+| `python -B scripts/repo_checks.py`（统一入口） | 232项通过，0失败/错误/跳过；含契约、bootstrap、integrations、T09自测 |
 | `python -B scripts/repo_guard.py` | 通过；最终文件纳入索引后再跑 |
 | `python -B scripts/repo_guard.py --staged` | 通过；覆盖本卡新增文件，不只扫描旧tracked内容 |
 | `git diff --check`、`git diff --cached --check` | 通过 |
@@ -44,13 +47,23 @@ L1：纯契约与失败边界。L2：注入合成writer/journal/lease的整链�
 
 ## 自查与改动边界
 
+### 主控审查三处修正（2026-09-14）
+
+依据PR #15主控双轴审查（基线61b0be1）逐项修正，均先写失败测试再实现：
+
+1. **Spec1阶段前态（P1）**：StageRequest.__post_init__新增允许前态表；未审批/未预留不建借出确认、未借出不建归还入口、无归还申请不建归还确认、终态一律拒绝。审查点名的test_stages未审批正例已改为先走到awaiting_issue_confirmation。回归：test_review_fixes.py中5项前态测试。
+2. **Spec2整账/单条混淆（P1）**：新增LedgerScope(tenant_id, container_key)与lease_key()；RuntimeBinding.ledger改为LedgerScope，check_binding按from_record(loan.item)比对；SingleInstance.acquire改收scope。同主账不同物资记录接受、同租户不同表拒绝WRONG_LOAN、lease_key不含物资recordId/账号/目录、同scope第二实例拒绝且不同scope独立lease均有测试。
+3. **Spec3混合意图（P2）**：SyntheticJournal经_intent_refs同时支持StageRequest与WriteIntent，按原单引用+物资引用拦未决冲突；阶段意图prepare/load/保存回执、UNKNOWN挂起、verified后放行均有测试。审查的AttributeError复现路径已覆盖。
+
+波及更新：test_adapters/test_guards旧用ITEM作ledger处改传LedgerScope.from_record(ITEM)；无行为变化。contracts/README.md新增3.1阶段前态表、5.1排他与主账范围节。未改T09文件、CI、依赖清单或业务模块；未实现OS锁/数据库/多机事务。
+
 ### PR测试发现兼容性补充
 
 首轮PR #15的合并预览CI运行`34823265475`失败；分支原基线检查通过不代表合并预览通过。主分支已合入T09的新发现器，按独立模块名加载测试，本卡最初依赖`from test_flow`/`from synthetic`的兄弟模块导入未被加载环境支持，导致本卡测试未完整发现。
 
 修复仅在tests/contracts/：共享合成数据移到fixtures.py，测试按自身文件位置显式加载fixture和synthetic，不依赖发现器模块名、当前工作目录或改全局sys.path。不改任何T09脚本/CI，也不合并main进指定任务分支。独立子进程仅在自己的测试进程中配置fixture搜索路径。
 
-已再次跑42项契约通过；只读加载`61b0be10dde05d436092b1f71e0344c61d7e87b1:scripts/repo_checks.py`的run_tests，对本分支文件进行发现兼容性探针，81项通过（42契约+39原回归），无加载问题。该探针不是将T09文件写入本分支；最终远程PR检查以最新head为准，不能引用旧失败运行冒充通过。
+已再次跑42项契约通过；只读加载`61b0be10dde05d436092b1f71e0344c61d7e87b1:scripts/repo_checks.py`的run_tests，对本分支文件进行发现兼容性探针，81项通过（42契约+39原回归），无加载问题。本轮按审查要求正常merge最新main（61b0be1）后统一入口实跑232项通过。该探针不是将T09文件写入本分支；最终远程PR检查以最新head为准，不能引用旧失败运行冒充通过。
 
 - Standards自查：仅contracts/、tests/contracts/、SPEC.md、design.md、tickets.md；标准库、无个人署名/路径/凭据/真实数据。备份保留为忽略的.bak，不进入提交。未改CI、检查脚本、依赖、bootstrap或他人模块。
 - Spec自查：单机单账号单主账；真实身份/明确决定/确认/整笔归还/回读不可省；未知写入不推进。宽范围首版闸门已移入延期，T01历史事实未删、完整L4未写通过。

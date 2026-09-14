@@ -7,7 +7,7 @@ from datetime import timedelta
 
 from contracts.flow import accept_application, plan, verify, Receipt
 from contracts.model import Action, Code, ContractError, Outcome, State, business_date
-from contracts.ports import RuntimeBinding, check_binding
+from contracts.ports import LedgerScope, RuntimeBinding, check_binding
 spec = importlib.util.spec_from_file_location("t02_fixtures", Path(__file__).with_name("fixtures.py"))
 fixtures = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixtures)
@@ -171,7 +171,8 @@ class GuardTests(unittest.TestCase):
                      config_version="synthetic-config-v2"), stock()))
 
     def test_binding_is_fail_closed_and_roles_are_pinned(self):
-        binding = RuntimeBinding(MANAGER, ITEM, "synthetic-config-v1", MANAGER, MANAGER,
+        binding = RuntimeBinding(MANAGER, LedgerScope.from_record(ITEM),
+                                 "synthetic-config-v1", MANAGER, MANAGER,
                                  "synthetic-binding-readback", True, True, True, True)
         check_binding(binding, loan())
         self.blocked(Code.CONFIG, lambda: check_binding(replace(binding, manager=BORROWER), loan()))
