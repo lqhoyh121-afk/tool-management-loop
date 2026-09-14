@@ -48,7 +48,7 @@ python scripts/repo_guard.py
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-测试用临时目录生成合成 HTML / xlsx，运行后删除，不提交真实台账或二进制夹具。
+测试用临时目录生成合成 HTML / xlsx，运行后删除，不提交真实台账或二进制夹具。`tests/test_bootstrap_suite.py` 把 `tests/bootstrap` 下的用例交给默认 `python -m unittest discover -s tests -p "test_*.py" -v`，避免嵌套 discover 在 Python 3.11 下改写搜索根目录。
 
 ## 等待项
 
