@@ -1,0 +1,140 @@
+{
+  "_warning": "全部为合成样例，不是真实业务数据。标识、数量、时间、选项文案均为占位值；真实资源 ID、人员、台账内容不进入本仓库。",
+  "_scope": "只覆盖公开报告 docs/evidence/T01-HANDOFF.md 与 docs/evidence/T01-FOLLOWUP.md 中逐条写明的返回形态。报告未记录的形态不在此编造。",
+  "samples": {
+    "record_query_single_page": {
+      "_synthetic": true,
+      "_source": "docs/evidence/T01-HANDOFF.md · 实际接口及字段形态 · record query",
+      "_observed": "data.records[].recordId 与 cells[fieldId]；creator 为 [{corpId,userId}]；number 本次回读为字符串；date 为带时区 ISO 字符串；singleSelect 为 {id,name}",
+      "payload": {
+        "success": true,
+        "data": {
+          "records": [
+            {
+              "recordId": "SYNTHETIC-record-0001",
+              "cells": {
+                "fldSYN0001": [{"corpId": "SYNTHETIC-corp-0001", "userId": "SYNTHETIC-contact-applicant"}],
+                "fldSYN0002": "2",
+                "fldSYN0003": "2026-09-14T18:00:00+08:00",
+                "fldSYN0004": {"id": "SYNTHETIC-option-01", "name": "合成选项甲"},
+                "fldSYN0005": "SYNTHETIC-free-text"
+              }
+            }
+          ],
+          "hasMore": false
+        }
+      }
+    },
+    "record_query_all_pages": {
+      "_synthetic": true,
+      "_source": "docs/evidence/T01-HANDOFF.md · record query --all",
+      "_observed": "有数据时是顶层 records，不在 data 下",
+      "payload": {
+        "success": true,
+        "records": [
+          {
+            "recordId": "SYNTHETIC-record-0002",
+            "cells": {
+              "fldSYN0002": "1"
+            }
+          }
+        ],
+        "hasMore": false,
+        "pages": 1
+      }
+    },
+    "record_query_empty_all": {
+      "_synthetic": true,
+      "_source": "docs/evidence/T01-HANDOFF.md · record query --all 空表",
+      "_observed": "空表曾返回 records:null, hasMore:false, pages:1；须当空结果而不是异常",
+      "payload": {
+        "success": true,
+        "records": null,
+        "hasMore": false,
+        "pages": 1
+      }
+    },
+    "base_not_found_business_error": {
+      "_synthetic": true,
+      "_source": "docs/evidence/T01-HANDOFF.md · 清理与恢复",
+      "_observed": "Base 不存在时顶层 success:true，同时 status:error 且 error.code=BASE_NOT_FOUND",
+      "payload": {
+        "success": true,
+        "status": "error",
+        "error": {
+          "code": "BASE_NOT_FOUND",
+          "message": "SYNTHETIC-message"
+        }
+      }
+    },
+    "todo_detail_open": {
+      "_synthetic": true,
+      "_source": "docs/evidence/T01-FOLLOWUP.md · 专用待办初始精确回读",
+      "_observed": "result.todoDetailModel；executorIds 为待办内部人员 ID；未完成时 isDone 为 false 且无完成活动",
+      "payload": {
+        "success": true,
+        "result": {
+          "todoDetailModel": {
+            "taskId": "SYNTHETIC-task-0001",
+            "isDone": false,
+            "executorIds": ["SYNTHETIC-todo-manager"],
+            "activities": []
+          }
+        }
+      }
+    },
+    "todo_detail_done_cross_creator": {
+      "_synthetic": true,
+      "_source": "docs/evidence/T01-FOLLOWUP.md · 跨创建者完成身份",
+      "_observed": "完成后新增 task.self.done 与 task.done；两事件 creatorId 等于唯一执行者内部 ID，且不同于创建人内部 ID；完成时间在 finishTime",
+      "payload": {
+        "success": true,
+        "result": {
+          "todoDetailModel": {
+            "taskId": "SYNTHETIC-task-0002",
+            "isDone": true,
+            "creatorId": "SYNTHETIC-todo-creator",
+            "modifierId": "SYNTHETIC-todo-creator",
+            "executorIds": ["SYNTHETIC-todo-executor"],
+            "finishTime": "2026-09-14T17:30:00+08:00",
+            "activities": [
+              {
+                "activityId": "SYNTHETIC-activity-0001",
+                "action": "task.self.done",
+                "creatorId": "SYNTHETIC-todo-executor"
+              },
+              {
+                "activityId": "SYNTHETIC-activity-0002",
+                "action": "task.done",
+                "creatorId": "SYNTHETIC-todo-executor"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "todo_detail_done_without_activity": {
+      "_synthetic": true,
+      "_source": "docs/evidence/T01-HANDOFF.md · 实际完成者",
+      "_observed": "报告要求不只依赖执行人或 modifierId；本例构造 isDone=true 但没有完成活动，用于验证不据此认定完成者",
+      "payload": {
+        "success": true,
+        "result": {
+          "todoDetailModel": {
+            "taskId": "SYNTHETIC-task-0003",
+            "isDone": true,
+            "modifierId": "SYNTHETIC-todo-manager",
+            "executorIds": ["SYNTHETIC-todo-manager"],
+            "activities": [
+              {
+                "activityId": "SYNTHETIC-activity-0003",
+                "action": "task.comment",
+                "creatorId": "SYNTHETIC-todo-manager"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
