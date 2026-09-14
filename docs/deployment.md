@@ -26,14 +26,30 @@ python -m bootstrap --preview 路径/到/合成文件.xls
 
 失败时窗口保持打开并打印原因，避免双击后立即闪退。
 
+`--require-ready` 表示环境检查存在**未通过**项时，拒绝预览和交互菜单。`--preview` 也会受该开关约束。钉钉授权等**待确认**项不是未通过，也不表示业务就绪。
+
 ## 本阶段会做什么
 
 - 检查 Windows、Python 3.11+、文件选择能力。
 - 对未冻结项显示「待确认」，包括钉钉授权、人员路由、台账映射和就绪闸门。
 - 使用系统文件选择框选取文件；也可在测试中注入选择结果。
 - 识别 Excel 工作簿（xlsx 容器）和 HTML 内容的 xls，展示工作表名、原始表头和原始单元格。
+- HTML 合并单元格按行列坐标展开；被覆盖格子留空，不复制原值、不猜填业务字段。
+- 预览前限制文件大小、ZIP 声明解压规模和行列窗口（50×32）；窗外稀疏单元格不展开为稠密大表。
 - 识别二进制 .xls（OLE），但不在未批准第三方库的情况下编造单元格。
 - 支持含中文或空格的路径。取消选择、空文件、格式不符和解析失败会显示错误，不修改源文件。
+
+## 本机文件选择核验（脱敏）
+
+在协作者 Windows 上针对当前分支做了真实对话框核验，不连接钉钉、不读正式台账。
+
+1. `python -m bootstrap`（与 `bootstrap/start.bat` 同一前台入口）打开系统文件选择框。
+2. 第一次选择后取消，向导显示取消且未写入。
+3. 再次打开对话框，选中仅含合成表头 `ColA/ColB` 的临时文件，文件名含中文与空格；预览出现原始表头和单元格，公开输出只有文件名，不含个人目录。
+4. 选择错误/取消路径可见；结束后对照进程列表，无新增遗留 `python.exe`。
+5. 另用 `bootstrap/start.bat` 确认双击入口也会弹出同一标题的真实对话框。
+
+此核验证明真实文件选择框可用，不等于 T07 主控部署或 L4 钉钉验收。
 
 ## 本阶段不会做什么
 
@@ -48,7 +64,7 @@ python scripts/repo_guard.py
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-测试用临时目录生成合成 HTML / xlsx，运行后删除，不提交真实台账或二进制夹具。`tests/test_bootstrap_suite.py` 把 `tests/bootstrap` 下的用例交给默认 `python -m unittest discover -s tests -p "test_*.py" -v`，避免嵌套 discover 在 Python 3.11 下改写搜索根目录。
+测试用临时目录生成合成 HTML / xlsx，运行后删除，不提交真实台账或二进制夹具。`tests/test_bootstrap_suite.py` 把 `tests/bootstrap` 下的用例交给默认 `python -m unittest discover -s tests -p "test_*.py" -v`，避免嵌套 discover 在 Python 3.11 下改写搜索根目录。该适配器仅用于阶段发现；T09 若统一测试入口，应复用或替换此单文件，避免 bootstrap 测试被跑两遍或漏跑。
 
 ## 等待项
 

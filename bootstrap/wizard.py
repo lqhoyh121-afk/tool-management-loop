@@ -41,11 +41,11 @@ def _run(args, in_stream, out_stream, picker, environ_kwargs):
     _write(out_stream, format_report(items))
     if parsed.check_env:
         return 1 if has_blocking_failure(items) else 0
+    if parsed.require_ready and has_blocking_failure(items):
+        _write(out_stream, '环境未通过，停止后续操作。不会自动安装软件或修改系统。待确认项不是未通过，也不表示业务就绪。')
+        return 1
     if parsed.preview:
         return _preview_path(parsed.preview, out_stream)
-    if has_blocking_failure(items) and parsed.require_ready:
-        _write(out_stream, '环境未通过，停止后续操作。不会自动安装软件或修改系统。')
-        return 1
     return _interactive(in_stream, out_stream, picker)
 
 
@@ -53,7 +53,11 @@ def _parse_args(args):
     parser = argparse.ArgumentParser(add_help=True, description='工器具借还部署向导阶段入口')
     parser.add_argument('--check-env', action='store_true', help='只打印环境检查后退出')
     parser.add_argument('--preview', metavar='FILE', help='预览指定文件，不弹出选择框')
-    parser.add_argument('--require-ready', action='store_true', help='环境失败时拒绝进入菜单')
+    parser.add_argument(
+        '--require-ready',
+        action='store_true',
+        help='环境检查存在未通过项时，拒绝预览和交互菜单。待确认项不视为未通过，也不表示业务就绪。',
+    )
     return parser.parse_args(args)
 
 

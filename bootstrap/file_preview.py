@@ -6,12 +6,21 @@ from xml.etree import ElementTree as ET
 import zipfile
 
 
+MAX_FILE_BYTES = 8 * 1024 * 1024
+MAX_SNIFF_BYTES = 8192
+MAX_ZIP_MEMBERS = 80
+MAX_ZIP_MEMBER_BYTES = 2 * 1024 * 1024
+MAX_ZIP_TOTAL_UNCOMPRESSED = 8 * 1024 * 1024
 MAX_PREVIEW_ROWS = 50
+MAX_PREVIEW_COLS = 32
+MAX_EXCEL_ROW = 1_048_576
+MAX_EXCEL_COL = 16_384
 OLE_MAGIC = b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'
 ZIP_MAGIC = b'PK'
 SSML = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 PKGREL = '{http://schemas.openxmlformats.org/package/2006/relationships}'
 ODREL = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+MERGED_COVER = ''
 
 
 class PreviewError(Exception):
@@ -26,6 +35,7 @@ class SheetPreview:
     headers: list
     rows: list
     truncated: bool = False
+    merges: list = field(default_factory=list)
 
 
 @dataclass
@@ -40,20 +50,29 @@ def preview_workbook(path):
     target = Path(path)
     if not target.exists() or not target.is_file():
         raise PreviewError('未找到所选文件，或选择已取消。')
-    data = target.read_bytes()
-    kind = detect_kind(data)
+    size = target.stat().st_size
+    if size == 0:
+        raise PreviewError('文件是空的，没有可预览的工作表。')
+    if size > MAX_FILE_BYTES:
+        raise PreviewError(f'文件过大（{size} 字节），超过预览上限 {MAX_FILE_BYTES} 字节，未解析。')
+    with target.open('rb') as handle:
+        head = handle.read(MAX_SNIFF_BYTES)
+    kind = detect_kind(head)
     if kind == 'empty':
         raise PreviewError('文件是空的，没有可预览的工作表。')
     if kind == 'html_table':
+        data = target.read_bytes()
         sheets = _preview_html(data)
         if not sheets:
             raise PreviewError('已识别为 HTML 表格文件，但没有可读取的表格。')
-        return WorkbookPreview(kind=kind, sheets=sheets, source_name=target.name)
+        warning = _merge_warning(sheets)
+        return WorkbookPreview(kind=kind, sheets=sheets, source_name=target.name, warning=warning)
     if kind == 'xlsx':
         sheets = _preview_xlsx(target)
         if not sheets:
             raise PreviewError('已识别为 Excel 工作簿，但没有可读取的工作表。')
-        return WorkbookPreview(kind=kind, sheets=sheets, source_name=target.name)
+        warning = _merge_warning(sheets)
+        return WorkbookPreview(kind=kind, sheets=sheets, source_name=target.name, warning=warning)
     if kind == 'xls_ole':
         return WorkbookPreview(
             kind=kind,
@@ -70,20 +89,10 @@ def detect_kind(data):
     if data.startswith(OLE_MAGIC):
         return 'xls_ole'
     if data.startswith(ZIP_MAGIC):
-        return 'xlsx' if _looks_like_xlsx(data) else 'unsupported'
+        return 'xlsx'
     if _looks_like_html(data):
         return 'html_table'
     return 'unsupported'
-
-
-def _looks_like_xlsx(data):
-    try:
-        from io import BytesIO
-        with zipfile.ZipFile(BytesIO(data)) as archive:
-            names = set(archive.namelist())
-    except zipfile.BadZipFile:
-        return False
-    return 'xl/workbook.xml' in names or '[Content_Types].xml' in names
 
 
 def _looks_like_html(data):
@@ -113,43 +122,90 @@ def _decode_text(data):
     return data.decode('utf-8', errors='replace')
 
 
+def _span_value(attrs, name):
+    raw = dict(attrs).get(name, '1')
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 1
+    if value < 1:
+        return 1
+    return value
+
+
 class _TableCollector(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.tables = []
-        self._table = None
-        self._row = None
-        self._cell = None
+        self._grid = None
+        self._occupied = None
+        self._merges = None
+        self._row = 0
+        self._col = 1
+        self._pending = None
         self._parts = []
+        self._truncated = False
 
     def handle_starttag(self, tag, attrs):
         name = tag.lower()
         if name == 'table':
-            self._table = []
-        elif name == 'tr' and self._table is not None:
-            self._row = []
-        elif name in {'td', 'th'} and self._row is not None:
-            self._cell = True
+            self._grid = {}
+            self._occupied = set()
+            self._merges = []
+            self._row = 0
+            self._truncated = False
+        elif name == 'tr' and self._grid is not None:
+            self._row += 1
+            self._col = 1
+        elif name in {'td', 'th'} and self._grid is not None and self._row:
+            rowspan = _span_value(attrs, 'rowspan')
+            colspan = _span_value(attrs, 'colspan')
+            while (self._row, self._col) in self._occupied:
+                self._col += 1
+            self._pending = (self._row, self._col, rowspan, colspan)
             self._parts = []
 
     def handle_endtag(self, tag):
         name = tag.lower()
-        if name in {'td', 'th'} and self._cell:
-            self._row.append(''.join(self._parts).strip())
-            self._cell = False
+        if name in {'td', 'th'} and self._pending is not None:
+            row, col, rowspan, colspan = self._pending
+            text = ''.join(self._parts).strip()
+            self._place_cell(row, col, rowspan, colspan, text)
+            self._col = col + min(colspan, MAX_PREVIEW_COLS)
+            self._pending = None
             self._parts = []
-        elif name == 'tr' and self._row is not None:
-            if any(cell != '' for cell in self._row):
-                self._table.append(self._row)
-            self._row = None
-        elif name == 'table' and self._table is not None:
-            if self._table:
-                self.tables.append(self._table)
-            self._table = None
+        elif name == 'table' and self._grid is not None:
+            self.tables.append({
+                'grid': self._grid,
+                'merges': self._merges,
+                'truncated': self._truncated,
+            })
+            self._grid = None
+            self._occupied = None
+            self._merges = None
 
     def handle_data(self, data):
-        if self._cell:
+        if self._pending is not None:
             self._parts.append(data)
+
+    def _place_cell(self, row, col, rowspan, colspan, text):
+        if row > MAX_EXCEL_ROW or col > MAX_EXCEL_COL:
+            raise PreviewError(f'HTML 表格坐标超出上限：row={row}, col={col}。')
+        if row > MAX_PREVIEW_ROWS or col > MAX_PREVIEW_COLS:
+            self._truncated = True
+            return
+        row_span = min(rowspan, MAX_PREVIEW_ROWS - row + 1)
+        col_span = min(colspan, MAX_PREVIEW_COLS - col + 1)
+        if rowspan > row_span or colspan > col_span:
+            self._truncated = True
+        self._grid[(row, col)] = text
+        if row_span > 1 or col_span > 1:
+            self._merges.append({'row': row, 'col': col, 'rowspan': rowspan, 'colspan': colspan, 'text': text})
+        for rr in range(row, row + row_span):
+            for cc in range(col, col + col_span):
+                self._occupied.add((rr, cc))
+                if (rr, cc) != (row, col):
+                    self._grid.setdefault((rr, cc), MERGED_COVER)
 
 
 def _preview_html(data):
@@ -157,35 +213,37 @@ def _preview_html(data):
     try:
         parser.feed(_decode_text(data))
         parser.close()
+    except PreviewError:
+        raise
     except Exception as exc:
         raise PreviewError(f'HTML 表格解析失败：{exc}') from exc
     sheets = []
     for index, table in enumerate(parser.tables, start=1):
-        sheets.append(_sheet_from_rows(f'table-{index}', table))
-    return sheets
+        sheets.append(_sheet_from_grid(f'table-{index}', table['grid'], table['merges'], table['truncated']))
+    return [sheet for sheet in sheets if sheet.headers or sheet.rows or sheet.merges]
 
 
-def _sheet_from_rows(name, rows):
-    truncated = len(rows) > MAX_PREVIEW_ROWS
-    visible = rows[:MAX_PREVIEW_ROWS]
-    headers = list(visible[0]) if visible else []
-    body = [list(row) for row in visible[1:]] if len(visible) > 1 else []
-    width = max((len(row) for row in visible), default=0)
-    headers = _pad(headers, width)
-    body = [_pad(row, width) for row in body]
-    return SheetPreview(name=name, headers=headers, rows=body, truncated=truncated)
-
-
-def _pad(row, width):
-    values = list(row)
-    if len(values) < width:
-        values.extend([''] * (width - len(values)))
-    return values[:width]
+def _sheet_from_grid(name, grid, merges, truncated):
+    if not grid:
+        return SheetPreview(name=name, headers=[], rows=[], truncated=truncated, merges=merges)
+    max_row = min(max(row for row, _col in grid), MAX_PREVIEW_ROWS)
+    max_col = min(max(col for _row, col in grid), MAX_PREVIEW_COLS)
+    if any(row > MAX_PREVIEW_ROWS or col > MAX_PREVIEW_COLS for row, col in grid):
+        truncated = True
+    matrix = []
+    for row in range(1, max_row + 1):
+        matrix.append([grid.get((row, col), '') for col in range(1, max_col + 1)])
+    headers = list(matrix[0]) if matrix else []
+    body = [list(row) for row in matrix[1:]]
+    return SheetPreview(name=name, headers=headers, rows=body, truncated=truncated, merges=list(merges))
 
 
 def _preview_xlsx(path):
     try:
         with zipfile.ZipFile(path) as archive:
+            _assert_zip_budget(archive)
+            if 'xl/workbook.xml' not in archive.namelist() and '[Content_Types].xml' not in archive.namelist():
+                raise PreviewError('ZIP 容器不是可识别的 Excel 工作簿。')
             workbook = _read_xml(archive, 'xl/workbook.xml')
             rels = _read_xml(archive, 'xl/_rels/workbook.xml.rels')
             shared = _shared_strings(archive)
@@ -199,8 +257,7 @@ def _preview_xlsx(path):
                 sheet_nodes = workbook.findall(f'.//{SSML}sheet')
             if not sheet_nodes:
                 if 'xl/worksheets/sheet1.xml' in archive.namelist():
-                    rows = _xlsx_sheet_rows(archive, 'xl/worksheets/sheet1.xml', shared)
-                    return [_sheet_from_rows('Sheet1', rows)]
+                    return [_xlsx_sheet_preview(archive, 'Sheet1', 'xl/worksheets/sheet1.xml', shared)]
                 return []
             for node in sheet_nodes:
                 name = node.attrib.get('name') or 'Sheet'
@@ -211,8 +268,7 @@ def _preview_xlsx(path):
                 member = target if target.startswith('xl/') else 'xl/' + target.lstrip('/')
                 if member.startswith('xl/xl/'):
                     member = member[3:]
-                rows = _xlsx_sheet_rows(archive, member, shared)
-                sheets.append(_sheet_from_rows(name, rows))
+                sheets.append(_xlsx_sheet_preview(archive, name, member, shared))
             return sheets
     except zipfile.BadZipFile as exc:
         raise PreviewError(f'Excel 工作簿无法打开：{exc}') from exc
@@ -222,9 +278,27 @@ def _preview_xlsx(path):
         raise PreviewError(f'Excel 工作簿解析失败：{exc}') from exc
 
 
+def _assert_zip_budget(archive):
+    infos = archive.infolist()
+    if len(infos) > MAX_ZIP_MEMBERS:
+        raise PreviewError(f'压缩成员过多（{len(infos)}），超过预览上限 {MAX_ZIP_MEMBERS}。')
+    total = 0
+    for info in infos:
+        if info.file_size > MAX_ZIP_MEMBER_BYTES:
+            raise PreviewError(
+                f'压缩成员 {info.filename} 声明解压后 {info.file_size} 字节，超过预览上限 {MAX_ZIP_MEMBER_BYTES} 字节。'
+            )
+        total += info.file_size
+        if total > MAX_ZIP_TOTAL_UNCOMPRESSED:
+            raise PreviewError(f'ZIP 声明解压总量 {total} 字节，超过预览上限 {MAX_ZIP_TOTAL_UNCOMPRESSED} 字节。')
+
+
 def _read_xml(archive, name):
     if name not in archive.namelist():
         return None
+    info = archive.getinfo(name)
+    if info.file_size > MAX_ZIP_MEMBER_BYTES:
+        raise PreviewError(f'压缩成员 {name} 过大，未展开。')
     return ET.fromstring(archive.read(name))
 
 
@@ -239,27 +313,24 @@ def _shared_strings(archive):
     return values
 
 
-def _xlsx_sheet_rows(archive, member, shared):
+def _xlsx_sheet_preview(archive, name, member, shared):
     root = _read_xml(archive, member)
     if root is None:
-        return []
+        return SheetPreview(name=name, headers=[], rows=[])
     grid = {}
-    max_row = 0
-    max_col = 0
+    truncated = False
     for cell in root.findall(f'.//{SSML}c'):
         ref = cell.attrib.get('r')
         if not ref:
             continue
         row_idx, col_idx = _a1_to_row_col(ref)
+        if row_idx > MAX_EXCEL_ROW or col_idx > MAX_EXCEL_COL:
+            raise PreviewError(f'单元格坐标超出上限：{ref}。')
+        if row_idx > MAX_PREVIEW_ROWS or col_idx > MAX_PREVIEW_COLS:
+            truncated = True
+            continue
         grid[(row_idx, col_idx)] = _cell_text(cell, shared)
-        max_row = max(max_row, row_idx)
-        max_col = max(max_col, col_idx)
-    rows = []
-    for row_idx in range(1, max_row + 1):
-        rows.append([grid.get((row_idx, col_idx), '') for col_idx in range(1, max_col + 1)])
-    while rows and not any(cell != '' for cell in rows[-1]):
-        rows.pop()
-    return rows
+    return _sheet_from_grid(name, grid, [], truncated)
 
 
 def _cell_text(cell, shared):
@@ -290,6 +361,14 @@ def _a1_to_row_col(ref):
     return int(digits or '1'), col
 
 
+def _merge_warning(sheets):
+    if any(sheet.merges for sheet in sheets):
+        return '表格含合并单元格，已按行列坐标展开；被合并覆盖的格子留空，不复制原值，也不猜填业务字段。'
+    if any(sheet.truncated for sheet in sheets):
+        return f'仅保留预览窗口内的单元格（最多 {MAX_PREVIEW_ROWS} 行 × {MAX_PREVIEW_COLS} 列），窗外坐标未展开为稠密表。'
+    return ''
+
+
 def format_preview(preview):
     lines = [
         f'文件: {preview.source_name}',
@@ -310,9 +389,17 @@ def format_preview(preview):
             lines.append('原始单元格:')
             for row in sheet.rows:
                 lines.append('  ' + _join_cells(row))
+        if sheet.merges:
+            lines.append('合并区: ' + '; '.join(_format_merge(item) for item in sheet.merges))
         if sheet.truncated:
-            lines.append(f'仅预览前 {MAX_PREVIEW_ROWS} 行，其余未读取为业务数据。')
+            lines.append(
+                f'仅预览窗口内 {MAX_PREVIEW_ROWS} 行 × {MAX_PREVIEW_COLS} 列；窗外或超限内容未分配稠密矩阵。'
+            )
     return '\n'.join(lines)
+
+
+def _format_merge(item):
+    return f"r{item['row']}c{item['col']} {item['rowspan']}x{item['colspan']}"
 
 
 def _kind_label(kind):

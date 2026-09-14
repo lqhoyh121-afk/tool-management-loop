@@ -64,6 +64,52 @@ def write_xlsx(path, sheet_name, rows):
         archive.writestr('xl/sharedStrings.xml', ''.join(sst))
 
 
+def write_xlsx_sparse(path, sheet_name, cells):
+    strings = []
+    index = {}
+    for row_idx, col_idx, value in cells:
+        if value not in index:
+            index[value] = len(strings)
+            strings.append(value)
+    sst = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        f'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{len(strings)}" uniqueCount="{len(strings)}">',
+    ]
+    for value in strings:
+        sst.append(f'<si><t>{escape(value)}</t></si>')
+    sst.append('</sst>')
+    sheet_rows = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
+    sheet_rows.append('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
+    by_row = {}
+    for row, col, value in cells:
+        by_row.setdefault(row, []).append((col, value))
+    for row in sorted(by_row):
+        sheet_rows.append(f'<row r="{row}">')
+        for col, value in sorted(by_row[row]):
+            ref = _col(col) + str(row)
+            sheet_rows.append(f'<c r="{ref}" t="s"><v>{index[value]}</v></c>')
+        sheet_rows.append('</row>')
+    sheet_rows.append('</sheetData></worksheet>')
+    workbook = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="{escape(sheet_name)}" sheetId="1" r:id="rId1"/></sheets>
+</workbook>
+'''
+    rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+</Relationships>
+'''
+    with zipfile.ZipFile(path, 'w') as archive:
+        archive.writestr('[Content_Types].xml', CONTENT_TYPES)
+        archive.writestr('_rels/.rels', ROOT_RELS)
+        archive.writestr('xl/workbook.xml', workbook)
+        archive.writestr('xl/_rels/workbook.xml.rels', rels)
+        archive.writestr('xl/worksheets/sheet1.xml', ''.join(sheet_rows))
+        archive.writestr('xl/sharedStrings.xml', ''.join(sst))
+
+
 def _col(index):
     text = ''
     remaining = index

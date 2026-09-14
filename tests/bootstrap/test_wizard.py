@@ -103,6 +103,37 @@ class WizardTests(unittest.TestCase):
         self.assertIn('环境未通过', stdout.getvalue())
         self.assertNotIn('should-not-run', stdout.getvalue())
 
+    def test_require_ready_blocks_preview_flag(self):
+        path = self.root / 'demo.xls'
+        path.write_text('<table><tr><td>列甲</td></tr><tr><td>值乙</td></tr></table>', encoding='utf-8')
+        stdout = io.StringIO()
+        code = main(
+            ['--require-ready', '--preview', str(path)],
+            stdin=io.StringIO(''),
+            stdout=stdout,
+            wait_on_error=False,
+            environ_kwargs={'system_name': 'Linux', 'version_info': (3, 9, 0, 'final', 0), 'tkinter_available': False},
+        )
+        self.assertEqual(code, 1)
+        text = stdout.getvalue()
+        self.assertIn('环境未通过', text)
+        self.assertNotIn('值乙', text)
+        self.assertNotIn('业务就绪', text.split('环境未通过', 1)[0])
+
+    def test_require_ready_does_not_treat_pending_as_ready_or_fail(self):
+        stdout = io.StringIO()
+        code = main(
+            ['--require-ready', '--check-env'],
+            stdin=io.StringIO(''),
+            stdout=stdout,
+            wait_on_error=False,
+            environ_kwargs={'system_name': 'Windows', 'version_info': (3, 11, 0, 'final', 0), 'tkinter_available': True},
+        )
+        self.assertEqual(code, 0)
+        text = stdout.getvalue()
+        self.assertIn('钉钉授权: 待确认', text)
+        self.assertNotIn('钉钉授权: 通过', text)
+
 
 if __name__ == '__main__':
     unittest.main()
