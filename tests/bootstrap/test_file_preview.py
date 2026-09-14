@@ -178,6 +178,35 @@ class FilePreviewTests(unittest.TestCase):
             preview_mod.MAX_ZIP_MEMBERS = old
         self.assertIn('压缩成员过多', ctx.exception.message)
 
+    def test_html_multiple_small_tables(self):
+        chunks = [
+            '<table><tr><td>A1</td><td>B1</td></tr><tr><td>C1</td><td>D1</td></tr></table>',
+            '<table><tr><td>A2</td><td>B2</td></tr></table>',
+            '<table><tr><td>A3</td></tr></table>',
+        ]
+        path = self.root / 'multi.xls'
+        path.write_text(''.join(chunks), encoding='utf-8')
+        preview = preview_workbook(path)
+        self.assertEqual(len(preview.sheets), 3)
+        self.assertEqual(preview.sheets[0].headers, ['A1', 'B1'])
+        self.assertEqual(preview.sheets[1].headers, ['A2', 'B2'])
+        self.assertEqual(preview.sheets[2].headers, ['A3'])
+
+    def test_html_cumulative_budget_stops_before_mass_expand(self):
+        block = '<table><tr><td rowspan="50" colspan="32">X</td></tr></table>'
+        path = self.root / 'many-merged.xls'
+        path.write_text(block * 100, encoding='utf-8')
+        import tracemalloc
+        tracemalloc.start()
+        try:
+            with self.assertRaises(PreviewError) as ctx:
+                preview_workbook(path)
+            current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertIn('累计预览单元格', ctx.exception.message)
+        self.assertLess(peak, 4 * 1024 * 1024)
+
 
 if __name__ == '__main__':
     unittest.main()

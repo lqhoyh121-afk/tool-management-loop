@@ -13,6 +13,9 @@ MAX_ZIP_MEMBER_BYTES = 2 * 1024 * 1024
 MAX_ZIP_TOTAL_UNCOMPRESSED = 8 * 1024 * 1024
 MAX_PREVIEW_ROWS = 50
 MAX_PREVIEW_COLS = 32
+MAX_HTML_TABLES = 8
+MAX_HTML_CELLS = MAX_PREVIEW_ROWS * MAX_PREVIEW_COLS
+MAX_HTML_TEXT_CHARS = 64 * 1024
 MAX_EXCEL_ROW = 1_048_576
 MAX_EXCEL_COL = 16_384
 OLE_MAGIC = b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'
@@ -145,10 +148,20 @@ class _TableCollector(HTMLParser):
         self._pending = None
         self._parts = []
         self._truncated = False
+        self._cells_used = 0
+        self._text_used = 0
+        self._stopped = False
 
     def handle_starttag(self, tag, attrs):
         name = tag.lower()
         if name == 'table':
+            if self._stopped:
+                return
+            if len(self.tables) >= MAX_HTML_TABLES:
+                self._stopped = True
+                raise PreviewError(
+                    f'HTML 表格数量超过预览上限 {MAX_HTML_TABLES}，已停止解析，未继续展开。'
+                )
             self._grid = {}
             self._occupied = set()
             self._merges = []
@@ -198,6 +211,19 @@ class _TableCollector(HTMLParser):
         col_span = min(colspan, MAX_PREVIEW_COLS - col + 1)
         if rowspan > row_span or colspan > col_span:
             self._truncated = True
+        claim = row_span * col_span
+        if self._cells_used + claim > MAX_HTML_CELLS:
+            self._stopped = True
+            raise PreviewError(
+                f'HTML 累计预览单元格将超过上限 {MAX_HTML_CELLS}，已停止解析，未继续展开合并格。'
+            )
+        if self._text_used + len(text) > MAX_HTML_TEXT_CHARS:
+            self._stopped = True
+            raise PreviewError(
+                f'HTML 累计文本将超过上限 {MAX_HTML_TEXT_CHARS} 字符，已停止解析。'
+            )
+        self._cells_used += claim
+        self._text_used += len(text)
         self._grid[(row, col)] = text
         if row_span > 1 or col_span > 1:
             self._merges.append({'row': row, 'col': col, 'rowspan': rowspan, 'colspan': colspan, 'text': text})
