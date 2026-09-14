@@ -1,13 +1,20 @@
 """Synthetic negative vectors at the public contract boundary."""
 import unittest
+import importlib.util
+from pathlib import Path
 from dataclasses import replace
 from datetime import timedelta
 
 from contracts.flow import accept_application, plan, verify, Receipt
 from contracts.model import Action, Code, ContractError, Outcome, State, business_date
 from contracts.ports import RuntimeBinding, check_binding
-from test_flow import (BORROWER, MANAGER, ITEM, LOAN, NOW, Identity, Resource,
-                       loan, stock, event, completion, settled)
+spec = importlib.util.spec_from_file_location("t02_fixtures", Path(__file__).with_name("fixtures.py"))
+fixtures = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixtures)
+BORROWER, MANAGER, ITEM, LOAN, NOW = (fixtures.BORROWER, fixtures.MANAGER, fixtures.ITEM,
+                                    fixtures.LOAN, fixtures.NOW)
+loan, stock, event = fixtures.loan, fixtures.stock, fixtures.event
+completion, settled = fixtures.completion, fixtures.settled
 
 
 class GuardTests(unittest.TestCase):

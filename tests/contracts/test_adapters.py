@@ -4,6 +4,7 @@ These tests do not prove OS exclusivity, durable recovery storage or DingTalk.
 """
 from dataclasses import replace
 import json
+import importlib.util
 from pathlib import Path
 import subprocess
 import sys
@@ -13,8 +14,16 @@ import unittest
 from contracts.flow import plan, verify, operation_id
 from contracts.model import Action, Code, ContractError, Outcome, State
 from contracts.ports import RuntimeBinding
-from synthetic import SyntheticJournal, SyntheticLease, SyntheticWriter
-from test_flow import loan, stock, event, MANAGER, ITEM, BORROWER, completion, LOAN
+fixture_spec = importlib.util.spec_from_file_location("t02_fixtures", Path(__file__).with_name("fixtures.py"))
+fixtures = importlib.util.module_from_spec(fixture_spec)
+fixture_spec.loader.exec_module(fixtures)
+loan, stock, event, completion = fixtures.loan, fixtures.stock, fixtures.event, fixtures.completion
+MANAGER, ITEM, BORROWER, LOAN = fixtures.MANAGER, fixtures.ITEM, fixtures.BORROWER, fixtures.LOAN
+synthetic_spec = importlib.util.spec_from_file_location("t02_synthetic", Path(__file__).with_name("synthetic.py"))
+synthetic = importlib.util.module_from_spec(synthetic_spec)
+synthetic_spec.loader.exec_module(synthetic)
+SyntheticJournal, SyntheticLease, SyntheticWriter = (synthetic.SyntheticJournal,
+                                                     synthetic.SyntheticLease, synthetic.SyntheticWriter)
 
 
 class AdapterTests(unittest.TestCase):
@@ -117,7 +126,7 @@ class AdapterTests(unittest.TestCase):
             saved.write_text(json.dumps({"operation_id": expected}), encoding="utf-8")
             code = ("import json,sys; from pathlib import Path; "
                     "sys.path.insert(0,str(Path.cwd()/'tests'/'contracts')); "
-                    "from test_flow import loan,event; from contracts.flow import operation_id; "
+                    "from fixtures import loan,event; from contracts.flow import operation_id; "
                     "from contracts.model import Action; "
                     "actual=operation_id(loan(),event(Action.APPROVE)); "
                     "assert actual==json.loads(Path(sys.argv[1]).read_text())['operation_id']; "

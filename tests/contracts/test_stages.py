@@ -1,10 +1,16 @@
 """Synthetic stage-resource contract tests; no TODO or form is created."""
 from dataclasses import replace
 import unittest
+import importlib.util
+from pathlib import Path
 
 from contracts.model import Action, Outcome, Code, ContractError
 from contracts.ports import StageRequest, StageReceipt, verify_stage, stage_operation_id
-from test_flow import loan, MANAGER, BORROWER, FORM, completion
+spec = importlib.util.spec_from_file_location("t02_fixtures", Path(__file__).with_name("fixtures.py"))
+fixtures = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixtures)
+loan, completion = fixtures.loan, fixtures.completion
+MANAGER, BORROWER, FORM = fixtures.MANAGER, fixtures.BORROWER, fixtures.FORM
 
 
 class StageTests(unittest.TestCase):

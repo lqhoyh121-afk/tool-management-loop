@@ -1,49 +1,19 @@
 """All identities/resources in this suite are synthetic, not business data."""
 import unittest
+import importlib.util
+from pathlib import Path
 from dataclasses import replace
-from datetime import datetime, timezone
 
-from contracts.model import (Identity, Resource, Loan, Inventory, Event,
-                             IdentityBinding, ContractError, Code)
+from contracts.model import Resource, Inventory
 from contracts.flow import plan, verify, State, Action, Receipt, Outcome
 
 
-NOW = datetime(2030, 1, 1, tzinfo=timezone.utc)
-BORROWER = Identity("contact", "synthetic-org", "synthetic-borrower")
-MANAGER = Identity("contact", "synthetic-org", "synthetic-manager")
-LOAN = Resource("record", "synthetic-org", "synthetic-loans", "synthetic-loan")
-ITEM = Resource("record", "synthetic-org", "synthetic-stock", "synthetic-item")
-FORM = Resource("form", "synthetic-org", "synthetic-forms", "synthetic-form")
-
-
-def loan():
-    return Loan(LOAN, ITEM, BORROWER, MANAGER, MANAGER, 2, False, (),
-                NOW, "synthetic-config-v1", application_evidence="synthetic-application-read")
-
-
-def event(action, actor=MANAGER):
-    return Event(action, "synthetic-" + action.value, LOAN, FORM, actor,
-                 NOW, "synthetic-config-v1", "form", True,
-                 evidence_ref="synthetic-source-readback")
-
-
-def stock():
-    return Inventory(ITEM, 5, 0, 0, (), (), (), "synthetic-rev-1")
-
-
-def completion(action):
-    task = Resource("todo", "synthetic-org", "synthetic-todos", "synthetic-" + action.value)
-    internal = Identity("todo", "synthetic-org", "synthetic-internal-manager")
-    binding = IdentityBinding(MANAGER, internal, task, "synthetic-create", "synthetic-get")
-    return replace(event(action), actor=internal, source=task,
-                   evidence_kind="todo_completion", binding=binding)
-
-
-def settled(current, action_event, inventory):
-    intent = plan(current, action_event, inventory)
-    receipt = Receipt(intent.operation_id, Outcome.VERIFIED, "synthetic-readback",
-                      intent.after, intent.stock_after)
-    return verify(intent, receipt).loan, intent.stock_after
+spec = importlib.util.spec_from_file_location("t02_fixtures", Path(__file__).with_name("fixtures.py"))
+fixtures = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixtures)
+loan, event, stock = fixtures.loan, fixtures.event, fixtures.stock
+completion, settled = fixtures.completion, fixtures.settled
+BORROWER, ITEM = fixtures.BORROWER, fixtures.ITEM
 
 
 class FlowTests(unittest.TestCase):
