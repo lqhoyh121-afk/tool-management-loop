@@ -11,11 +11,23 @@ BANNED_SUFFIXES = ('.bak', '.pyc', '.log', '.tmp', '.swp')
 HANDOVER_MARKS = ('handover', 'receipt', '交接', '回执')
 SECRET_NAME_PARTS = {'key', 'token', 'secret', 'password', 'passwd', 'pwd', 'cred', 'creds',
                      'credential', 'credentials', 'auth', 'salt', 'apikey', 'privatekey'}
-PLACEHOLDER_MARKS = ('xxx', '<', '>', '${', '{{', 'example', 'sample', 'placeholder',
-                     'dummy', 'synthetic', 'fake', 'changeme', 'demo', 'todo', 'your_')
-ASSIGNMENT = re.compile(
-    r"(?im)^[\t ]*(?:export[\t ]+)?([A-Za-z_][A-Za-z0-9_-]*)[\t ]*[:=][\t ]*"
-    r"(['\"])([^'\"\r\n]{8,})\2")
+PLACEHOLDER_EXACT = {'example', 'sample', 'placeholder', 'dummy', 'synthetic', 'fake',
+                     'demo', 'changeme', 'todo', 'password', 'secret', 'token', 'value'}
+PLACEHOLDER_PATTERNS = (
+    re.compile(r'^[xX][xX._\-]{7,}$'),
+    re.compile(r'^<[^<>]{1,64}>$'),
+    re.compile(r'^\$\{[^}]{1,64}\}$'),
+    re.compile(r'^\{\{[^}]{1,64}\}\}$'),
+    re.compile(r'^[Yy]our[_\-][A-Za-z0-9_\-]+$'),
+)
+ASSIGNMENT_QUOTED = re.compile(
+    r"(?im)^[\t ]*(?:export[\t ]+)?(?:[{,][\t ]*)?"
+    r"(?:['\"]([A-Za-z_][A-Za-z0-9_-]*)['\"]|([A-Za-z_][A-Za-z0-9_-]*))"
+    r"[\t ]*[:=][\t ]*(['\"])([^'\"\r\n]{8,})\3")
+ASSIGNMENT_BARE = re.compile(
+    r"(?im)^[\t ]*(?:export[\t ]+)?(?:[{,][\t ]*)?"
+    r"(?:['\"]([A-Za-z_][A-Za-z0-9_-]*)['\"]|([A-Za-z_][A-Za-z0-9_-]*))"
+    r"[\t ]*[:=][\t ]*([^\s'\"#][^\s'\"#]*)[\t ]*$")
 
 
 def _is_secret_name(name):
@@ -23,17 +35,24 @@ def _is_secret_name(name):
 
 
 def _is_placeholder(value):
-    lowered = value.lower()
-    return any(mark in lowered for mark in PLACEHOLDER_MARKS)
+    if value.lower() in PLACEHOLDER_EXACT:
+        return True
+    return any(pattern.match(value) for pattern in PLACEHOLDER_PATTERNS)
 
 
 def _plaintext_assignments(text):
     found = []
-    for match in ASSIGNMENT.finditer(text):
-        name, value = match.group(1), match.group(3)
+    candidates = []
+    for match in ASSIGNMENT_QUOTED.finditer(text):
+        candidates.append((match.group(1) or match.group(2), match.group(4), True))
+    for match in ASSIGNMENT_BARE.finditer(text):
+        candidates.append((match.group(1) or match.group(2), match.group(3), False))
+    for name, value, quoted in candidates:
         if not _is_secret_name(name):
             continue
         if not value.isascii() or not all(ch.isprintable() for ch in value):
+            continue
+        if not quoted and not any(ch.isdigit() for ch in value):
             continue
         if _is_placeholder(value):
             continue

@@ -32,6 +32,45 @@ def dummy_test_source():
         '        self.assertTrue(True)\n')
 
 
+def counting_test_source():
+    return (
+        'import unittest\n'
+        'from pathlib import Path\n'
+        '\n'
+        'class CountCases(unittest.TestCase):\n'
+        '    def test_count(self):\n'
+        "        target = Path(__file__).with_name('count.txt')\n"
+        "        with target.open('a', encoding='utf-8') as handle:\n"
+        "            handle.write('x')\n"
+        '        self.assertTrue(True)\n')
+
+
+def adapter_source():
+    return (
+        '"""Adapter mirroring the real load_tests suite-entry shape."""\n'
+        'import importlib.util\n'
+        'import sys\n'
+        'import unittest\n'
+        'from pathlib import Path\n'
+        '\n'
+        'BOOT = Path(__file__).resolve().parent / "sub"\n'
+        '\n'
+        '\n'
+        'def load_tests(loader, tests, pattern):\n'
+        '    suite = unittest.TestSuite()\n'
+        '    here = str(BOOT)\n'
+        '    if here not in sys.path:\n'
+        '        sys.path.insert(0, here)\n'
+        '    for path in sorted(BOOT.glob("test_*.py")):\n'
+        '        name = "ad_" + path.stem\n'
+        '        spec = importlib.util.spec_from_file_location(name, path)\n'
+        '        module = importlib.util.module_from_spec(spec)\n'
+        '        sys.modules[name] = module\n'
+        '        spec.loader.exec_module(module)\n'
+        '        suite.addTests(loader.loadTestsFromModule(module))\n'
+        '    return suite\n')
+
+
 def secret_source():
     q = chr(39)
     return 'API' + '_KEY = ' + q + 'z' * 24 + q + '\n'
@@ -94,7 +133,39 @@ class DiscoveryTests(unittest.TestCase):
         problems, stats = self.run_runner()
         joined = '\n'.join(problems)
         self.assertIn('test_broken.py', joined)
-        self.assertIn('import failed', joined)
+        self.assertIn('load failed', joined)
+
+    def test_failing_test_reports_problem(self):
+        write(self.tests_dir / 'test_fails.py',
+              'import unittest\n\n\nclass FailCases(unittest.TestCase):\n'
+              '    def test_fail(self):\n'
+              '        self.assertTrue(False)\n')
+        problems, stats = self.run_runner()
+        self.assertTrue(any('test failure' in p for p in problems), problems)
+
+    def test_adapter_files_run_exactly_once(self):
+        write(self.tests_dir / 'sub' / 'test_one.py', counting_test_source())
+        write(self.tests_dir / 'sub' / 'test_two.py', counting_test_source())
+        write(self.tests_dir / 'test_suite.py', adapter_source())
+        write(self.tests_dir / 'test_plain.py', counting_test_source())
+        problems, stats = self.run_runner()
+        self.assertEqual(problems, [])
+        self.assertEqual(stats['tests'], 3)
+        self.assertEqual((self.tests_dir / 'sub' / 'count.txt').read_text(
+            encoding='utf-8'), 'xx')
+        self.assertEqual((self.tests_dir / 'count.txt').read_text(encoding='utf-8'), 'x')
+
+    def test_adapter_load_failure_reported(self):
+        write(self.tests_dir / 'sub' / 'test_one.py', counting_test_source())
+        write(self.tests_dir / 'test_suite.py',
+              'import unittest\n\n\ndef load_tests(loader, tests, pattern):\n'
+              '    raise RuntimeError("adapter exploded")\n')
+        stream = io.StringIO()
+        problems, stats = repo_checks.run_tests(tests_dir=self.tests_dir, stream=stream)
+        joined = '\n'.join(problems)
+        self.assertIn('test_suite.py', joined)
+        self.assertIn('load failed', joined)
+        self.assertIn('RuntimeError', stream.getvalue())
 
     def test_rerun_is_idempotent(self):
         write(self.tests_dir / 'test_once.py', dummy_test_source())
@@ -164,6 +235,53 @@ class FileCheckTests(unittest.TestCase):
         self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
 
 
+class CliOutcomeTests(unittest.TestCase):
+    def run_cli(self, test_sources):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+        (repo / 'scripts').mkdir()
+        for name in ('repo_guard.py', 'repo_checks.py'):
+            shutil.copy2(REPO_ROOT / 'scripts' / name, repo / 'scripts' / name)
+        for rel, source in test_sources.items():
+            write(repo / 'tests' / rel, source)
+        run_cmd(['git', 'init', '-q', '-b', 'main'], repo)
+        run_cmd(['git', 'config', 'user.email', 'synth@example.invalid'], repo)
+        run_cmd(['git', 'config', 'user.name', 'synth-tester'], repo)
+        run_cmd(['git', 'add', 'scripts', 'tests'], repo)
+        return run_cmd([sys.executable, 'scripts/repo_checks.py'], repo)
+
+    def test_assertion_failure_exits_nonzero(self):
+        proc = self.run_cli({'test_a.py': 'import unittest\n\n\nclass A(unittest.TestCase):\n'
+                                          '    def test_a(self):\n'
+                                          '        self.fail("boom")\n'})
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('RESULT: FAIL', proc.stdout)
+        self.assertIn('AssertionError', proc.stderr)
+
+    def test_runtime_error_exits_nonzero(self):
+        proc = self.run_cli({'test_a.py': 'import unittest\n\n\nclass A(unittest.TestCase):\n'
+                                          '    def test_a(self):\n'
+                                          '        raise RuntimeError("boom")\n'})
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('RuntimeError', proc.stderr)
+
+    def test_fixture_error_exits_nonzero(self):
+        proc = self.run_cli({'test_a.py': 'import unittest\n\n\nclass A(unittest.TestCase):\n'
+                                          '    def setUp(self):\n'
+                                          '        raise ValueError("broken fixture")\n'
+                                          '    def test_a(self):\n'
+                                          '        self.assertTrue(True)\n'})
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('ValueError', proc.stderr)
+
+    def test_load_tests_error_exits_nonzero(self):
+        proc = self.run_cli({'test_a.py': 'import unittest\n\n\ndef load_tests(loader, tests, pattern):\n'
+                                          '    raise RuntimeError("broken adapter")\n'})
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('RESULT: FAIL', proc.stdout)
+
+
 @unittest.skipUnless(GIT, 'git not available')
 class HookAndInstallTests(unittest.TestCase):
     def setUp(self):
@@ -215,6 +333,18 @@ class HookAndInstallTests(unittest.TestCase):
         proc = run_cmd(['git', 'commit', '-q', '-m', 'bad'], self.repo)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn('plaintext secret assignment', proc.stdout + proc.stderr)
+        self.assertEqual(run_cmd(['git', 'rev-parse', 'HEAD'], self.repo).stdout.strip(), head)
+
+    def test_precommit_blocks_failing_test_and_keeps_head(self):
+        run_cmd([sys.executable, 'scripts/install_hooks.py'], self.repo)
+        head = self.baseline_commit()
+        write(self.repo / 'tests' / 'test_bad.py',
+              'import unittest\n\n\nclass BadCases(unittest.TestCase):\n'
+              '    def test_bad(self):\n'
+              '        self.fail("broken")\n')
+        run_cmd(['git', 'add', 'tests/test_bad.py'], self.repo)
+        proc = run_cmd(['git', 'commit', '-q', '-m', 'bad test'], self.repo)
+        self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(run_cmd(['git', 'rev-parse', 'HEAD'], self.repo).stdout.strip(), head)
 
     def test_precommit_allows_clean_commit(self):

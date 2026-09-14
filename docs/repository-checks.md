@@ -15,11 +15,12 @@ python scripts/install_hooks.py
 入口 `python scripts/repo_checks.py`，两个阶段，任一失败即非零退出：
 
 1. 文件检查（`scripts/repo_guard.py` 与 `repo_checks.py` 内建规则）
-   - 隐私扫描：明文密钥赋值（名字含 key/token/secret/password 等词段且值为 8 字符以上 ASCII 引号字面量）、token/私钥形态、个人绝对路径、文档署名。占位值（`xxxx-xxxx`、`<your-key>`、`${VAR}` 等）、环境变量引用和运行时拼接的合成样例放行。
+   - 隐私扫描：明文密钥赋值（名字含 key/token/secret/password 等词段，值为 8 字符以上 ASCII 字面量），覆盖三种常见形态——无引号键+引号值（Python/env）、JSON 引号键、无引号 YAML·env 裸标量（无引号值须为含字母和数字的单个词元）；另有 token/私钥形态、个人绝对路径、文档署名。仅按完整占位格式放行：`xxxx-xxxx` 全 x 串、`<...>`、`${...}`、`{{ ... }}`、`your-...` 前缀及 changeme/example 等整词；值中间夹着占位词不豁免。环境变量引用和运行时拼接的合成样例天然不命中。
    - 本地产物拦截：`.dev-flow`、`local-private`、`runtime`、`logs` 等目录，`.bak/.log/.tmp/.swp/.pyc` 后缀，文件名含 handover/receipt/交接/回执，以及 `*.local.*` 配置覆盖。
    - 语法检查：受跟踪 `.py` 文件 `ast.parse`，不执行被扫描模块。
    - 基础格式：`.py`/`.yml` 行尾空白、`.py`/`.md`/`.yml` 末尾换行。`.md` 不查行尾空白（Markdown 双空格换行是合法语法）；`.bat` 规范形态为 CRLF，不做格式检查。
-2. 测试执行：递归收集 `tests/` 下全部 `test_*.py`，按相对路径生成唯一模块名逐个加载执行。嵌套目录无 `__init__.py`、跨目录同名测试文件都会执行；零个测试文件、零个用例、任一导入失败或测试失败均非零退出。
+2. 测试执行：递归收集 `tests/` 下全部 `test_*.py`，按相对路径生成唯一模块名逐个加载执行。嵌套目录无 `__init__.py`、跨目录同名测试文件都会执行；零个测试文件、零个用例、任一加载失败或任一测试失败/报错均非零退出。
+   - 适配器单一归属：定义模块级 `load_tests` 的文件视为套件适配器，先于直接发现执行；适配器导入过的收集文件归其所有，不再被直接发现重复执行。用真实适配器形态组合验证过每个源用例恰好执行一次。
 
 ## 全量与暂存区语义
 

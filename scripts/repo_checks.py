@@ -114,6 +114,15 @@ def module_name_for(rel_posix, used):
     return name
 
 
+def declares_load_tests(source):
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return False
+    return any(isinstance(node, ast.FunctionDef) and node.name == 'load_tests'
+               for node in tree.body)
+
+
 def run_tests(tests_dir=None, stream=None):
     tests_dir = Path(tests_dir) if tests_dir is not None else ROOT / 'tests'
     if str(ROOT) not in sys.path:
@@ -124,21 +133,67 @@ def run_tests(tests_dir=None, stream=None):
     if not files:
         print('ERROR: no test files found under tests/')
         return ['no test files'], zero
+    resolved = {str(full.resolve()): (full, rel) for full, rel in files}
     used = set()
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    for full, rel in files:
+
+    def load_module(full, rel):
         modname = module_name_for(rel, used)
         sys.modules.pop(modname, None)
         spec = importlib.util.spec_from_file_location(modname, full)
         module = importlib.util.module_from_spec(spec)
         sys.modules[modname] = module
+        spec.loader.exec_module(module)
+        return loader.loadTestsFromModule(module)
+
+    def add_with_notes(loaded, rel):
+        # unittest converts a raising load_tests into a _FailedTest error case
+        # instead of propagating; attribute it to the declaring file.
+        stack = list(loaded)
+        while stack:
+            item = stack.pop()
+            if isinstance(item, unittest.TestSuite):
+                stack.extend(item)
+            elif type(item).__name__ == '_FailedTest':
+                problems.append(f'{rel}: load failed: load_tests raised during suite construction')
+        suite.addTests(loaded)
+
+    # Phase 1: adapter files (module-level load_tests) run first and own every
+    # collected test file they import; single ownership, no double execution.
+    consumed = set()
+    plain = []
+    for full, rel in files:
         try:
-            spec.loader.exec_module(module)
-        except Exception as exc:
-            problems.append(f'{rel}: import failed: {type(exc).__name__}: {exc}')
+            source = full.read_bytes()
+        except OSError as exc:
+            problems.append(f'{rel}: load failed: {type(exc).__name__}: {exc}')
             continue
-        suite.addTests(loader.loadTestsFromModule(module))
+        if not declares_load_tests(source):
+            plain.append((full, rel))
+            continue
+        before = set(sys.modules)
+        try:
+            add_with_notes(load_module(full, rel), rel)
+        except Exception as exc:
+            problems.append(f'{rel}: load failed: {type(exc).__name__}: {exc}')
+            continue
+        for name in set(sys.modules) - before:
+            loaded = getattr(sys.modules[name], '__file__', None)
+            if loaded:
+                key = str(Path(loaded).resolve())
+                if key in resolved:
+                    consumed.add(key)
+
+    # Phase 2: direct discovery of everything not already owned by an adapter.
+    for full, rel in plain:
+        if str(full.resolve()) in consumed:
+            continue
+        try:
+            add_with_notes(load_module(full, rel), rel)
+        except Exception as exc:
+            problems.append(f'{rel}: load failed: {type(exc).__name__}: {exc}')
+
     if suite.countTestCases() == 0:
         print('ERROR: zero test cases discovered')
         problems.append('zero test cases')
@@ -147,6 +202,8 @@ def run_tests(tests_dir=None, stream=None):
              'errors': len(result.errors), 'skipped': len(result.skipped)}
     if result.testsRun == 0 and 'zero test cases' not in problems:
         problems.append('zero tests ran')
+    if not result.wasSuccessful():
+        problems.append(f'{len(result.failures)} test failure(s), {len(result.errors)} test error(s)')
     return problems, stats
 
 

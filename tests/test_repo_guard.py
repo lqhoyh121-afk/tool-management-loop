@@ -76,6 +76,48 @@ class AssignmentTests(unittest.TestCase):
         data = ('to' + 'ken = ' + q + 'abc' + q + '\n').encode()
         self.assertEqual(inspect('a.py', data), [])
 
+    def test_bare_yaml_scalar_flagged(self):
+        data = ('api' + '_key: ' + 'zk9' + 'z' * 20 + '\n').encode()
+        self.assertIn('plaintext secret assignment', inspect('conf.yml', data))
+
+    def test_bare_env_style_flagged(self):
+        data = ('API' + '_KEY=' + 'zk9' + 'z' * 20 + '\n').encode()
+        self.assertIn('plaintext secret assignment', inspect('env.example', data))
+
+    def test_json_quoted_key_flagged(self):
+        q = chr(34)
+        data = ('{' + chr(34) + 'api' + '_key' + chr(34) + ': '
+                + q + 'zk9' + 'z' * 20 + q + '}').encode()
+        self.assertIn('plaintext secret assignment', inspect('conf.json', data))
+
+    def test_embedded_placeholder_word_still_flagged(self):
+        q = chr(39)
+        data = ('to' + 'ken = ' + q + 'ab' + 'demo' + 'cd12345' + q + '\n').encode()
+        self.assertIn('plaintext secret assignment', inspect('a.py', data))
+
+    def test_bare_prose_with_spaces_allowed(self):
+        data = ('to' + 'ken: see the internal docs page\n').encode()
+        self.assertEqual(inspect('notes.md', data), [])
+
+    def test_bare_letters_only_allowed(self):
+        data = ('au' + 'th_mode: certificate\n').encode()
+        self.assertEqual(inspect('conf.yml', data), [])
+
+    def test_exact_placeholder_word_allowed(self):
+        q = chr(39)
+        data = ('DB' + '_PASSWORD = ' + q + 'changeme' + q + '\n').encode()
+        self.assertEqual(inspect('a.py', data), [])
+
+    def test_your_prefix_placeholder_allowed(self):
+        q = chr(39)
+        data = ('API' + '_KEY = ' + q + 'your-key-here' + q + '\n').encode()
+        self.assertEqual(inspect('a.py', data), [])
+
+    def test_mustache_placeholder_allowed(self):
+        q = chr(34)
+        data = ('API' + '_KEY = ' + q + '{{ TOKEN }}' + q + '\n').encode()
+        self.assertEqual(inspect('a.py', data), [])
+
 
 class ArtifactTests(unittest.TestCase):
     def test_dev_flow_blocked(self):
