@@ -45,11 +45,21 @@ class FixtureLabellingTests(unittest.TestCase):
         for name, entry in self.samples.items():
             with self.subTest(sample=name):
                 for key, value in _pairs(entry['payload']):
-                    if key.endswith(('Id', 'Ids')) and isinstance(value, str):
+                    if not key.endswith(('Id', 'Ids')):
+                        continue
+                    if isinstance(value, str):
                         self.assertTrue(
                             value.startswith('SYNTHETIC-'),
                             f'{name}.{key} 未标为合成: {value!r}',
                         )
+                    elif isinstance(value, int) and not isinstance(value, bool):
+                        self.assertGreaterEqual(
+                            value,
+                            9_000_000_000,
+                            f'{name}.{key} 整数标识须落在合成区间: {value!r}',
+                        )
+                    else:
+                        self.fail(f'{name}.{key} 标识类型不受支持: {value!r}')
 
 
 class HelperLoadingTests(unittest.TestCase):

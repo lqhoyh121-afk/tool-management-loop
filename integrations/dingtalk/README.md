@@ -22,15 +22,17 @@ Refs #3。当前只有**离线解析**：按公开 T01 报告已观察到的返�
 |---|---|---|
 | `record query` 单页 | `data.records[].recordId` 与 `cells[fieldId]` | `envelope.extract_records` 优先读 `data.records` |
 | `record query --all` | 有数据时是顶层 `records` | 同一函数回退读顶层 `records` |
-| `--all` 空表 | 曾返回 `records: null, hasMore: false, pages: 1` | `null` 且 `hasMore` 为假时当空结果；`hasMore` 为真则报错 |
-| 顶层成功掩盖业务错误 | Base 不存在时 `success: true` 同时 `status: error`、`error.code=BASE_NOT_FOUND` | 先查 `error.code` 与 `status`，不把 `success` 布尔值当成功 |
-| creator 单元格 | `[{corpId, userId}]`，组织加人员的二元身份；不能用姓名代替 | 返回 `record_creator` 命名空间的 `PersonRef`，字符串取值直接报错 |
-| number 单元格 | 本次回读为字符串，需显式数值解析 | 解析为 `Decimal`；布尔值、空串、带单位的文本都报错 |
+| `--all` 空表 | 曾返回 `records: null, hasMore: false, pages: 1` | `null` 且 `hasMore is False` 时当空结果；缺 `hasMore` 或其它假值报错 |
+| 成功封套 | 主控核对原始回执：`status=success` 且 `error={}` | 空 `error` 表示无业务错误，不是缺 `code`；缺 `status`/`error` 不能当成功 |
+| 顶层成功掩盖业务错误 | Base 不存在时 `success: true` 同时 `status: error`、`error.code=BASE_NOT_FOUND` | 先查 `error.code` 与 `status`，不把 success 布尔值当成功 |
+| 未支持错误封套 | 公开报告未确认 `errorCode` / `errorMsg` | 即使带空 `records` 也报错，不当空成功 |
+| creator 单元格 | `[{corpId, userId}]`，组织加人员的二元身份；不能用姓名代替 | 返回 `record_creator` 命名空间的 `PersonRef`，必须带 org；字符串取值直接报错 |
+| number 单元格 | 本次回读为字符串，需显式数值解析 | 只接受字符串，解析为有限 `Decimal`；int/float/bool、空串、带单位文本、非有限值均报错 |
 | date 单元格 | 带时区 ISO 字符串 | 解析为 aware `datetime`；无时区报错，不补默认时区 |
 | singleSelect 单元格 | `{id, name}` | 原样返回 `SelectOption`，缺 id 或 name 报错 |
 | 待办详情 | `todo task get` 返回 `result.todoDetailModel` | `todo.read_todo_detail` |
-| 待办人员 ID | `executorIds`、`activities[].creatorId` 是待办内部人员 ID，与通讯录 userId 分属两个命名空间 | 统一标为 `todo` 命名空间；跨命名空间比较报错 |
-| 实际完成事件 | `action` 为 `task.self.done`、`task.done`，带 `activityId`、`creatorId`；完成时间在 `finishTime` | `completion_events` 只认这两种 action |
+| 待办人员 ID | `executorIds`、`activities[].creatorId` 是待办内部人员 ID；主控核对类型为 int | 标为 `todo` 命名空间；int 转规范十进制字符串，非规范字符串与 bool 拒绝；跨命名空间比较报错 |
+| 实际完成事件 | `action` 为 `task.self.done`、`task.done`，带 `activityId`、`creatorId`；`finishTime` 为 int，未完成时为 0 | `completion_events` 只认这两种 action；`finish_time` 原样保留非 0 整数，0 视为未完成，不换算 datetime |
 | 完成者判定 | 不能只依据执行人或 `modifierId`；勾完成也不等于同意 | `completed_by` 只看完成活动的 `creatorId`，完全不读 `isDone`、`modifierId` |
 
 ## 人员标识命名空间
@@ -41,7 +43,7 @@ Refs #3。当前只有**离线解析**：按公开 T01 报告已观察到的返�
 - `todo`：待办详情内部的人员 ID。
 - `record_creator`：多维表 creator 单元格中的 userId，与 corpId 成对。
 
-`PersonRef.__eq__` 包含命名空间，所以通讯录标识永远不等于待办内部标识。要回答"是不是同一个人"用 `same_person_as`，跨命名空间时它报错而不是静默返回 False。
+`PersonRef.__eq__` 与 `same_person_as` 都包含命名空间和组织。`record_creator` 缺 org 直接报错；同 user、不同 corp 不是同一个人。通讯录标识永远不等于待办内部标识。跨命名空间比较报错而不是静默给出 False，也不提供转换。
 
 报告只在同一个人身上观察到 `record_creator` 与 `contact` 取值一致，并未确认为通用映射，所以本目录**不提供**任何跨命名空间转换。
 
@@ -55,7 +57,7 @@ Refs #3。当前只有**离线解析**：按公开 T01 报告已观察到的返�
 
 1. 报告只逐字记录了 `success` / `status` / `error.code` 三个封套字段。其他错误封套形式（例如命令行常见的 `errorCode` / `errorMsg`）未在公开报告中确认，本目录不处理，遇到即报错。
 2. `record_creator` 的 userId 与通讯录 userId 是否恒等，未确认。
-3. number 是否可能返回非字符串、date 是否可能返回时间戳，均未观察到，当前报错。
+3. number 是否可能返回非字符串、date 是否可能返回时间戳，均未观察到，当前报错。`finishTime` 的整数单位未由主控说明，本层不换算。
 4. 单元格 creator 出现多个的形态未观察到，当前报错。
 5. `task.self.done` / `task.done` 之外的完成类事件未观察到。
 6. 正文说明中的原单引用是受控配置关联，**不是不可篡改外键**，不能当唯一业务主键用。
@@ -63,7 +65,7 @@ Refs #3。当前只有**离线解析**：按公开 T01 报告已观察到的返�
 
 ## 测试
 
-合成夹具在 `tests/integrations/fixtures/t01_observed_shapes.json`，每份样例标注来源报告条目与模拟性质，标识一律 `SYNTHETIC-` 前缀。没有真实资源 ID、人员、台账内容或个人路径。
+合成夹具在 `tests/integrations/fixtures/t01_observed_shapes.json`，每份样例标注来源报告条目与模拟性质。字符串标识用 `SYNTHETIC-` 前缀；待办内部人员 ID 等整数标识落在 `9000000000` 及以上合成区间。没有真实资源 ID、人员、台账内容或个人路径。
 
 统一入口（T09 已合入 main）：
 

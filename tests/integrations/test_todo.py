@@ -22,9 +22,9 @@ from integrations.dingtalk.todo import (
     read_todo_detail,
 )
 
-EXECUTOR = PersonRef(TODO, 'SYNTHETIC-todo-executor')
-CREATOR = PersonRef(TODO, 'SYNTHETIC-todo-creator')
-MANAGER = PersonRef(TODO, 'SYNTHETIC-todo-manager')
+EXECUTOR = PersonRef(TODO, '9000000002')
+CREATOR = PersonRef(TODO, '9000000001')
+MANAGER = PersonRef(TODO, '9000000003')
 
 
 class DetailReadTests(unittest.TestCase):
@@ -55,11 +55,36 @@ class DetailReadTests(unittest.TestCase):
     def test_finish_time_absent_while_open(self):
         self.assertIsNone(finish_time(read_todo_detail(sample('todo_detail_open'))))
 
-    def test_finish_time_requires_timezone(self):
+    def test_finish_time_keeps_observed_int(self):
+        self.assertEqual(
+            finish_time(read_todo_detail(sample('todo_detail_done_cross_creator'))),
+            9000000000001,
+        )
+
+    def test_finish_time_rejects_iso_string(self):
         detail = read_todo_detail(sample('todo_detail_done_cross_creator'))
-        detail['finishTime'] = '2026-09-14T17:30:00'
+        detail['finishTime'] = '2026-09-14T17:30:00+08:00'
         with self.assertRaises(UnsupportedShapeError):
             finish_time(detail)
+
+    def test_finish_time_rejects_bool(self):
+        detail = read_todo_detail(sample('todo_detail_done_cross_creator'))
+        detail['finishTime'] = True
+        with self.assertRaises(UnsupportedShapeError):
+            finish_time(detail)
+
+    def test_person_id_int_canonicalizes_and_rejects_bool(self):
+        detail = read_todo_detail(sample('todo_detail_done_cross_creator'))
+        detail['executorIds'] = [True]
+        with self.assertRaises(UnsupportedShapeError):
+            executor_refs(detail)
+        detail['executorIds'] = ['0123']
+        with self.assertRaises(UnsupportedShapeError):
+            executor_refs(detail)
+        detail['executorIds'] = [9000000002]
+        self.assertEqual(executor_refs(detail), [EXECUTOR])
+        detail['executorIds'] = ['9000000002']
+        self.assertEqual(executor_refs(detail), [EXECUTOR])
 
 
 class CompletionEvidenceTests(unittest.TestCase):
@@ -78,7 +103,7 @@ class CompletionEvidenceTests(unittest.TestCase):
     def test_is_done_and_modifier_alone_are_not_evidence(self):
         detail = read_todo_detail(sample('todo_detail_done_without_activity'))
         self.assertTrue(detail['isDone'])
-        self.assertEqual(detail['modifierId'], 'SYNTHETIC-todo-manager')
+        self.assertEqual(detail['modifierId'], 9000000003)
         self.assertEqual(completion_events(detail), [])
         self.assertFalse(completed_by(detail, MANAGER))
 
@@ -110,14 +135,14 @@ class CompletionEvidenceTests(unittest.TestCase):
 class NamespaceTests(unittest.TestCase):
     def test_contact_id_cannot_answer_who_completed(self):
         detail = read_todo_detail(sample('todo_detail_done_cross_creator'))
-        contact = PersonRef(CONTACT, 'SYNTHETIC-todo-executor')
+        contact = PersonRef(CONTACT, '9000000002')
         with self.assertRaises(IdentityNamespaceError):
             completed_by(detail, contact)
 
     def test_plain_string_is_not_a_person(self):
         detail = read_todo_detail(sample('todo_detail_done_cross_creator'))
         with self.assertRaises(UnsupportedShapeError):
-            completed_by(detail, 'SYNTHETIC-todo-executor')
+            completed_by(detail, '9000000002')
 
 
 if __name__ == '__main__':

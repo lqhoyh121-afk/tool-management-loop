@@ -40,18 +40,16 @@ def read_text(cells, field_id):
 def read_number(cells, field_id):
     """返回 :class:`~decimal.Decimal`。
 
-    报告记录 number 回读为字符串，所以这里显式解析，不依赖隐式转换，也不接受
-    布尔值冒充数字。
+    报告只观察到 number 回读为字符串。非字符串（含 int/float/bool）一律拒绝，
+    不走旁路；解析后必须是有限数。
     """
     value = _raw(cells, field_id)
     if isinstance(value, bool):
         raise UnsupportedShapeError(f'字段 {field_id} 是布尔值，不是数量')
-    if isinstance(value, int):
-        return Decimal(value)
-    if isinstance(value, float):
-        return Decimal(str(value))
     if not isinstance(value, str):
-        raise UnsupportedShapeError(f'字段 {field_id} 应为数字或数字字符串，收到 {type(value).__name__}')
+        raise UnsupportedShapeError(
+            f'字段 {field_id} 应为数字字符串，收到 {type(value).__name__}'
+        )
     text = value.strip()
     if not text:
         raise MissingFieldError(f'字段 {field_id} 是空字符串，不能当 0')

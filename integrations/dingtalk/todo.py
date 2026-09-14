@@ -3,11 +3,15 @@
 公开 T01 报告观察到：``todo task get`` 返回 ``result.todoDetailModel``；
 ``executorIds`` 与 ``activities[].creatorId`` 是待办内部人员 ID；实际完成事件的
 ``action`` 为 ``task.self.done`` 或 ``task.done``，带 ``activityId`` 与
-``creatorId``，完成时间在 ``finishTime``。报告同时记录：完成事件里没有明确审批
-结果字段，"勾完成"不等于"同意"；实际完成者不能只依据 ``isDone`` 或
-``modifierId`` 判定。
+``creatorId``，完成时间在 ``finishTime``。
+
+主控对原始回执的类型核对：完成活动 ``creatorId`` 是 int，``finishTime`` 是 int；
+未完成时 ``finishTime`` 为 0（见 ``docs/evidence/t01-trusted-application.md``）。
+时间单位未另给说明，本层原样保留整数，不换算成 datetime，也不臆造 ISO 字符串。
+
+报告同时记录：完成事件里没有明确审批结果字段，"勾完成"不等于"同意"；实际
+完成者不能只依据 ``isDone`` 或 ``modifierId`` 判定。
 """
-from datetime import datetime
 from typing import NamedTuple
 
 from .envelope import read_envelope
@@ -92,24 +96,52 @@ def completed_by(detail, person):
 
 
 def finish_time(detail):
-    """返回带时区的完成时间；未完成时返回 None。"""
-    value = detail.get('finishTime')
-    if value is None:
+    """返回报文中的整数完成时间；未完成（0）时返回 None。
+
+    不换算时区或纪元单位。主控未给出单位说明前，调用方只能把非 0 整数当原始值。
+    """
+    if 'finishTime' not in detail:
+        raise MissingFieldError('待办详情缺少 finishTime')
+    value = detail['finishTime']
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise UnsupportedShapeError(
+            f'finishTime 应为整数，收到 {type(value).__name__}'
+        )
+    if value < 0:
+        raise UnsupportedShapeError(f'finishTime 不能为负数: {value!r}')
+    if value == 0:
         return None
-    if not isinstance(value, str):
-        raise UnsupportedShapeError(f'finishTime 应为 ISO 时间字符串，收到 {type(value).__name__}')
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        raise UnsupportedShapeError(f'finishTime 不是可解析的 ISO 时间: {value!r}') from None
-    if parsed.tzinfo is None:
-        raise UnsupportedShapeError(f'finishTime 缺时区，不推断本地时区: {value!r}')
-    return parsed
+    return value
 
 
 def _person_id(value, where):
+    """待办内部人员 ID：观察类型为 int。
+
+    转换规则：``bool`` 拒绝；``int`` 转为十进制规范字符串（``format(n, 'd')``）；
+    字符串仅在等于该规范形式时接受，避免 ``"0123"`` 与 ``123`` 被当成同一人；
+    其它类型拒绝。不做跨命名空间转换。
+    """
     if value is None:
         raise MissingFieldError(f'{where} 缺少人员 ID')
-    if not isinstance(value, str) or not value:
-        raise UnsupportedShapeError(f'{where} 的人员 ID 应为非空字符串')
-    return value
+    if isinstance(value, bool):
+        raise UnsupportedShapeError(f'{where} 的人员 ID 不能是布尔值')
+    if isinstance(value, int):
+        return format(value, 'd')
+    if isinstance(value, str):
+        if not value:
+            raise UnsupportedShapeError(f'{where} 的人员 ID 不能是空字符串')
+        try:
+            parsed = int(value, 10)
+        except ValueError:
+            raise UnsupportedShapeError(
+                f'{where} 的人员 ID 字符串必须是十进制整数: {value!r}'
+            ) from None
+        canonical = format(parsed, 'd')
+        if value != canonical:
+            raise UnsupportedShapeError(
+                f'{where} 的人员 ID 字符串必须是规范十进制 {canonical!r}，收到 {value!r}'
+            )
+        return canonical
+    raise UnsupportedShapeError(
+        f'{where} 的人员 ID 应为整数或规范十进制字符串，收到 {type(value).__name__}'
+    )

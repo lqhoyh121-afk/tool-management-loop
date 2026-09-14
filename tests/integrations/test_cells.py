@@ -91,6 +91,27 @@ class TypeAnomalyTests(unittest.TestCase):
         with self.assertRaises(UnsupportedShapeError):
             read_number(cells, NUMBER)
 
+    def test_int_number_is_refused(self):
+        cells = synthetic_cells()
+        cells[NUMBER] = 2
+        with self.assertRaises(UnsupportedShapeError):
+            read_number(cells, NUMBER)
+
+    def test_float_number_is_refused(self):
+        cells = synthetic_cells()
+        cells[NUMBER] = 2.0
+        with self.assertRaises(UnsupportedShapeError):
+            read_number(cells, NUMBER)
+
+    def test_non_finite_number_string_is_refused(self):
+        cells = synthetic_cells()
+        cells[NUMBER] = 'Infinity'
+        with self.assertRaises(UnsupportedShapeError):
+            read_number(cells, NUMBER)
+        cells[NUMBER] = 'NaN'
+        with self.assertRaises(UnsupportedShapeError):
+            read_number(cells, NUMBER)
+
     def test_unparsable_number_is_refused(self):
         cells = synthetic_cells()
         cells[NUMBER] = '2 把'
