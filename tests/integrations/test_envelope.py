@@ -1,6 +1,11 @@
+import sys
 import unittest
+from pathlib import Path
 
-from support import sample
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from t03_fixture_loader import sample
 
 from integrations.dingtalk.envelope import (
     extract_records,

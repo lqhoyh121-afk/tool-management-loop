@@ -65,8 +65,16 @@ Refs #3。当前只有**离线解析**：按公开 T01 报告已观察到的返�
 
 合成夹具在 `tests/integrations/fixtures/t01_observed_shapes.json`，每份样例标注来源报告条目与模拟性质，标识一律 `SYNTHETIC-` 前缀。没有真实资源 ID、人员、台账内容或个人路径。
 
+统一入口（T09 已合入 main）：
+
+```text
+python scripts/repo_checks.py
+```
+
+显式目录入口：
+
 ```text
 python -m unittest discover -s tests/integrations -p "test_*.py" -v
 ```
 
-仓库根的 `python -m unittest discover -s tests -p "test_*.py"` **不会**发现本目录：`tests/integrations/` 不是包，加 `__init__.py` 又会让 `tests` 下的 `integrations` 遮蔽顶层 `integrations/` 包。统一测试发现入口属于 T09 (#9)，本卡不越界修改，按上面的命令显式运行。
+辅助模块是 `t03_fixture_loader.py`，不用通用名 `support`。各测试按本文件所在目录把它加入搜索路径，因此统一入口按文件导入时也能加载，不必改 CI 或全局 `PYTHONPATH`。不要给 `tests/integrations/` 加 `__init__.py`，以免遮蔽顶层 `integrations/` 包。

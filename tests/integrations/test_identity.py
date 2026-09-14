@@ -1,6 +1,9 @@
+import sys
 import unittest
+from pathlib import Path
 
-from support import sample  # noqa: F401  # 统一把仓库根加入 sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from integrations.dingtalk.errors import IdentityNamespaceError
 from integrations.dingtalk.identity import CONTACT, RECORD_CREATOR, TODO, PersonRef
