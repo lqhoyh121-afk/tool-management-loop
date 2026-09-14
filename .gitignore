@@ -1,0 +1,21 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+# Local backups and runtime artifacts
+*.bak
+*.bak.*
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+logs/
+.cache/
+# Local planning history and generated handoffs are not public
+/DECISIONS.md
+/CONTEXT.md
+/业务规划.md
+/build_business_plan.py
+/deliverables/
+/local-private/
+/runtime/

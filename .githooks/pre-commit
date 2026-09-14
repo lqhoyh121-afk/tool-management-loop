@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+python scripts/repo_guard.py --staged
+python -m unittest discover -s tests -p 'test_*.py' -v
