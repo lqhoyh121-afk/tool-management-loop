@@ -147,21 +147,27 @@ def run_tests(tests_dir=None, stream=None):
         spec.loader.exec_module(module)
         return loader.loadTestsFromModule(module)
 
-    def add_with_notes(loaded, rel):
-        # unittest converts a raising load_tests into a _FailedTest error case
-        # instead of propagating; attribute it to the declaring file.
-        stack = list(loaded)
+    def iter_cases(tests):
+        stack = list(tests)
         while stack:
             item = stack.pop()
             if isinstance(item, unittest.TestSuite):
                 stack.extend(item)
-            elif type(item).__name__ == '_FailedTest':
-                problems.append(f'{rel}: load failed: load_tests raised during suite construction')
-        suite.addTests(loaded)
+            else:
+                yield item
 
-    # Phase 1: adapter files (module-level load_tests) run first and own every
-    # collected test file they import; single ownership, no double execution.
-    consumed = set()
+    def case_key(case):
+        module = sys.modules.get(type(case).__module__)
+        loaded = getattr(module, '__file__', None)
+        if not loaded:
+            return None
+        return (str(Path(loaded).resolve()), type(case).__qualname__, case._testMethodName)
+
+    # Phase 1: adapter files (module-level load_tests, detected statically)
+    # execute first. Ownership of an imported file is decided by the cases the
+    # adapter actually returns, never by the import itself.
+    adapter_runs = []
+    imported = {}
     plain = []
     for full, rel in files:
         try:
@@ -174,25 +180,69 @@ def run_tests(tests_dir=None, stream=None):
             continue
         before = set(sys.modules)
         try:
-            add_with_notes(load_module(full, rel), rel)
+            loaded = load_module(full, rel)
         except Exception as exc:
             problems.append(f'{rel}: load failed: {type(exc).__name__}: {exc}')
             continue
         for name in set(sys.modules) - before:
-            loaded = getattr(sys.modules[name], '__file__', None)
-            if loaded:
-                key = str(Path(loaded).resolve())
-                if key in resolved:
-                    consumed.add(key)
+            mod_file = getattr(sys.modules[name], '__file__', None)
+            if mod_file:
+                key = str(Path(mod_file).resolve())
+                if key in resolved and key not in imported:
+                    imported[key] = name
+        for item in iter_cases(loaded):
+            if type(item).__name__ == '_FailedTest':
+                problems.append(f'{rel}: load failed: load_tests raised during suite construction')
+                break
+        adapter_runs.append((rel, loaded))
 
-    # Phase 2: direct discovery of everything not already owned by an adapter.
+    contributed = {}
+    for _rel, loaded in adapter_runs:
+        for case in iter_cases(loaded):
+            key = case_key(case)
+            if key:
+                contributed.setdefault(key[0], set()).add(key)
+        suite.addTests(loaded)
+
+    # Phase 2: direct discovery. Files fully covered by an adapter's returned
+    # suite are skipped; files imported but never collected still run; files
+    # only partially collected fail closed instead of guessing.
     for full, rel in plain:
-        if str(full.resolve()) in consumed:
+        fkey = str(full.resolve())
+        if fkey not in imported:
+            try:
+                suite.addTests(load_module(full, rel))
+            except Exception as exc:
+                problems.append(f'{rel}: load failed: {type(exc).__name__}: {exc}')
+            continue
+        module = sys.modules.get(imported[fkey])
+        if module is None:
+            problems.append(f'{rel}: adapter imported this file but left no module; failing closed')
             continue
         try:
-            add_with_notes(load_module(full, rel), rel)
+            expected = unittest.TestLoader().loadTestsFromModule(module)
+            expected_keys = {case_key(case) for case in iter_cases(expected)}
         except Exception as exc:
-            problems.append(f'{rel}: load failed: {type(exc).__name__}: {exc}')
+            problems.append(f'{rel}: cannot verify adapter coverage: {type(exc).__name__}: {exc}')
+            continue
+        collected = contributed.get(fkey, set()) & expected_keys
+        if not collected:
+            suite.addTests(expected)
+        elif expected_keys - collected:
+            problems.append(f'{rel}: adapter collected only {len(collected)} of '
+                            f'{len(expected_keys)} cases; failing closed')
+
+    # Global duplicate guard: no source case may execute twice.
+    seen = {}
+    for case in iter_cases(suite):
+        if type(case).__name__ == '_FailedTest':
+            continue
+        key = case_key(case)
+        if key:
+            seen[key] = seen.get(key, 0) + 1
+    for (fpath, qualname, _method), count in seen.items():
+        if count > 1:
+            problems.append(f'duplicate test case execution: {qualname} in {fpath} ran {count} times')
 
     if suite.countTestCases() == 0:
         print('ERROR: zero test cases discovered')

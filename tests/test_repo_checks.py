@@ -71,6 +71,55 @@ def adapter_source():
         '    return suite\n')
 
 
+def adapter_import_only_source():
+    return (
+        '"""Adapter that imports a test file for helpers but never collects it."""\n'
+        'import importlib.util\n'
+        'import sys\n'
+        'import unittest\n'
+        'from pathlib import Path\n'
+        '\n'
+        'TARGET = Path(__file__).resolve().parent / "sub" / "test_hidden.py"\n'
+        '\n'
+        '\n'
+        'class AdapterCases(unittest.TestCase):\n'
+        '    def test_adapter(self):\n'
+        '        self.assertTrue(True)\n'
+        '\n'
+        '\n'
+        'def load_tests(loader, tests, pattern):\n'
+        '    name = "ad_hidden"\n'
+        '    spec = importlib.util.spec_from_file_location(name, TARGET)\n'
+        '    module = importlib.util.module_from_spec(spec)\n'
+        '    sys.modules[name] = module\n'
+        '    spec.loader.exec_module(module)\n'
+        '    suite = unittest.TestSuite()\n'
+        '    suite.addTests(loader.loadTestsFromTestCase(AdapterCases))\n'
+        '    return suite\n')
+
+
+def adapter_partial_source():
+    return (
+        '"""Adapter that imports a test file and collects only one case."""\n'
+        'import importlib.util\n'
+        'import sys\n'
+        'import unittest\n'
+        'from pathlib import Path\n'
+        '\n'
+        'TARGET = Path(__file__).resolve().parent / "sub" / "test_two.py"\n'
+        '\n'
+        '\n'
+        'def load_tests(loader, tests, pattern):\n'
+        '    name = "ad_two"\n'
+        '    spec = importlib.util.spec_from_file_location(name, TARGET)\n'
+        '    module = importlib.util.module_from_spec(spec)\n'
+        '    sys.modules[name] = module\n'
+        '    spec.loader.exec_module(module)\n'
+        '    suite = unittest.TestSuite()\n'
+        '    suite.addTest(module.TwoCases("test_first"))\n'
+        '    return suite\n')
+
+
 def secret_source():
     q = chr(39)
     return 'API' + '_KEY = ' + q + 'z' * 24 + q + '\n'
@@ -166,6 +215,37 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn('test_suite.py', joined)
         self.assertIn('load failed', joined)
         self.assertIn('RuntimeError', stream.getvalue())
+
+    def test_adapter_import_without_collection_still_runs(self):
+        write(self.tests_dir / 'sub' / 'test_hidden.py',
+              'import unittest\n\n\nclass HiddenCases(unittest.TestCase):\n'
+              '    def test_hidden_must_fail(self):\n'
+              '        self.fail("never collected by adapter")\n')
+        write(self.tests_dir / 'test_suite.py', adapter_import_only_source())
+        problems, stats = self.run_runner()
+        self.assertEqual(stats['tests'], 2)
+        self.assertEqual(stats['failures'], 1)
+        self.assertTrue(any('test failure' in p for p in problems), problems)
+
+    def test_partial_adapter_coverage_fails_closed(self):
+        write(self.tests_dir / 'sub' / 'test_two.py',
+              'import unittest\n\n\nclass TwoCases(unittest.TestCase):\n'
+              '    def test_first(self):\n'
+              '        self.assertTrue(True)\n'
+              '    def test_second(self):\n'
+              '        self.assertTrue(True)\n')
+        write(self.tests_dir / 'test_suite.py', adapter_partial_source())
+        problems, stats = self.run_runner()
+        joined = '\n'.join(problems)
+        self.assertIn('test_two.py', joined)
+        self.assertIn('failing closed', joined)
+
+    def test_two_adapters_collecting_same_file_flagged(self):
+        write(self.tests_dir / 'sub' / 'test_one.py', counting_test_source())
+        write(self.tests_dir / 'test_suite_a.py', adapter_source())
+        write(self.tests_dir / 'test_suite_b.py', adapter_source())
+        problems, stats = self.run_runner()
+        self.assertTrue(any('duplicate test case execution' in p for p in problems), problems)
 
     def test_rerun_is_idempotent(self):
         write(self.tests_dir / 'test_once.py', dummy_test_source())
