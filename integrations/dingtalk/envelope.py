@@ -60,10 +60,12 @@ def read_envelope(payload):
     if status != 'success':
         raise UnsupportedShapeError(f'未观察过的 status 取值: {status!r}')
 
+    if 'success' not in payload:
+        raise UnsupportedShapeError('报文缺少 success，不能把缺字段当成功')
     if success is False:
         raise UnsupportedShapeError('success=false 但没有 error.code，无法判定结果')
-    if success is not None and success is not True:
-        raise UnsupportedShapeError(f'success 应为布尔值，收到 {type(success).__name__}')
+    if success is not True:
+        raise UnsupportedShapeError(f'success 应为布尔 true，收到 {success!r}')
 
     return payload
 
@@ -73,9 +75,13 @@ def extract_records(payload):
     envelope = read_envelope(payload)
 
     data = envelope.get('data')
-    if isinstance(data, dict) and 'records' in data:
+    has_data = isinstance(data, dict) and 'records' in data
+    has_top = 'records' in envelope
+    if has_data and has_top:
+        raise UnsupportedShapeError('data.records 与顶层 records 并存，形态歧义，不能静默取边')
+    if has_data:
         container = data
-    elif 'records' in envelope:
+    elif has_top:
         container = envelope
     elif isinstance(data, dict):
         raise UnsupportedShapeError('data 对象里没有 records，未观察过该形态')
