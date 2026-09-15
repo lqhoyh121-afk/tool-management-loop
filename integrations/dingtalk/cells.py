@@ -100,6 +100,16 @@ def read_single_select(cells, field_id):
     return SelectOption(option_id, option_name)
 
 
+def read_select_name(cells, field_id):
+    """Option name from a live ``{id, name}`` cell or a write-path name string."""
+    value = _raw(cells, field_id)
+    if isinstance(value, str):
+        if not value:
+            raise MissingFieldError(f'字段 {field_id} 是空字符串，不能当选项名')
+        return value
+    return read_single_select(cells, field_id).name
+
+
 def read_creator(cells, field_id):
     """返回 ``record_creator`` 命名空间的 :class:`PersonRef`。
 

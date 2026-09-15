@@ -130,6 +130,23 @@ class DwsTransportTests(unittest.TestCase):
         self.assertIn('records', listed)
         self.assertNotIn('records', listed.get('data') or {})
 
+    def test_synthetic_option_id_write_is_not_success(self):
+        current = loan()
+        cells = encode_loan(current, self.fields)
+        cells[self.fields.state] = {
+            'id': f'SYNTHETIC-opt-{current.state.value}',
+            'name': current.state.value,
+        }
+        payload = self.transport.exchange('record.update', {
+            'tenant_id': LOAN.tenant_id,
+            'container_id': LOAN.container_id,
+            'resource_id': LOAN.resource_id,
+            'cells': cells,
+        })
+        self.assertEqual(payload['status'], 'error')
+        self.assertEqual(payload['error']['code'], 'SELECT_OPTION_NOT_FOUND')
+        self.assertEqual(self.adapter.read_loan(LOAN).quantity, 2)
+
     def test_update_uses_records_file_argument(self):
         current = loan()
         cells = encode_loan(replace(current, quantity=1), self.fields)
@@ -140,6 +157,7 @@ class DwsTransportTests(unittest.TestCase):
             'cells': cells,
         })
         self.assertEqual(payload['data']['recordIds'], [LOAN.resource_id])
+        self.assertEqual(payload['status'], 'success')
         files = list((self.work / 'runtime' / 'dws-records-file').iterdir())
         self.assertEqual(len(files), 1)
         if os.name == 'nt':
