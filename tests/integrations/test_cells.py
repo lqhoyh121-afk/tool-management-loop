@@ -15,6 +15,7 @@ from integrations.dingtalk.cells import (
     read_number,
     read_single_select,
     read_text,
+    read_text_or_empty,
 )
 from integrations.dingtalk.envelope import extract_records, record_cells
 from integrations.dingtalk.errors import MissingFieldError, UnsupportedShapeError
@@ -58,6 +59,12 @@ class MissingFieldTests(unittest.TestCase):
     def test_absent_field_is_reported(self):
         with self.assertRaises(MissingFieldError):
             read_number(synthetic_cells(), 'fldSYN9999')
+
+    def test_optional_text_absent_is_empty_string(self):
+        self.assertEqual(read_text_or_empty({}, 'fldSYN9999'), '')
+
+    def test_optional_text_null_is_empty_string(self):
+        self.assertEqual(read_text_or_empty({'fldSYN9999': None}, 'fldSYN9999'), '')
 
     def test_null_field_is_reported(self):
         cells = synthetic_cells()

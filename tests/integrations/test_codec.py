@@ -51,6 +51,16 @@ class CodecTests(unittest.TestCase):
             decode_loan(loan().ref, cells, fields)
         self.assertEqual(caught.exception.code, Code.EVIDENCE)
 
+    def test_select_name_not_id_and_omitted_empty_return(self):
+        fields = SYNTHETIC_FIELDS
+        current = loan()
+        cells = encode_loan(current, fields)
+        cells[fields.state] = {'id': 'SYNTHETIC-rand-state', 'name': current.state.value}
+        cells[fields.tracked] = {'id': 'SYNTHETIC-rand-tracked', 'name': 'false'}
+        cells.pop(fields.return_id, None)
+        cells.pop(fields.return_container, None)
+        self.assertEqual(decode_loan(current.ref, cells, fields), current)
+
     def test_return_ref_roundtrip(self):
         fields = SYNTHETIC_FIELDS
         current = replace(

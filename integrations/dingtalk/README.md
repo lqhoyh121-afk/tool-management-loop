@@ -34,7 +34,7 @@ Refs #3。在冻结的 `contracts/` 之上实现 ReadPort / WritePort / StagePor
 
 ## 字段映射（T01）
 
-台账记录走 `FieldMap`（`codec.decode_loan` / `encode_loan` / 库存）。收集表/阶段入口走 `EntryFieldMap`（`adapter._read_form_event` 与 `form.create` 单元格）。`config_version`、`quantity`、`physical_ids`、`borrower`、`approver`、`manager`、`return_container`、`return_id` 这八个键在两张表上是不同字段 ID；缺任一套映射是 CONFIG，不得把台账 `fields` 套到入口。真实 ID 只存在本机 `binding.json`，合成夹具不得冒充生产字段。
+台账记录走 `FieldMap`（`codec.decode_loan` / `encode_loan` / 库存）。收集表/阶段入口走 `EntryFieldMap`（`adapter._read_form_event` 与 `form.create` 单元格）。`config_version`、`quantity`、`physical_ids`、`borrower`、`approver`、`manager`、`return_container`、`return_id` 这八个键在两张表上是不同字段 ID；缺任一套映射是 CONFIG，不得把台账 `fields` 套到入口。真实 ID 只存在本机 `binding.json`，合成夹具不得冒充生产字段。singleSelect 业务值读 `.name`（钉钉 `.id` 是随机串）。空的 `return_id` / `return_container` 钉钉不回传，解码按空字符串，不得当缺证失败。
 
 - number：字符串，显式解析为有限小数后再收窄为整数。
 - date：带时区 ISO 字符串。
@@ -47,10 +47,10 @@ Refs #3。在冻结的 `contracts/` 之上实现 ReadPort / WritePort / StagePor
 
 1. `prepare` 原意图，同 ID 不同负载拒绝。
 2. 发前保存 unknown。
-3. 写超时、限流、部分目标未回读：outcome=unknown；再次 submit 拒绝，只能 `query` 原意图。
+3. 写超时、限流：outcome=unknown。回查时若借用和库存都仍是发前快照，记 `NOT_SENT`，允许按原 `operation_id` 再 submit。部分目标已变仍是 unknown，不重放整个意图。
 4. `FORBIDDEN` / `PERMISSION_DENIED` → `IDENTITY_REQUIRED`，立刻停止。
 5. 部分写入（借用已改、库存未改）保持 unknown，不重放整个意图，不把缺查询当成 not_applied。
-6. **首版 `query()` 在写入从未落地时仍返回 UNKNOWN，不把“查不到记录”编成 NOT_APPLIED。** 重启后 operator 必须按原 `operation_id` 人工介入（查平台是否已有记录、决定作废或补证据），适配器不会自行改判。T07 联调时验证该运维语义。
+6. **`query()` 在记录根本不存在或读失败时仍返回 UNKNOWN，不把“查不到记录”编成 NOT_APPLIED。** 两个目标都还停在发前快照时才是 `NOT_SENT`。
 7. 阶段回查的容器 ID 只取 `stage.query` 结果里的 `container` 字段；缺字段、空字符串或非字符串按未观察形态失败。不得写死测试夹具名 `synthetic-forms` / `synthetic-todos`。
 
 阶段入口同样：ISSUE/RETURN 为两条独立待办并保存 `IdentityBinding`；APPROVE 表单同时承载同意/拒绝；创建超时只回查，不重创建。

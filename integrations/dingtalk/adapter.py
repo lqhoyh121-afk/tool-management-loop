@@ -1,8 +1,9 @@
 """DingTalk Read/Write/Stage ports over an injected transport.
 
 No credentials, no real platform calls. Tests inject a fake transport.
-Unknown write results stay unknown until an exact query; the adapter never
-blindly resends.
+Unknown write results stay unknown until an exact query. A query that
+finds both loan and stock still at the pre-write snapshot is NOT_SENT and
+may be retried. Partial writes stay unknown and are not replayed.
 """
 from dataclasses import replace
 
@@ -33,6 +34,7 @@ def _business_code(exc):
 
 
 _FORM_DECISIONS = {
+    'apply': Action.APPLY,
     'agree': Action.APPROVE,
     'reject': Action.REJECT,
     'cancel': Action.CANCEL,
@@ -71,8 +73,12 @@ class DingTalkAdapter:
         if saved is not None:
             if saved.outcome == Outcome.VERIFIED:
                 return saved
-            if saved.outcome == Outcome.UNKNOWN:
-                raise ContractError(Code.UNKNOWN)
+            if saved.outcome in (Outcome.UNKNOWN, Outcome.NOT_SENT):
+                queried = self.query(intent)
+                if queried.outcome == Outcome.VERIFIED:
+                    return queried
+                if queried.outcome != Outcome.NOT_SENT:
+                    raise ContractError(Code.UNKNOWN)
         current = self.read_loan(intent.before.ref)
         stock = self.read_inventory(intent.stock_before.ref)
         require(current == intent.before, Code.CONFLICT)
@@ -102,8 +108,12 @@ class DingTalkAdapter:
             f'read:{intent.stock_after.ref.resource_id}'
         )
         receipt = Receipt(intent.operation_id, Outcome.VERIFIED, evidence, loan, inventory)
-        if verify(intent, receipt).outcome != Outcome.VERIFIED:
-            receipt = Receipt(intent.operation_id, Outcome.UNKNOWN, evidence, loan, inventory)
+        checked = verify(intent, receipt).outcome
+        if checked != Outcome.VERIFIED:
+            if loan == intent.before and inventory == intent.stock_before:
+                receipt = Receipt(intent.operation_id, Outcome.NOT_SENT, evidence, loan, inventory)
+            else:
+                receipt = Receipt(intent.operation_id, Outcome.UNKNOWN, evidence, loan, inventory)
         self.journal.save_receipt(receipt)
         return receipt
 
@@ -250,8 +260,8 @@ class DingTalkAdapter:
                     Code.WRONG_LOAN)
             require(read_text(cells, fields.config_version) == loan.config_version,
                     Code.CONFIG)
-            action = _FORM_DECISIONS[read_single_select(cells, fields.decision).id]
-            if action == Action.REQUEST_RETURN:
+            action = _FORM_DECISIONS[read_single_select(cells, fields.decision).name]
+            if action in (Action.APPLY, Action.REQUEST_RETURN):
                 actor = _identity(cells, fields.borrower, loan.ref.tenant_id)
             elif action == Action.CANCEL:
                 actor = _identity(cells, fields.manager, loan.ref.tenant_id)
@@ -261,9 +271,10 @@ class DingTalkAdapter:
             return_ref = None
             quantity = None
             physical_ids = ()
-            if action == Action.REQUEST_RETURN:
+            if action in (Action.APPLY, Action.REQUEST_RETURN):
                 quantity = _int_count(cells, fields.quantity, zero=False)
                 physical_ids = _text_list(cells, fields.physical_ids)
+            if action == Action.REQUEST_RETURN:
                 return_ref = Resource(
                     'record', loan.ref.tenant_id,
                     read_text(cells, fields.return_container),

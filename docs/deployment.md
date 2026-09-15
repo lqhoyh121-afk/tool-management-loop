@@ -176,6 +176,10 @@ python -m bootstrap --drive --runtime 运行目录 --lock-root 锁目录
 
 两张表共用一套扁平 `FieldMap` 时，`--drive` 消费 `kind=apply` 会把入口表的 `return_id` 等键套到台账记录上，解码失败为 `EVIDENCE_REQUIRED`。重叠的八个键（`config_version`、`quantity`、`physical_ids`、`borrower`、`approver`、`manager`、`return_container`、`return_id`）在两张表上是不同 ID。适配器读借用/库存只用 `fields`；读收集表事件只用 `entry_fields`。
 
+## T10 缺陷：假实现必须对齐钉钉回读形态
+
+隔离传输不得把 singleSelect 的 `id` 设成与 `name` 相同，也不得回传空字符串字段。适配器读选项用 `.name`；空的归还字段按空而不是缺证。申请决定 `apply` 的 actor 是借款人。写超时后若台账和库存仍是发前快照，记 `NOT_SENT` 并允许按原操作重试；部分写入仍是 `UNKNOWN`，不重放。
+
 ## 本阶段会做什么
 
 - 检查 Windows、Python 3.11+、文件选择能力。

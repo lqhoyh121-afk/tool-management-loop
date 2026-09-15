@@ -179,7 +179,7 @@ class DwsTransportTests(unittest.TestCase):
         self.assertEqual(verify(intent, receipt).outcome, Outcome.VERIFIED)
         self.assertEqual(self.adapter.query(intent).loan.state, State.RESERVATION_PENDING)
 
-    def test_timeout_submit_does_not_resend(self):
+    def test_timeout_submit_retries_when_records_unchanged(self):
         state = load_state(self.state_path)
         state['timeout'] = ['aitable record update']
         save_state(self.state_path, state)
@@ -189,7 +189,8 @@ class DwsTransportTests(unittest.TestCase):
         self.assertEqual(receipt.outcome, Outcome.UNKNOWN)
         state['timeout'] = []
         save_state(self.state_path, state)
-        self.blocked(Code.UNKNOWN, lambda: self.adapter.submit(intent, self.binding, self.lease))
+        retried = self.adapter.submit(intent, self.binding, self.lease)
+        self.assertEqual(verify(intent, retried).outcome, Outcome.VERIFIED)
 
     def test_create_stage_form_and_todo_use_query_container(self):
         request = StageRequest(stage_operation_id(loan(), Action.APPROVE),

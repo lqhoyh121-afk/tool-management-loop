@@ -66,8 +66,8 @@ class SplitFieldMapTests(unittest.TestCase):
 
     def test_encode_loan_writes_ledger_ids_not_entry_ids(self):
         cells = encode_loan(loan(), self.fields)
-        self.assertIn(self.fields.return_id, cells)
         self.assertNotIn(self.entry_fields.return_id, cells)
+        self.assertNotIn(self.fields.return_id, cells)
         self.assertEqual(decode_loan(LOAN, cells, self.fields), loan())
 
     def test_decode_loan_rejects_entry_ids_on_ledger_cells(self):

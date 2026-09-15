@@ -140,7 +140,7 @@ class DwsTransport:
     def _form_cells(self, arguments):
         tenant = arguments['tenant_id']
         fields = self.entry_fields
-        return {
+        cells = {
             fields.loan_container: arguments['loan_container'],
             fields.loan_id: arguments['loan_id'],
             fields.config_version: arguments['config_version'],
@@ -152,9 +152,11 @@ class DwsTransport:
             fields.manager: _put_identity(Identity('contact', tenant, arguments['manager'])),
             fields.action: arguments['action'],
             fields.operation_id: arguments['operation_id'],
-            fields.return_container: '',
-            fields.return_id: '',
         }
+        if arguments.get('return_container') and arguments.get('return_id'):
+            cells[fields.return_container] = arguments['return_container']
+            cells[fields.return_id] = arguments['return_id']
+        return cells
 
     def _records_file(self, records):
         path = self._files_dir / f'{uuid.uuid4().hex}.json'

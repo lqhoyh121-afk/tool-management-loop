@@ -52,6 +52,7 @@ class MemoryTransport(Transport):
         self._forms = 0
         self._todos = 0
         self._activities = 0
+        self._selects = 0
         self._next_internal = 9000000100
         self.contact_to_internal = {}
 
@@ -83,7 +84,9 @@ class MemoryTransport(Transport):
         key = ('synthetic-org', self.form_container, form_id)
         cells = self.records[key]
         fields = self.entry_fields
-        cells[fields.decision] = {'id': decision, 'name': decision}
+        cells[fields.decision] = {
+            'id': f'SYNTHETIC-rand-{decision}', 'name': decision,
+        }
         cells[fields.occurred_at] = occurred_at
         if 'return_container' in extra:
             cells[fields.return_container] = extra['return_container']
@@ -125,9 +128,24 @@ class MemoryTransport(Transport):
             return ok_envelope(data={'records': [], 'hasMore': False})
         record = {
             'recordId': arguments['resource_id'],
-            'cells': deepcopy(self.records[key]),
+            'cells': self._live_cells(self.records[key]),
         }
         return ok_envelope(data={'records': [record], 'hasMore': False})
+
+    def _live_cells(self, cells):
+        visible = {}
+        for field_id, value in cells.items():
+            if value == '':
+                continue
+            if isinstance(value, dict) and 'id' in value and 'name' in value:
+                self._selects += 1
+                visible[field_id] = {
+                    'id': f'SYNTHETIC-rand-{self._selects:04d}',
+                    'name': value['name'],
+                }
+            else:
+                visible[field_id] = deepcopy(value)
+        return visible
 
     def _record_update(self, arguments):
         if self.drop_after_updates is not None and self.update_count >= self.drop_after_updates:
@@ -156,8 +174,6 @@ class MemoryTransport(Transport):
             fields.manager: _put_identity(Identity('contact', tenant, arguments['manager'])),
             fields.action: arguments['action'],
             fields.operation_id: arguments['operation_id'],
-            fields.return_container: '',
-            fields.return_id: '',
         }
         self.seed_record(Resource('form', tenant, self.form_container, form_id), cells)
         meta = {
