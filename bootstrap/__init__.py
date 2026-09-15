@@ -1,1 +1,1 @@
-"""Deployment wizard package. This is not a production lending workflow."""
+"""Deployment wizard package. Binding, machine lock and import confirm; not a lending workflow."""

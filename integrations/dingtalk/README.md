@@ -1,18 +1,88 @@
-# 钉钉读写适配器（T03 · 第一段）
+# 钉钉读写适配器（T03 · 连接层）
 
-Refs #3。当前只有**离线解析**：按公开 T01 报告已观察到的返回形态提取字段、识别错误、区分人员标识命名空间。
+Refs #3。在冻结的 `contracts/` 之上实现 ReadPort / WritePort / StagePort。传输对象由调用方注入；本目录**不**读凭据、不调用真实 dws、不断言 L4。
 
-**没有**平台调用、端点定义、凭据读取、待办发送、库存写回、身份决策或重试调度。正式连接层等 T02 (#2) 冻结公共契约后再接，那时本目录按契约改写。
+离线解析（报文封套、单元格、待办详情、人员命名空间）仍按公开 T01 报告的已观察形态工作。连接层把这些解析接到公共契约：精确读借用/库存/可信事件，发受限表单或独立待办，提交后必须按原意图回查。
 
 ## 模块
 
 | 文件 | 职责 |
 |---|---|
-| `errors.py` | 解析层失败信号。不是公共业务错误码。 |
-| `identity.py` | 带来源命名空间的人员标识，不做跨命名空间转换。 |
-| `envelope.py` | 报文封套校验与记录列表提取。 |
+| `errors.py` | 解析层失败信号。映射到契约时用 `contracts.model.ContractError`。 |
+| `identity.py` | 带来源命名空间的人员标识，不做通用跨命名空间转换。 |
+| `envelope.py` | 报文封套校验与记录列表提取。缺 `success` 不能当成功；`data.records` 与顶层 `records` 并存视为歧义。 |
 | `cells.py` | 多维表单元格取值与形态校验。 |
-| `todo.py` | 待办详情与实际完成事件。 |
+| `todo.py` | 待办详情与实际完成事件。`finishTime` 保持整数，不换算 datetime。 |
+| `layout.py` | 适配器私有字段 ID，不是公共契约名。 |
+| `codec.py` | Loan / Inventory 按 T01 单元格类型编解码。角色字段写成 creator 形态 `[{corpId,userId}]`，读出后作为 **contact** Identity；这是本适配器写入后再读回的约定，不是通用 record_creator→contact 转换。 |
+| `transport.py` | 注入传输接口。`None` 表示超时/掉线，结果未知。 |
+| `adapter.py` | Read/Write/Stage 端口。每次写入检查 lease 与 `check_binding`；发前将回执标为 unknown；不明结果只 query，不盲重发。 |
+
+## 注入命令名（仅测试/适配器内部）
+
+真实 T07 必须把这些名字对到本机已验证的 dws/多维表命令，不能把本表当作已证明的平台 API。
+
+| 内部命令 | 对应的 T01 观察 / 停止点 |
+|---|---|
+| `record.query` | `record query`（`data.records`）与 `record query --all`（顶层 `records`） |
+| `record.update` | T01 证明了可读；精确更新命令与失败形态由 T07 对照本机回执后才能写死 |
+| `form.create` / 表单记录查询 | T01 用的是受限收集表（`view get` 的 formInfo + 结果表 `record query`），不是 OA。建表/授权若只能靠 UI，程序不得假装 CLI 已可建入口 |
+| `todo.create` | `todo task create --executors` 接受通讯录 userId |
+| `todo.get` | `todo task get` → `result.todoDetailModel` |
+| `stage.query` | 适配器保存的原单/阶段绑定回读；平台没有同名命令 |
+
+## 字段映射（T01）
+
+- number：字符串，显式解析为有限小数后再收窄为整数。
+- date：带时区 ISO 字符串。
+- 角色/creator：`[{corpId,userId}]`。
+- 待办内部人员 ID、`finishTime`：int；内部 ID 规范为十进制字符串后放入 `Identity(namespace="todo")`。
+- 完成事件：只认 `task.self.done` / `task.done`；同一 task 上两者归一为一条业务事件，不看成两次确认。
+- **`finishTime` 不得当作 `Event.occurred_at`。** 单位未说明。连接层要求待办回执另有带时区 ISO 的 `result.occurredAt`；没有该证据就 fail-closed。T07 若观察不到等价 ISO 时间字段，必须停止，不得用整数时间戳猜纪元。
+
+## 写入与未知结果
+
+1. `prepare` 原意图，同 ID 不同负载拒绝。
+2. 发前保存 unknown。
+3. 写超时、限流、部分目标未回读：outcome=unknown；再次 submit 拒绝，只能 `query` 原意图。
+4. `FORBIDDEN` / `PERMISSION_DENIED` → `IDENTITY_REQUIRED`，立刻停止。
+5. 部分写入（借用已改、库存未改）保持 unknown，不重放整个意图，不把缺查询当成 not_applied。
+6. **首版 `query()` 在写入从未落地时仍返回 UNKNOWN，不把“查不到记录”编成 NOT_APPLIED。** 重启后 operator 必须按原 `operation_id` 人工介入（查平台是否已有记录、决定作废或补证据），适配器不会自行改判。T07 联调时验证该运维语义。
+7. 阶段回查的容器 ID 只取 `stage.query` 结果里的 `container` 字段；缺字段、空字符串或非字符串按未观察形态失败。不得写死测试夹具名 `synthetic-forms` / `synthetic-todos`。
+
+阶段入口同样：ISSUE/RETURN 为两条独立待办并保存 `IdentityBinding`；APPROVE 表单同时承载同意/拒绝；创建超时只回查，不重创建。
+
+## T07 主控实测命令与停止点
+
+隔离测试通过 **不等于** L4。下列命令仅供主控本机对照，协作者不得索要凭据或代跑真实组织。
+
+建议先只读：
+
+```text
+dws auth status --format json
+dws contact user me -y
+dws record query
+dws record query --all
+dws todo task get
+```
+
+写入前必须能精确指出目标 Base/表/记录/待办，并先回读。候选写命令（以本机帮助与 T01 回执为准，不在此编造参数）：
+
+```text
+dws todo task create --executors
+```
+
+**停止点（任一出现即停，不盲发、不声称成功）：**
+
+1. 受限表单无法证明“原单完整引用 + 指定人 + 明确决定”，只靠可编辑标题或说明文本。
+2. 待办完成活动的 creatorId 无法与创建时通讯录执行者做成 **该 task 限定** 的 IdentityBinding。
+3. 没有带时区的完成时间证据，只有 `finishTime` 整数。
+4. `success: true` 同时带 `error.code`，或 `view update` 一类“受理但未改变配置”的回执。
+5. 权限不足、限流、超时、只回读到其中一个目标。
+6. 普通人主账未整体拒绝、或字段级权限未验证却当成已隔离。
+7. 需要跨机器、并发、OA 审批流或通用审批关联——首版不支持。
+
+所需权限（T01 已部分证明、T07 仍须本机重验）：当前运行账号可读写指定主账；普通人不可访问该主账；审批/归还为仅指定人可填的受限收集表；借出/归还确认待办只分配给指定管理人。
 
 ## 依据的已观察形态
 
@@ -23,60 +93,40 @@ Refs #3。当前只有**离线解析**：按公开 T01 报告已观察到的返�
 | `record query` 单页 | `data.records[].recordId` 与 `cells[fieldId]` | `envelope.extract_records` 优先读 `data.records` |
 | `record query --all` | 有数据时是顶层 `records` | 同一函数回退读顶层 `records` |
 | `--all` 空表 | 曾返回 `records: null, hasMore: false, pages: 1` | `null` 且 `hasMore is False` 时当空结果；缺 `hasMore` 或其它假值报错 |
-| 成功封套 | 主控核对原始回执：`status=success` 且 `error={}` | 空 `error` 表示无业务错误，不是缺 `code`；缺 `status`/`error` 不能当成功 |
+| 成功封套 | 主控核对原始回执：`status=success` 且 `error={}`；正式段要求 `success` 键存在且为 true | 空 `error` 表示无业务错误；缺 `success`/`status`/`error` 不能当成功 |
 | 顶层成功掩盖业务错误 | Base 不存在时 `success: true` 同时 `status: error`、`error.code=BASE_NOT_FOUND` | 先查 `error.code` 与 `status`，不把 success 布尔值当成功 |
+| 两种 records 同时出现 | 正式段收紧：不得静默取 `data` | `UnsupportedShapeError` |
 | 未支持错误封套 | 公开报告未确认 `errorCode` / `errorMsg` | 即使带空 `records` 也报错，不当空成功 |
-| creator 单元格 | `[{corpId, userId}]`，组织加人员的二元身份；不能用姓名代替 | 返回 `record_creator` 命名空间的 `PersonRef`，必须带 org；字符串取值直接报错 |
-| number 单元格 | 本次回读为字符串，需显式数值解析 | 只接受字符串，解析为有限 `Decimal`；int/float/bool、空串、带单位文本、非有限值均报错 |
-| date 单元格 | 带时区 ISO 字符串 | 解析为 aware `datetime`；无时区报错，不补默认时区 |
-| singleSelect 单元格 | `{id, name}` | 原样返回 `SelectOption`，缺 id 或 name 报错 |
-| 待办详情 | `todo task get` 返回 `result.todoDetailModel` | `todo.read_todo_detail` |
-| 待办人员 ID | `executorIds`、`activities[].creatorId` 是待办内部人员 ID；主控核对类型为 int | 标为 `todo` 命名空间；int 转规范十进制字符串，非规范字符串与 bool 拒绝；跨命名空间比较报错 |
-| 实际完成事件 | `action` 为 `task.self.done`、`task.done`，带 `activityId`、`creatorId`；`finishTime` 为 int，未完成时为 0 | `completion_events` 只认这两种 action；`finish_time` 原样保留非 0 整数，0 视为未完成，不换算 datetime |
-| 完成者判定 | 不能只依据执行人或 `modifierId`；勾完成也不等于同意 | `completed_by` 只看完成活动的 `creatorId`，完全不读 `isDone`、`modifierId` |
+| creator 单元格 | `[{corpId, userId}]`，组织加人员的二元身份；不能用姓名代替 | 解析为 `record_creator`；codec 在本适配器自写自读的角色字段上收成 contact Identity |
+| number 单元格 | 本次回读为字符串，需显式数值解析 | 只接受字符串，解析为有限 `Decimal` |
+| date 单元格 | 带时区 ISO 字符串 | 解析为 aware `datetime`；无时区报错 |
+| 待办人员 ID | `executorIds`、`activities[].creatorId` 为 int | `todo` 命名空间；int 转规范十进制字符串 |
+| 实际完成事件 | `task.self.done`、`task.done`；`finishTime` 为 int | 完成活动只认这两种 action；`finishTime` 不换算 |
 
 ## 人员标识命名空间
-
-报告观察到三处来源，并明确不得把它们直接相等比较：
 
 - `contact`：通讯录接口返回、且被待办创建参数接受的 userId。
 - `todo`：待办详情内部的人员 ID。
 - `record_creator`：多维表 creator 单元格中的 userId，与 corpId 成对。
 
-`PersonRef.__eq__` 与 `same_person_as` 都包含命名空间和组织。`record_creator` 缺 org 直接报错；同 user、不同 corp 不是同一个人。通讯录标识永远不等于待办内部标识。跨命名空间比较报错而不是静默给出 False，也不提供转换。
+`PersonRef.__eq__` 与 `same_person_as` 都包含命名空间和组织。跨命名空间比较报错而不是静默 False。IdentityBinding 只按 **该次创建参数 + 该 task 回读 + 新完成活动** 建立，不缓存成通用换算表。
 
-报告只在同一个人身上观察到 `record_creator` 与 `contact` 取值一致，并未确认为通用映射，所以本目录**不提供**任何跨命名空间转换。
+## 未验证项
 
-## 结果未知
-
-没有响应报文（例如超时）时 `read_envelope(None)` 抛 `UnknownResultError`，语义是"结果未知"，不是失败。调用方必须先按精确目标回查再决定后续，禁止盲目重发。
-
-回查与重试调度本身**不在本段实现**：它们依赖 T02 冻结的操作标识与接口语义。
-
-## 未验证 / 留给 T02 的问题
-
-1. 报告只逐字记录了 `success` / `status` / `error.code` 三个封套字段。其他错误封套形式（例如命令行常见的 `errorCode` / `errorMsg`）未在公开报告中确认，本目录不处理，遇到即报错。
-2. `record_creator` 的 userId 与通讯录 userId 是否恒等，未确认。
-3. number 是否可能返回非字符串、date 是否可能返回时间戳，均未观察到，当前报错。`finishTime` 的整数单位未由主控说明，本层不换算。
-4. 单元格 creator 出现多个的形态未观察到，当前报错。
-5. `task.self.done` / `task.done` 之外的完成类事件未观察到。
-6. 正文说明中的原单引用是受控配置关联，**不是不可篡改外键**，不能当唯一业务主键用。
-7. 公共字段名、状态机、错误码、幂等标识与客户端接口都属于 T02；本目录的异常类与 `PersonRef` 只是本层解析工具，契约冻结后按契约改写或删除。
+1. 真实 `record update` 的完整失败形态、CAS/revision 语义。
+2. 程序化创建受限表单是否可代替 T01 的 UI 配置。
+3. `record_creator` 与通讯录 userId 是否在任意人员上恒等（本适配器只依赖自己写入的角色单元格）。
+4. `finishTime` 的整数单位；跨创建者待办内部 ID 映射（T01 未验）。
+5. 字段级权限、OA、并发、断网重启、跨机器。
+6. 真实组织 L4。本目录的 unittest 只覆盖注入传输。
 
 ## 测试
 
-合成夹具在 `tests/integrations/fixtures/t01_observed_shapes.json`，每份样例标注来源报告条目与模拟性质。字符串标识用 `SYNTHETIC-` 前缀；待办内部人员 ID 等整数标识落在 `9000000000` 及以上合成区间。没有真实资源 ID、人员、台账内容或个人路径。
-
-统一入口（T09 已合入 main）：
+合成夹具：`tests/integrations/fixtures/t01_observed_shapes.json`（解析形态）与 `tests/contracts/fixtures.py`（契约对象）。字符串标识用 `SYNTHETIC-` 前缀；待办内部整数 ID 落在 `9000000000` 及以上。注入传输是 `t03_memory_transport.py`，不用通用名 `support`。
 
 ```text
-python scripts/repo_checks.py
+python -B scripts/repo_checks.py
+python -B -m unittest discover -s tests/integrations -p "test_*.py" -v
 ```
 
-显式目录入口：
-
-```text
-python -m unittest discover -s tests/integrations -p "test_*.py" -v
-```
-
-辅助模块是 `t03_fixture_loader.py`，不用通用名 `support`。各测试按本文件所在目录把它加入搜索路径，因此统一入口按文件导入时也能加载，不必改 CI 或全局 `PYTHONPATH`。不要给 `tests/integrations/` 加 `__init__.py`，以免遮蔽顶层 `integrations/` 包。
+不要给 `tests/integrations/` 加 `__init__.py`，以免遮蔽顶层 `integrations/` 包。

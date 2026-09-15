@@ -69,6 +69,10 @@ class EnvelopeTests(unittest.TestCase):
         with self.assertRaises(UnsupportedShapeError):
             read_envelope({'success': True, 'status': 'success'})
 
+    def test_missing_success_is_not_success(self):
+        with self.assertRaises(UnsupportedShapeError):
+            read_envelope({'status': 'success', 'error': {}})
+
     def test_error_code_envelope_is_refused_even_with_empty_records(self):
         with self.assertRaises(UnsupportedShapeError):
             extract_records(ok_payload(errorCode='SYNTHETIC-ERR', records=[]))
@@ -86,6 +90,10 @@ class RecordListTests(unittest.TestCase):
     def test_single_page_uses_data_records(self):
         records = extract_records(sample('record_query_single_page'))
         self.assertEqual([record_id(r) for r in records], ['SYNTHETIC-record-0001'])
+
+    def test_data_and_top_level_records_together_are_ambiguous(self):
+        with self.assertRaises(UnsupportedShapeError):
+            extract_records(ok_payload(data={'records': []}, records=[]))
 
     def test_all_pages_uses_top_level_records(self):
         records = extract_records(sample('record_query_all_pages'))
