@@ -63,6 +63,16 @@
 
 L1/L2 合成实现注入测试，与 #5 验收清单一一对应：完整借还、拒绝、取消释放、错人错单、缺编号/数量不符、库存不足、重复事件、旧事件、未知结果回查、未确认不增库存、预留竞争、重启与跨表部分成功恢复。每项断言真实业务状态与库存变化，不只看返回值。运行 `python scripts/repo_checks.py` 确认 tests/workflow 新增测试实际纳入且非零，必要时另列本目录显式测试命令。
 
+## 实现（阶段二，2026-09-15）
+
+`workflow/engine.py` 的 `LendingEngine` 消费冻结契约（contracts v0.1.0）编排主链：注入 ReadPort/WritePort/StagePort/OperationStore/SingleInstance，不自带平台客户端、不另造字段或状态。关键口径：
+
+- `admit_application` 先核验可信申请；`execute`/`reserve` 走 plan→prepare→submit→verify，只有回读一致的 Resolution 才发布新状态；UNKNOWN 一律 load→query→verify 回查，不重发。
+- `ensure_stage` 用 `stage_operation_id` 保证同单同阶段只建一次；受理不明的阶段回查不重建。
+- 系统预留（reserve）事件由审批事件确定性派生（`system:` 前缀 event_id），evidence 沿用审批回读。
+- 预留不足由契约抛 RESERVATION_CONFLICT 挂起，引擎不落任何意图；重复事件抛 DUPLICATE，不重复增减。
+- 测试见 `tests/workflow/test_engine.py`（20 项，含本文用例集 U1-U3、R1-R11 的合成实现覆盖；端口为合成件，L1/L2）。
+
 ## 开工核对记录（2026-09-14）
 
 - 分支 `task/t05-lending-loop`，基线 `61b0be1`（与 origin/main HEAD 一致），工作区干净，HEAD 与基线相符。
