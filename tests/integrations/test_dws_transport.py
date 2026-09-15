@@ -22,7 +22,7 @@ from integrations.dingtalk.codec import encode_inventory, encode_loan
 from integrations.dingtalk.dws_transport import (DwsTransport, split_container,
                                                  windows_native_path)
 from integrations.dingtalk.errors import UnsupportedShapeError
-from integrations.dingtalk.layout import SYNTHETIC_FIELDS
+from integrations.dingtalk.layout import SYNTHETIC_FIELDS, entry_fields_from
 
 
 def _load(name, path):
@@ -65,6 +65,7 @@ class DwsTransportTests(unittest.TestCase):
         self.state_path = self.work / 'fake-state.json'
         save_state(self.state_path, load_state(self.state_path))
         self.fields = SYNTHETIC_FIELDS
+        self.entry_fields = entry_fields_from(self.fields)
         self.journal = SyntheticJournal()
         self.leases = SyntheticLease()
         self.lease = self.leases.acquire(LedgerScope.from_record(ITEM), MANAGER)
@@ -74,9 +75,11 @@ class DwsTransportTests(unittest.TestCase):
         self.transport = DwsTransport(
             [sys.executable, str(FAKE_DWS)], self.fields,
             form_container=FORM_CONTAINER, todo_container=TODO_CONTAINER,
-            work_dir=self.work / 'runtime', extra_env={'FAKE_DWS_STATE': str(self.state_path)},
+            work_dir=self.work / 'runtime', entry_fields=self.entry_fields,
+            extra_env={'FAKE_DWS_STATE': str(self.state_path)},
         )
-        self.adapter = DingTalkAdapter(self.transport, self.journal, self.leases, self.fields)
+        self.adapter = DingTalkAdapter(
+            self.transport, self.journal, self.leases, self.fields, self.entry_fields)
         self.seed(loan(), stock())
 
     def tearDown(self):

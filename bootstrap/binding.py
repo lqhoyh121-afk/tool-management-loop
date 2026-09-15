@@ -4,6 +4,7 @@ from pathlib import Path
 
 from contracts.model import Code, ContractError, Identity, Resource, require, text
 from contracts.ports import LedgerScope, RuntimeBinding
+from integrations.dingtalk.layout import EntryFieldMap, FieldMap
 
 BINDING_NAME = 'binding.json'
 TMP_NAME = 'binding.json.tmp'
@@ -58,6 +59,7 @@ def binding_from_document(data):
         *flags,
     )
     require_complete(binding)
+    field_maps_from_document(data)
     entry = data.get('application_entry')
     require(entry is not None, Code.EVIDENCE)
     application = _resource(entry)
@@ -78,6 +80,21 @@ def require_complete(binding):
         binding.explicitly_confirmed,
     )), Code.EVIDENCE)
     return binding
+
+
+def field_maps_from_document(data):
+    """Ledger FieldMap and stage-entry EntryFieldMap are both required. No fallback."""
+    require(isinstance(data, dict), Code.INVALID)
+    raw_fields = data.get('fields')
+    raw_entry = data.get('entry_fields')
+    require(isinstance(raw_fields, dict), Code.CONFIG)
+    require(isinstance(raw_entry, dict), Code.CONFIG)
+    try:
+        fields = FieldMap(**raw_fields)
+        entry_fields = EntryFieldMap(**raw_entry)
+    except TypeError as exc:
+        raise ContractError(Code.CONFIG) from exc
+    return fields, entry_fields
 
 
 def load_binding(runtime):

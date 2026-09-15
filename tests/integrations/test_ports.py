@@ -14,7 +14,7 @@ from contracts.model import Action, Code, ContractError, Outcome, State
 from contracts.ports import LedgerScope, RuntimeBinding, StageRequest, stage_operation_id
 from integrations.dingtalk.adapter import DingTalkAdapter
 from integrations.dingtalk.codec import encode_inventory, encode_loan
-from integrations.dingtalk.layout import SYNTHETIC_FIELDS
+from integrations.dingtalk.layout import SYNTHETIC_FIELDS, entry_fields_from
 
 
 def _load(name, path):
@@ -36,14 +36,16 @@ SyntheticJournal, SyntheticLease = _synthetic.SyntheticJournal, _synthetic.Synth
 class PortTests(unittest.TestCase):
     def setUp(self):
         self.fields = SYNTHETIC_FIELDS
+        self.entry_fields = entry_fields_from(self.fields)
         self.journal = SyntheticJournal()
         self.leases = SyntheticLease()
         self.lease = self.leases.acquire(LedgerScope.from_record(ITEM), MANAGER)
         self.binding = RuntimeBinding(
             MANAGER, LedgerScope.from_record(ITEM), 'synthetic-config-v1',
             MANAGER, MANAGER, 'synthetic-readback', True, True, True, True)
-        self.transport = MemoryTransport(self.fields)
-        self.adapter = DingTalkAdapter(self.transport, self.journal, self.leases, self.fields)
+        self.transport = MemoryTransport(self.fields, self.entry_fields)
+        self.adapter = DingTalkAdapter(
+            self.transport, self.journal, self.leases, self.fields, self.entry_fields)
         self.seed(loan(), stock())
 
     def seed(self, current, inventory):
@@ -147,7 +149,7 @@ class PortTests(unittest.TestCase):
                                loan(), Action.APPROVE, MANAGER)
         receipt = self.adapter.create_stage(request, self.binding, self.lease)
         key = ('synthetic-org', 'synthetic-forms', receipt.source.resource_id)
-        self.transport.records[key][self.fields.loan_id] = 'synthetic-other-loan'
+        self.transport.records[key][self.entry_fields.loan_id] = 'synthetic-other-loan'
         self.transport.complete_form(receipt.source.resource_id, 'agree', NOW.isoformat())
         self.blocked(Code.WRONG_LOAN, lambda: self.adapter.read_event(loan(), receipt.source))
 

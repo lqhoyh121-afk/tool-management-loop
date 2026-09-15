@@ -13,7 +13,7 @@ Refs #3。在冻结的 `contracts/` 之上实现 ReadPort / WritePort / StagePor
 | `envelope.py` | 报文封套校验与记录列表提取。缺 `success` 不能当成功；`data.records` 与顶层 `records` 并存视为歧义。 |
 | `cells.py` | 多维表单元格取值与形态校验。 |
 | `todo.py` | 待办详情与实际完成事件。`finishTime` 保持整数，不换算 datetime。 |
-| `layout.py` | 适配器私有字段 ID，不是公共契约名。 |
+| `layout.py` | 适配器私有字段 ID，不是公共契约名。台账用 `FieldMap`，阶段入口用 `EntryFieldMap`；重叠键在两张表上是不同 ID，禁止共用一套映射。 |
 | `codec.py` | Loan / Inventory 按 T01 单元格类型编解码。角色字段写成 creator 形态 `[{corpId,userId}]`，读出后作为 **contact** Identity；这是本适配器写入后再读回的约定，不是通用 record_creator→contact 转换。 |
 | `transport.py` | 注入传输接口。`None` 表示超时/掉线，结果未知。 |
 | `dws_transport.py` | 真实 dws CLI 驱动。调用方注入 `node`+`dws.js`（或测试假脚本）；不读凭据、不猜安装路径。`--records-file` 只传 Windows 原生路径。`form.create` 是向**已有**收集结果表 `record create`，不是 `view create`。`stage.query` 只读本机阶段索引。 |
@@ -33,6 +33,8 @@ Refs #3。在冻结的 `contracts/` 之上实现 ReadPort / WritePort / StagePor
 | `stage.query` | 适配器保存的原单/阶段绑定回读；平台没有同名命令 |
 
 ## 字段映射（T01）
+
+台账记录走 `FieldMap`（`codec.decode_loan` / `encode_loan` / 库存）。收集表/阶段入口走 `EntryFieldMap`（`adapter._read_form_event` 与 `form.create` 单元格）。`config_version`、`quantity`、`physical_ids`、`borrower`、`approver`、`manager`、`return_container`、`return_id` 这八个键在两张表上是不同字段 ID；缺任一套映射是 CONFIG，不得把台账 `fields` 套到入口。真实 ID 只存在本机 `binding.json`，合成夹具不得冒充生产字段。
 
 - number：字符串，显式解析为有限小数后再收窄为整数。
 - date：带时区 ISO 字符串。

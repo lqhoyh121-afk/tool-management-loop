@@ -343,6 +343,32 @@ class DriveTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('闸门拒绝', stdout.getvalue())
 
+    def test_live_adapter_missing_entry_fields_does_not_reuse_fields(self):
+        from bootstrap.drive import live_adapter
+        from bootstrap.journal import FileJournal
+        data = binding_document(
+            dws_cmd=[sys.executable, '-c', 'pass'],
+            form_container='baseForm/tblForm',
+            todo_container='todoSpace/executors',
+        )
+        del data['entry_fields']
+        self.blocked(Code.CONFIG, lambda: live_adapter(
+            self.runtime, FileJournal(self.runtime / 'operations'),
+            MachineLock(self.locks), data))
+
+    def test_live_adapter_missing_fields_does_not_use_synthetic(self):
+        from bootstrap.drive import live_adapter
+        from bootstrap.journal import FileJournal
+        data = binding_document(
+            dws_cmd=[sys.executable, '-c', 'pass'],
+            form_container='baseForm/tblForm',
+            todo_container='todoSpace/executors',
+        )
+        del data['fields']
+        self.blocked(Code.CONFIG, lambda: live_adapter(
+            self.runtime, FileJournal(self.runtime / 'operations'),
+            MachineLock(self.locks), data))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -43,11 +43,12 @@ _FORM_DECISIONS = {
 class DingTalkAdapter:
     """Implements ReadPort, WritePort and StagePort against `transport`."""
 
-    def __init__(self, transport, journal, leases, fields):
+    def __init__(self, transport, journal, leases, fields, entry_fields):
         self.transport = transport
         self.journal = journal
         self.leases = leases
         self.fields = fields
+        self.entry_fields = entry_fields
 
     def read_loan(self, ref):
         return decode_loan(ref, self._record_cells(ref), self.fields)
@@ -241,31 +242,32 @@ class DingTalkAdapter:
 
     def _read_form_event(self, loan, source):
         cells = self._record_cells(source)
+        fields = self.entry_fields
         try:
-            require(read_text(cells, self.fields.loan_container) == loan.ref.container_id,
+            require(read_text(cells, fields.loan_container) == loan.ref.container_id,
                     Code.WRONG_LOAN)
-            require(read_text(cells, self.fields.loan_id) == loan.ref.resource_id,
+            require(read_text(cells, fields.loan_id) == loan.ref.resource_id,
                     Code.WRONG_LOAN)
-            require(read_text(cells, self.fields.config_version) == loan.config_version,
+            require(read_text(cells, fields.config_version) == loan.config_version,
                     Code.CONFIG)
-            action = _FORM_DECISIONS[read_single_select(cells, self.fields.decision).id]
+            action = _FORM_DECISIONS[read_single_select(cells, fields.decision).id]
             if action == Action.REQUEST_RETURN:
-                actor = _identity(cells, self.fields.borrower, loan.ref.tenant_id)
+                actor = _identity(cells, fields.borrower, loan.ref.tenant_id)
             elif action == Action.CANCEL:
-                actor = _identity(cells, self.fields.manager, loan.ref.tenant_id)
+                actor = _identity(cells, fields.manager, loan.ref.tenant_id)
             else:
-                actor = _identity(cells, self.fields.approver, loan.ref.tenant_id)
-            occurred = read_datetime(cells, self.fields.occurred_at)
+                actor = _identity(cells, fields.approver, loan.ref.tenant_id)
+            occurred = read_datetime(cells, fields.occurred_at)
             return_ref = None
             quantity = None
             physical_ids = ()
             if action == Action.REQUEST_RETURN:
-                quantity = _int_count(cells, self.fields.quantity, zero=False)
-                physical_ids = _text_list(cells, self.fields.physical_ids)
+                quantity = _int_count(cells, fields.quantity, zero=False)
+                physical_ids = _text_list(cells, fields.physical_ids)
                 return_ref = Resource(
                     'record', loan.ref.tenant_id,
-                    read_text(cells, self.fields.return_container),
-                    read_text(cells, self.fields.return_id),
+                    read_text(cells, fields.return_container),
+                    read_text(cells, fields.return_id),
                 )
         except ContractError:
             raise
