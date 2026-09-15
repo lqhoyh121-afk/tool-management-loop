@@ -1,11 +1,16 @@
 import io
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from t04_binding_doc import binding_document
+
+from bootstrap.binding import save_binding
 from bootstrap.wizard import main
 
 
@@ -17,7 +22,7 @@ class WizardTests(unittest.TestCase):
     def tearDown(self):
         self._temp.cleanup()
 
-    def test_check_env_exit_zero_when_injected_pass(self):
+    def test_check_env_exit_nonzero_without_binding(self):
         stdout = io.StringIO()
         code = main(
             ['--check-env'],
@@ -26,10 +31,28 @@ class WizardTests(unittest.TestCase):
             wait_on_error=False,
             environ_kwargs={'system_name': 'Windows', 'version_info': (3, 11, 4, 'final', 0), 'tkinter_available': True},
         )
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1)
         text = stdout.getvalue()
         self.assertIn('Python 运行时: 通过', text)
-        self.assertIn('钉钉授权: 待确认', text)
+        self.assertIn('钉钉授权: 未通过', text)
+        self.assertNotIn('钉钉授权: 待确认', text)
+
+    def test_check_env_exit_zero_when_binding_complete(self):
+        save_binding(self.root, binding_document())
+        stdout = io.StringIO()
+        code = main(
+            ['--check-env', '--runtime', str(self.root)],
+            stdin=io.StringIO(''),
+            stdout=stdout,
+            wait_on_error=False,
+            environ_kwargs={'system_name': 'Windows', 'version_info': (3, 11, 4, 'final', 0),
+                            'tkinter_available': True, 'runtime_dir': str(self.root)},
+        )
+        self.assertEqual(code, 0)
+        text = stdout.getvalue()
+        self.assertIn('人员与路由绑定: 通过', text)
+        self.assertIn('钉钉授权: 通过', text)
+        self.assertIn('台账字段映射与导入: 未通过', text)
 
     def test_preview_html_file(self):
         path = self.root / 'demo.xls'
@@ -100,7 +123,7 @@ class WizardTests(unittest.TestCase):
             environ_kwargs={'system_name': 'Linux', 'version_info': (3, 9, 0, 'final', 0), 'tkinter_available': False},
         )
         self.assertEqual(code, 1)
-        self.assertIn('环境未通过', stdout.getvalue())
+        self.assertIn('环境或绑定未通过', stdout.getvalue())
         self.assertNotIn('should-not-run', stdout.getvalue())
 
     def test_require_ready_blocks_preview_flag(self):
@@ -116,23 +139,46 @@ class WizardTests(unittest.TestCase):
         )
         self.assertEqual(code, 1)
         text = stdout.getvalue()
-        self.assertIn('环境未通过', text)
+        self.assertIn('环境或绑定未通过', text)
         self.assertNotIn('值乙', text)
-        self.assertNotIn('业务就绪', text.split('环境未通过', 1)[0])
+        self.assertNotIn('业务就绪', text.split('环境或绑定未通过', 1)[0])
 
-    def test_require_ready_does_not_treat_pending_as_ready_or_fail(self):
+    def test_require_ready_rejects_ready_file_without_binding(self):
+        (self.root / 'ready.json').write_text(json.dumps({'ready': True}), encoding='utf-8')
         stdout = io.StringIO()
         code = main(
-            ['--require-ready', '--check-env'],
+            ['--require-ready', '--check-env', '--runtime', str(self.root)],
             stdin=io.StringIO(''),
             stdout=stdout,
             wait_on_error=False,
-            environ_kwargs={'system_name': 'Windows', 'version_info': (3, 11, 0, 'final', 0), 'tkinter_available': True},
+            environ_kwargs={'system_name': 'Windows', 'version_info': (3, 11, 0, 'final', 0),
+                            'tkinter_available': True, 'runtime_dir': str(self.root)},
         )
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1)
         text = stdout.getvalue()
-        self.assertIn('钉钉授权: 待确认', text)
+        self.assertIn('钉钉授权: 未通过', text)
+        self.assertIn('ready 标记不能绕过', text)
         self.assertNotIn('钉钉授权: 通过', text)
+
+    def test_bind_refuses_overwrite(self):
+        source = self.root / 'bind.json'
+        source.write_text(json.dumps(binding_document()), encoding='utf-8')
+        kwargs = {'system_name': 'Windows', 'version_info': (3, 11, 0, 'final', 0),
+                  'tkinter_available': True, 'runtime_dir': str(self.root)}
+        first = main(
+            ['--runtime', str(self.root), '--bind', str(source)],
+            stdin=io.StringIO(''), stdout=io.StringIO(), wait_on_error=False,
+            environ_kwargs=kwargs,
+        )
+        self.assertEqual(first, 0)
+        stdout = io.StringIO()
+        second = main(
+            ['--runtime', str(self.root), '--bind', str(source)],
+            stdin=io.StringIO(''), stdout=stdout, wait_on_error=False,
+            environ_kwargs=kwargs,
+        )
+        self.assertEqual(second, 1)
+        self.assertIn('闸门拒绝', stdout.getvalue())
 
 
 if __name__ == '__main__':
