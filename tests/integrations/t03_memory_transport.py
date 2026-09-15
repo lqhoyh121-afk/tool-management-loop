@@ -26,6 +26,16 @@ def error_envelope(code, message='SYNTHETIC-denied'):
     }
 
 
+def _synthetic_option_write(cells):
+    for value in cells.values():
+        if not isinstance(value, dict):
+            continue
+        option_id = value.get('id')
+        if isinstance(option_id, str) and option_id.startswith('SYNTHETIC-opt-'):
+            return True
+    return False
+
+
 class MemoryTransport(Transport):
     """Records, forms and todos in process memory.
 
@@ -134,6 +144,7 @@ class MemoryTransport(Transport):
 
     def _live_cells(self, cells):
         visible = {}
+        select_ids = {self.fields.state, self.fields.tracked}
         for field_id, value in cells.items():
             if value == '':
                 continue
@@ -142,6 +153,12 @@ class MemoryTransport(Transport):
                 visible[field_id] = {
                     'id': f'SYNTHETIC-rand-{self._selects:04d}',
                     'name': value['name'],
+                }
+            elif field_id in select_ids and isinstance(value, str):
+                self._selects += 1
+                visible[field_id] = {
+                    'id': f'SYNTHETIC-rand-{self._selects:04d}',
+                    'name': value,
                 }
             else:
                 visible[field_id] = deepcopy(value)
@@ -153,7 +170,10 @@ class MemoryTransport(Transport):
         key = self._key(arguments)
         if key not in self.records:
             return error_envelope('RECORD_NOT_FOUND')
-        self.records[key] = dict(arguments['cells'])
+        cells = arguments['cells']
+        if _synthetic_option_write(cells):
+            return error_envelope('SELECT_OPTION_NOT_FOUND')
+        self.records[key] = dict(cells)
         self.update_count += 1
         return ok_envelope(result={'recordId': arguments['resource_id']})
 

@@ -126,6 +126,16 @@ def key(base_id, table_id, record_id):
     return f'{base_id}/{table_id}/{record_id}'
 
 
+def synthetic_option_write(cells):
+    for value in cells.values():
+        if not isinstance(value, dict):
+            continue
+        option_id = value.get('id')
+        if isinstance(option_id, str) and option_id.startswith('SYNTHETIC-opt-'):
+            return True
+    return False
+
+
 def main(argv):
     verb = ' '.join(argv[:3])
     spec_error = require_spec(verb, argv)
@@ -164,7 +174,11 @@ def main(argv):
         if slot not in state['records']:
             print(json.dumps(err('RECORD_NOT_FOUND'), ensure_ascii=True))
             return 0
-        state['records'][slot] = dict(record['cells'])
+        cells = dict(record['cells'])
+        if synthetic_option_write(cells):
+            print(json.dumps(err('SELECT_OPTION_NOT_FOUND'), ensure_ascii=True))
+            return 0
+        state['records'][slot] = cells
         save_state(state_path, state)
         print(json.dumps(ok(data={'recordIds': [record['recordId']]}),
                          ensure_ascii=True))
@@ -175,7 +189,11 @@ def main(argv):
         form_id = f'SYNTHETIC-form-{state["seq"]["form"]:04d}'
         base_id = flag(argv, '--base-id')
         table_id = flag(argv, '--table-id')
-        state['records'][key(base_id, table_id, form_id)] = dict(records[0]['cells'])
+        cells = dict(records[0]['cells'])
+        if synthetic_option_write(cells):
+            print(json.dumps(err('SELECT_OPTION_NOT_FOUND'), ensure_ascii=True))
+            return 0
+        state['records'][key(base_id, table_id, form_id)] = cells
         save_state(state_path, state)
         print(json.dumps(ok(data={'newRecordIds': [form_id]}), ensure_ascii=True))
         return 0
