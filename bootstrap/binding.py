@@ -59,13 +59,13 @@ def binding_from_document(data):
         *flags,
     )
     require_complete(binding)
-    field_maps_from_document(data)
+    fields, entry_fields = field_maps_from_document(data)
     entry = data.get('application_entry')
     require(entry is not None, Code.EVIDENCE)
     application = _resource(entry)
     require(application.kind in ('form', 'record'), Code.EVIDENCE)
     require(application.tenant_id == binding.account.tenant_id, Code.IDENTITY)
-    return binding, application
+    return binding, application, fields, entry_fields
 
 
 def require_complete(binding):
@@ -98,15 +98,11 @@ def field_maps_from_document(data):
 
 
 def load_binding(runtime):
-    runtime = Path(runtime)
-    path = binding_path(runtime)
-    tmp = interrupted_path(runtime)
-    if tmp.exists() and not path.exists():
-        raise ContractError(Code.EVIDENCE)
-    if not path.exists():
+    data = read_binding_document(runtime)
+    if data is None:
         return None, None
-    data = json.loads(path.read_text(encoding='utf-8'))
-    return binding_from_document(data)
+    binding, application, _, _ = binding_from_document(data)
+    return binding, application
 
 
 def save_binding(runtime, document):
@@ -118,11 +114,22 @@ def save_binding(runtime, document):
         raise ContractError(Code.EVIDENCE)
     if path.exists():
         raise ContractError(Code.CONFIG)
-    binding, application = binding_from_document(document)
+    binding, application, _, _ = binding_from_document(document)
     payload = json.dumps(document, ensure_ascii=True, indent=2) + '\n'
     tmp.write_text(payload, encoding='utf-8')
     tmp.replace(path)
     return binding, application
+
+
+def read_binding_document(runtime):
+    runtime = Path(runtime)
+    path = binding_path(runtime)
+    tmp = interrupted_path(runtime)
+    if tmp.exists() and not path.exists():
+        raise ContractError(Code.EVIDENCE)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding='utf-8'))
 
 
 def document_from_files(path):

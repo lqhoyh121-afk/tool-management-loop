@@ -8,14 +8,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from t03_layout import entry_fields_from
 from t03_memory_transport import MemoryTransport
 
 from contracts.model import Action, Code, ContractError
 from contracts.ports import LedgerScope, RuntimeBinding, StageRequest, stage_operation_id
 from integrations.dingtalk.adapter import DingTalkAdapter
 from integrations.dingtalk.codec import decode_loan, encode_inventory, encode_loan
-from integrations.dingtalk.layout import (SYNTHETIC_ENTRY_FIELDS, SYNTHETIC_FIELDS,
-                                          entry_fields_from)
+from integrations.dingtalk.layout import SYNTHETIC_ENTRY_FIELDS, SYNTHETIC_FIELDS
 
 
 def _load(name, path):
@@ -110,6 +110,11 @@ class SplitFieldMapTests(unittest.TestCase):
         shared = entry_fields_from(self.fields)
         self.assertEqual(shared.return_id, self.fields.return_id)
         self.assertNotEqual(shared.return_id, self.entry_fields.return_id)
+
+    def test_entry_fields_from_is_not_in_production_layout(self):
+        layout = Path(__file__).resolve().parents[2] / 'integrations' / 'dingtalk' / 'layout.py'
+        source = layout.read_text(encoding='utf-8')
+        self.assertNotIn('def entry_fields_from', source)
 
 
 if __name__ == '__main__':

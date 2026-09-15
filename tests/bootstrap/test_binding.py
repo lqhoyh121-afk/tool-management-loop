@@ -10,9 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from t04_binding_doc import binding_document
 
-from bootstrap.binding import load_binding, save_binding
+from bootstrap.binding import binding_from_document, load_binding, save_binding
 from contracts.model import Code, ContractError
 from contracts.ports import check_binding
+from integrations.dingtalk.layout import SYNTHETIC_ENTRY_FIELDS, SYNTHETIC_FIELDS
 
 
 def _fixtures():
@@ -42,6 +43,13 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(loaded, binding)
         self.assertEqual(loaded_entry, entry)
         self.assertEqual(entry.kind, 'form')
+
+    def test_binding_from_document_returns_both_maps(self):
+        binding, entry, fields, entry_fields = binding_from_document(binding_document())
+        self.assertEqual(fields, SYNTHETIC_FIELDS)
+        self.assertEqual(entry_fields, SYNTHETIC_ENTRY_FIELDS)
+        self.assertEqual(entry.kind, 'form')
+        self.assertIsNotNone(binding)
 
     def test_missing_flag_defaults_closed(self):
         data = binding_document()

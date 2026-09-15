@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from t031_fake_dws import load_state, save_state
+from t03_layout import entry_fields_from
 
 from contracts.flow import plan, verify
 from contracts.model import Action, Code, ContractError, Outcome, Resource, State
@@ -22,7 +23,7 @@ from integrations.dingtalk.codec import encode_inventory, encode_loan
 from integrations.dingtalk.dws_transport import (DwsTransport, split_container,
                                                  windows_native_path)
 from integrations.dingtalk.errors import UnsupportedShapeError
-from integrations.dingtalk.layout import SYNTHETIC_FIELDS, entry_fields_from
+from integrations.dingtalk.layout import SYNTHETIC_FIELDS
 
 
 def _load(name, path):

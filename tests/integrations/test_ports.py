@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from t03_layout import entry_fields_from
 from t03_memory_transport import MemoryTransport
 
 from contracts.flow import plan, verify
@@ -14,7 +15,7 @@ from contracts.model import Action, Code, ContractError, Outcome, State
 from contracts.ports import LedgerScope, RuntimeBinding, StageRequest, stage_operation_id
 from integrations.dingtalk.adapter import DingTalkAdapter
 from integrations.dingtalk.codec import encode_inventory, encode_loan
-from integrations.dingtalk.layout import SYNTHETIC_FIELDS, entry_fields_from
+from integrations.dingtalk.layout import SYNTHETIC_FIELDS
 
 
 def _load(name, path):
