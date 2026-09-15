@@ -4,7 +4,8 @@ import json
 from contracts.model import (ContractError, Code, Identity, Inventory, Loan,
                              Resource, State, require)
 
-from .cells import read_creator, read_datetime, read_number, read_single_select, read_text
+from .cells import (read_creator, read_datetime, read_number, read_single_select,
+                    read_text, read_text_or_empty)
 from .errors import DingTalkShapeError
 from .identity import RECORD_CREATOR
 
@@ -50,7 +51,7 @@ def _put_identity(identity):
 
 
 def _select(value):
-    return {'id': value, 'name': value}
+    return {'id': f'SYNTHETIC-opt-{value}', 'name': value}
 
 
 def encode_loan(loan: Loan, fields) -> dict:
@@ -68,8 +69,6 @@ def encode_loan(loan: Loan, fields) -> dict:
         fields.item_id: loan.item.resource_id,
         fields.consumed_events: json.dumps(list(loan.consumed_events), ensure_ascii=True),
         fields.application_evidence: loan.application_evidence,
-        fields.return_container: '',
-        fields.return_id: '',
     }
     if loan.return_ref is not None:
         cells[fields.return_container] = loan.return_ref.container_id
@@ -91,9 +90,9 @@ def encode_inventory(stock: Inventory, fields) -> dict:
 
 def decode_loan(ref: Resource, cells, fields) -> Loan:
     try:
-        tracked = read_single_select(cells, fields.tracked).id == 'true'
+        tracked = read_single_select(cells, fields.tracked).name == 'true'
         return_ref = None
-        return_id = read_text(cells, fields.return_id)
+        return_id = read_text_or_empty(cells, fields.return_id)
         if return_id:
             return_ref = Resource('record', ref.tenant_id,
                                   read_text(cells, fields.return_container), return_id)
@@ -110,7 +109,7 @@ def decode_loan(ref: Resource, cells, fields) -> Loan:
             _text_list(cells, fields.physical_ids),
             read_datetime(cells, fields.due_at),
             read_text(cells, fields.config_version),
-            State(read_single_select(cells, fields.state).id),
+            State(read_single_select(cells, fields.state).name),
             return_ref,
             _text_list(cells, fields.consumed_events),
             read_text(cells, fields.application_evidence),

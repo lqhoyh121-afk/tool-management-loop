@@ -37,6 +37,13 @@ def read_text(cells, field_id):
     return value
 
 
+def read_text_or_empty(cells, field_id):
+    """Optional text: missing or null is empty. Present non-strings still fail."""
+    if field_id not in cells or cells[field_id] is None:
+        return ''
+    return read_text(cells, field_id)
+
+
 def read_number(cells, field_id):
     """返回 :class:`~decimal.Decimal`。
 

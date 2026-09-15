@@ -67,17 +67,16 @@ class PortTests(unittest.TestCase):
         self.assertEqual(verify(intent, receipt).outcome, Outcome.VERIFIED)
         self.assertEqual(self.adapter.read_loan(LOAN).state, State.RESERVATION_PENDING)
 
-    def test_timeout_does_not_resend(self):
+    def test_timeout_retries_when_records_unchanged(self):
         intent = plan(loan(), event(Action.APPROVE), stock())
         self.transport.drop_once.append('record.update')
         receipt = self.adapter.submit(intent, self.binding, self.lease)
         self.assertEqual(receipt.outcome, Outcome.UNKNOWN)
         self.assertEqual(len(self.transport.writes_of('record.update')), 1)
-        self.blocked(Code.UNKNOWN, lambda: self.adapter.submit(intent, self.binding, self.lease))
-        self.assertEqual(len(self.transport.writes_of('record.update')), 1)
-        # Timeout happened before any record changed. First-version query does
-        # not invent not_applied from a missing write.
-        self.assertEqual(self.adapter.query(intent).outcome, Outcome.UNKNOWN)
+        self.assertEqual(self.adapter.query(intent).outcome, Outcome.NOT_SENT)
+        retried = self.adapter.submit(intent, self.binding, self.lease)
+        self.assertEqual(verify(intent, retried).outcome, Outcome.VERIFIED)
+        self.assertEqual(len(self.transport.writes_of('record.update')), 3)
 
     def test_partial_write_stays_unknown(self):
         approved = plan(loan(), event(Action.APPROVE), stock())
