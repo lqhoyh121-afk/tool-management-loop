@@ -16,6 +16,7 @@ Refs #3。在冻结的 `contracts/` 之上实现 ReadPort / WritePort / StagePor
 | `layout.py` | 适配器私有字段 ID，不是公共契约名。 |
 | `codec.py` | Loan / Inventory 按 T01 单元格类型编解码。角色字段写成 creator 形态 `[{corpId,userId}]`，读出后作为 **contact** Identity；这是本适配器写入后再读回的约定，不是通用 record_creator→contact 转换。 |
 | `transport.py` | 注入传输接口。`None` 表示超时/掉线，结果未知。 |
+| `dws_transport.py` | 真实 dws CLI 驱动。调用方注入 `node`+`dws.js`（或测试假脚本）；不读凭据、不猜安装路径。`--records-file` 只传 Windows 原生路径。`form.create` 是向**已有**收集结果表 `record create`，不是 `view create`。`stage.query` 只读本机阶段索引。 |
 | `adapter.py` | Read/Write/Stage 端口。每次写入检查 lease 与 `check_binding`；发前将回执标为 unknown；不明结果只 query，不盲重发。 |
 
 ## 注入命令名（仅测试/适配器内部）
@@ -69,7 +70,13 @@ dws todo task get
 写入前必须能精确指出目标 Base/表/记录/待办，并先回读。候选写命令（以本机帮助与 T01 回执为准，不在此编造参数）：
 
 ```text
-dws todo task create --executors
+node <injected-dws.js> aitable record query --base-id <ID> --table-id <ID> --record-ids <ID> --format json
+node <injected-dws.js> aitable record query --base-id <ID> --table-id <ID> --record-ids <ID> --all --format json
+node <injected-dws.js> aitable record update --records-file <Windows-native-path> --yes --format json
+node <injected-dws.js> aitable record create --records-file <Windows-native-path> --yes --format json
+node <injected-dws.js> todo task create --executors <contact-userId> --yes --format json
+node <injected-dws.js> todo task get --task-id <ID> --format json
+node <injected-dws.js> chat message send --yes --format json
 ```
 
 **停止点（任一出现即停，不盲发、不声称成功）：**
@@ -81,6 +88,9 @@ dws todo task create --executors
 5. 权限不足、限流、超时、只回读到其中一个目标。
 6. 普通人主账未整体拒绝、或字段级权限未验证却当成已隔离。
 7. 需要跨机器、并发、OA 审批流或通用审批关联——首版不支持。
+
+8. 收集表 Form 视图 CLI 创建返回 `UNSUPPORTED_VIEW_TYPE`：不得改走 `view create`；只允许对主控已建好的结果表做 `record create`。
+9. `--records-file` 不是 Windows 原生绝对路径。
 
 所需权限（T01 已部分证明、T07 仍须本机重验）：当前运行账号可读写指定主账；普通人不可访问该主账；审批/归还为仅指定人可填的受限收集表；借出/归还确认待办只分配给指定管理人。
 
