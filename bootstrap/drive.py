@@ -14,8 +14,8 @@ from contracts.model import Action, Code, ContractError, State, require
 from contracts.ports import StageRequest, check_binding
 from workflow.engine import LendingEngine
 
-from .binding import (binding_path, document_from_files, field_maps_from_document,
-                      load_binding, require_complete)
+from .binding import (binding_from_document, field_maps_from_document,
+                      read_binding_document, require_complete)
 from .gate import assert_business_allowed
 from .instance import MachineLock
 from .journal import FileJournal
@@ -189,7 +189,7 @@ def start_engine(reader, writer, stages, store, locks, binding):
     return engine
 
 
-def live_adapter(runtime, journal, locks, document):
+def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=None):
     """Build DingTalkAdapter only from explicit binding fields. Never guess dws."""
     from integrations.dingtalk.adapter import DingTalkAdapter
     from integrations.dingtalk.dws_transport import DwsTransport
@@ -201,7 +201,8 @@ def live_adapter(runtime, journal, locks, document):
     todo_container = document.get('todo_container')
     require(isinstance(form_container, str) and form_container.strip(), Code.CONFIG)
     require(isinstance(todo_container, str) and todo_container.strip(), Code.CONFIG)
-    fields, entry_fields = field_maps_from_document(document)
+    if fields is None or entry_fields is None:
+        fields, entry_fields = field_maps_from_document(document)
     transport = DwsTransport(
         cmd, fields, form_container=form_container, todo_container=todo_container,
         work_dir=runtime, entry_fields=entry_fields,
@@ -212,13 +213,16 @@ def live_adapter(runtime, journal, locks, document):
 def run_bound_drive(runtime, lock_root, reader=None, writer=None, stages=None,
                     sources=None, locks=None, store=None):
     runtime = Path(runtime)
-    binding, _entry = load_binding(runtime)
+    document = read_binding_document(runtime)
+    if document is None:
+        binding, _entry, fields, entry_fields = None, None, None, None
+    else:
+        binding, _entry, fields, entry_fields = binding_from_document(document)
     require_complete(binding)
     locks = locks or MachineLock(lock_root)
     store = store or FileJournal(runtime / 'operations')
     if reader is None or writer is None or stages is None:
-        document = document_from_files(binding_path(runtime))
-        adapter = live_adapter(runtime, store, locks, document)
+        adapter = live_adapter(runtime, store, locks, document, fields, entry_fields)
         reader = writer = stages = adapter
     if sources is None:
         sources = FileSources(runtime / 'sources.json')
