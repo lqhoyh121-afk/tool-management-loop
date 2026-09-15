@@ -58,6 +58,28 @@ class BindingTests(unittest.TestCase):
         self.blocked(Code.EVIDENCE, lambda: load_binding(self.root))
         self.blocked(Code.EVIDENCE, lambda: save_binding(self.root, binding_document()))
 
+    def test_missing_fields_is_config_not_silent(self):
+        data = binding_document()
+        del data['fields']
+        self.blocked(Code.CONFIG, lambda: save_binding(self.root, data))
+        self.assertFalse((self.root / 'binding.json').exists())
+
+    def test_missing_entry_fields_is_config_not_fallback(self):
+        data = binding_document()
+        del data['entry_fields']
+        self.blocked(Code.CONFIG, lambda: save_binding(self.root, data))
+        self.assertFalse((self.root / 'binding.json').exists())
+
+    def test_entry_fields_cannot_reuse_ledger_map(self):
+        data = binding_document()
+        data['entry_fields'] = dict(data['fields'])
+        self.blocked(Code.CONFIG, lambda: save_binding(self.root, data))
+
+    def test_incomplete_field_map_is_config(self):
+        data = binding_document()
+        del data['fields']['return_id']
+        self.blocked(Code.CONFIG, lambda: save_binding(self.root, data))
+
     def test_check_binding_uses_ledger_scope_not_item_id(self):
         binding, _entry = save_binding(self.root, binding_document())
         fixtures = _fixtures()

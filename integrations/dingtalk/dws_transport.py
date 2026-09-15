@@ -52,13 +52,14 @@ class DwsTransport:
     """Transport.exchange adapter for node-invoked dws.js (or a test double)."""
 
     def __init__(self, dws_cmd, fields, *, form_container, todo_container,
-                 work_dir, timeout=30, extra_env=None):
+                 work_dir, entry_fields, timeout=30, extra_env=None):
         if not dws_cmd or not all(isinstance(part, str) and part for part in dws_cmd):
             raise UnsupportedShapeError('dws_cmd 必须由调用方注入，仓库不猜测安装路径')
         text(form_container)
         text(todo_container)
         self.dws_cmd = list(dws_cmd)
         self.fields = fields
+        self.entry_fields = entry_fields
         self.form_container = form_container
         self.todo_container = todo_container
         self.work_dir = Path(work_dir)
@@ -138,7 +139,7 @@ class DwsTransport:
 
     def _form_cells(self, arguments):
         tenant = arguments['tenant_id']
-        fields = self.fields
+        fields = self.entry_fields
         return {
             fields.loan_container: arguments['loan_container'],
             fields.loan_id: arguments['loan_id'],

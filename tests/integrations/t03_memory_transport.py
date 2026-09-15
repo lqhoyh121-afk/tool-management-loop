@@ -33,9 +33,10 @@ class MemoryTransport(Transport):
     It is never derived from todo `finishTime` (integer, unit unknown).
     """
 
-    def __init__(self, fields, form_container='synthetic-forms',
+    def __init__(self, fields, entry_fields, form_container='synthetic-forms',
                  todo_container='synthetic-todos'):
         self.fields = fields
+        self.entry_fields = entry_fields
         self.form_container = form_container
         self.todo_container = todo_container
         self.records = {}
@@ -81,15 +82,16 @@ class MemoryTransport(Transport):
     def complete_form(self, form_id, decision, occurred_at, **extra):
         key = ('synthetic-org', self.form_container, form_id)
         cells = self.records[key]
-        cells[self.fields.decision] = {'id': decision, 'name': decision}
-        cells[self.fields.occurred_at] = occurred_at
+        fields = self.entry_fields
+        cells[fields.decision] = {'id': decision, 'name': decision}
+        cells[fields.occurred_at] = occurred_at
         if 'return_container' in extra:
-            cells[self.fields.return_container] = extra['return_container']
-            cells[self.fields.return_id] = extra['return_id']
+            cells[fields.return_container] = extra['return_container']
+            cells[fields.return_id] = extra['return_id']
         if 'quantity' in extra:
-            cells[self.fields.quantity] = str(extra['quantity'])
+            cells[fields.quantity] = str(extra['quantity'])
         if 'physical_ids' in extra:
-            cells[self.fields.physical_ids] = json.dumps(
+            cells[fields.physical_ids] = json.dumps(
                 list(extra['physical_ids']), ensure_ascii=True)
 
     def complete_todo(self, task_id, occurred_at, creator_id=None):
@@ -141,20 +143,21 @@ class MemoryTransport(Transport):
         self._forms += 1
         form_id = f'SYNTHETIC-form-{self._forms:04d}'
         tenant = arguments['tenant_id']
+        fields = self.entry_fields
         cells = {
-            self.fields.loan_container: arguments['loan_container'],
-            self.fields.loan_id: arguments['loan_id'],
-            self.fields.config_version: arguments['config_version'],
-            self.fields.quantity: str(arguments['quantity']),
-            self.fields.physical_ids: json.dumps(list(arguments['physical_ids']),
-                                                 ensure_ascii=True),
-            self.fields.borrower: _put_identity(Identity('contact', tenant, arguments['borrower'])),
-            self.fields.approver: _put_identity(Identity('contact', tenant, arguments['approver'])),
-            self.fields.manager: _put_identity(Identity('contact', tenant, arguments['manager'])),
-            self.fields.action: arguments['action'],
-            self.fields.operation_id: arguments['operation_id'],
-            self.fields.return_container: '',
-            self.fields.return_id: '',
+            fields.loan_container: arguments['loan_container'],
+            fields.loan_id: arguments['loan_id'],
+            fields.config_version: arguments['config_version'],
+            fields.quantity: str(arguments['quantity']),
+            fields.physical_ids: json.dumps(list(arguments['physical_ids']),
+                                            ensure_ascii=True),
+            fields.borrower: _put_identity(Identity('contact', tenant, arguments['borrower'])),
+            fields.approver: _put_identity(Identity('contact', tenant, arguments['approver'])),
+            fields.manager: _put_identity(Identity('contact', tenant, arguments['manager'])),
+            fields.action: arguments['action'],
+            fields.operation_id: arguments['operation_id'],
+            fields.return_container: '',
+            fields.return_id: '',
         }
         self.seed_record(Resource('form', tenant, self.form_container, form_id), cells)
         meta = {

@@ -1,4 +1,8 @@
 """Synthetic binding document for T04 tests. Not a generic support module."""
+from copy import deepcopy
+from dataclasses import asdict
+
+from integrations.dingtalk.layout import SYNTHETIC_ENTRY_FIELDS, SYNTHETIC_FIELDS
 
 DOC = {
     'account': {'namespace': 'contact', 'tenant_id': 'synthetic-org',
@@ -20,11 +24,13 @@ DOC = {
         'container_id': 'synthetic-forms',
         'resource_id': 'synthetic-apply-entry',
     },
+    'fields': asdict(SYNTHETIC_FIELDS),
+    'entry_fields': asdict(SYNTHETIC_ENTRY_FIELDS),
 }
 
 
 def binding_document(**overrides):
-    data = {key: value for key, value in DOC.items()}
+    data = deepcopy(DOC)
     data.update(overrides)
     return data
 

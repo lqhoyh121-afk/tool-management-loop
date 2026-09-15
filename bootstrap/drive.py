@@ -1,8 +1,9 @@
 """Non-interactive lending driver: recover journal, then consume trusted sources.
 
-Does not modify workflow/, contracts/, or integrations/dingtalk/. The engine
-and ports are injected. Live DingTalk wiring belongs to T07 (dws_cmd must be
-supplied; this module never guesses an install path).
+Does not modify workflow/ or contracts/. The engine and ports are injected.
+Live DingTalk wiring belongs to T07 (dws_cmd must be supplied; this module
+never guesses an install path). Ledger and stage-entry field maps both come
+from binding.json; neither falls back to synthetic IDs.
 """
 import json
 from dataclasses import dataclass
@@ -13,7 +14,8 @@ from contracts.model import Action, Code, ContractError, State, require
 from contracts.ports import StageRequest, check_binding
 from workflow.engine import LendingEngine
 
-from .binding import binding_path, document_from_files, load_binding, require_complete
+from .binding import (binding_path, document_from_files, field_maps_from_document,
+                      load_binding, require_complete)
 from .gate import assert_business_allowed
 from .instance import MachineLock
 from .journal import FileJournal
@@ -191,7 +193,6 @@ def live_adapter(runtime, journal, locks, document):
     """Build DingTalkAdapter only from explicit binding fields. Never guess dws."""
     from integrations.dingtalk.adapter import DingTalkAdapter
     from integrations.dingtalk.dws_transport import DwsTransport
-    from integrations.dingtalk.layout import FieldMap, SYNTHETIC_FIELDS
 
     cmd = document.get('dws_cmd')
     require(isinstance(cmd, list) and all(isinstance(part, str) and part for part in cmd),
@@ -200,16 +201,12 @@ def live_adapter(runtime, journal, locks, document):
     todo_container = document.get('todo_container')
     require(isinstance(form_container, str) and form_container.strip(), Code.CONFIG)
     require(isinstance(todo_container, str) and todo_container.strip(), Code.CONFIG)
-    fields = SYNTHETIC_FIELDS
-    raw_fields = document.get('fields')
-    if raw_fields is not None:
-        require(isinstance(raw_fields, dict), Code.CONFIG)
-        fields = FieldMap(**raw_fields)
+    fields, entry_fields = field_maps_from_document(document)
     transport = DwsTransport(
         cmd, fields, form_container=form_container, todo_container=todo_container,
-        work_dir=runtime,
+        work_dir=runtime, entry_fields=entry_fields,
     )
-    return DingTalkAdapter(transport, journal, locks, fields)
+    return DingTalkAdapter(transport, journal, locks, fields, entry_fields)
 
 
 def run_bound_drive(runtime, lock_root, reader=None, writer=None, stages=None,

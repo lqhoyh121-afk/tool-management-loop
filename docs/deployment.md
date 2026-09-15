@@ -149,7 +149,7 @@ https://docs.dingtalk.com/notable/share/form/<shareUuid>?source=link
 
 ## T10 运行层驱动
 
-T07 端到端还差本地操作流水和把收集表/待办完成接进冻结引擎。本卡补这两块；**不改** `contracts/`、`workflow/`、`integrations/dingtalk/`。真实 dws 联调仍归 T07，隔离测试通过不能当成 L4。
+T07 端到端还差本地操作流水和把收集表/待办完成接进冻结引擎。本卡补这两块；**不改** `contracts/`、`workflow/`。真实 dws 联调仍归 T07，隔离测试通过不能当成 L4。字段映射拆分见下一节。
 
 无交互重复运行（每次先回查未决流水，不盲重发）：
 
@@ -163,11 +163,18 @@ python -m bootstrap --drive --runtime 运行目录 --lock-root 锁目录
 
 - `dws_cmd`：字符串数组，例如调用方注入的 `node` 与 `dws.js` 路径
 - `form_container` / `todo_container`：阶段入口容器
-- 可选 `fields`：字段 ID 映射；省略则只用合成标识，不能对真实表
+- `fields`：台账字段 ID（`FieldMap` 全套键），必填
+- `entry_fields`：阶段入口字段 ID（`EntryFieldMap`），必填
+
+缺 `fields` 或 `entry_fields`、键不完整、或把台账整表拷进 `entry_fields`，都是 `CONFIG`。不会回落到合成标识，也不会拿台账映射去读收集表。真实字段 ID 只放本机绑定，不进仓库。
 
 工作队列是运行目录下的 `sources.json`（Git 忽略），只存单据/来源引用，不是第二本库存账。`kind` 为 `apply` 或 `event`。`apply` 走 `admit_application` 后建立审批入口；`event` 走 `execute`，同意后系统预留，再按状态建借出/归还入口。回执落 `runtime/operations/<operation_id>.json`。
 
 隔离测试注入假读写端口，不连真实钉钉。协作者不得索要凭据或代跑真实组织。
+
+## T10 缺陷：台账与阶段入口字段必须拆开
+
+两张表共用一套扁平 `FieldMap` 时，`--drive` 消费 `kind=apply` 会把入口表的 `return_id` 等键套到台账记录上，解码失败为 `EVIDENCE_REQUIRED`。重叠的八个键（`config_version`、`quantity`、`physical_ids`、`borrower`、`approver`、`manager`、`return_container`、`return_id`）在两张表上是不同 ID。适配器读借用/库存只用 `fields`；读收集表事件只用 `entry_fields`。
 
 ## 本阶段会做什么
 
