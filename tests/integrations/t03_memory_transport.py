@@ -1,0 +1,223 @@
+"""Injected in-memory DingTalk transport. Test-only, no platform calls.
+
+Module name is unique so T09 file-based discovery does not collide with other
+helpers. Commands are adapter-internal names, not a claim of real dws verbs.
+"""
+from copy import deepcopy
+import json
+
+from contracts.model import Identity, Resource
+
+from integrations.dingtalk.codec import _put_identity
+from integrations.dingtalk.transport import Transport
+
+
+def ok_envelope(**extra):
+    payload = {'success': True, 'status': 'success', 'error': {}}
+    payload.update(extra)
+    return payload
+
+
+def error_envelope(code, message='SYNTHETIC-denied'):
+    return {
+        'success': True,
+        'status': 'error',
+        'error': {'code': code, 'message': message},
+    }
+
+
+class MemoryTransport(Transport):
+    """Records, forms and todos in process memory.
+
+    `occurredAt` on todo.get is a separate ISO evidence field used by tests.
+    It is never derived from todo `finishTime` (integer, unit unknown).
+    """
+
+    def __init__(self, fields):
+        self.fields = fields
+        self.records = {}
+        self.stages = {}
+        self.todos = {}
+        self.by_task = {}
+        self.calls = []
+        self.fail_codes = {}
+        self.drop_once = []
+        self.drop_commands = set()
+        self.drop_after_updates = None
+        self.update_count = 0
+        self._forms = 0
+        self._todos = 0
+        self._activities = 0
+        self._next_internal = 9000000100
+        self.contact_to_internal = {}
+
+    def seed_record(self, ref, cells):
+        self.records[(ref.tenant_id, ref.container_id, ref.resource_id)] = dict(cells)
+
+    def exchange(self, command, arguments):
+        arguments = dict(arguments)
+        self.calls.append((command, arguments))
+        if command in self.drop_commands or command in self.drop_once:
+            if command in self.drop_once:
+                self.drop_once.remove(command)
+            return None
+        if command in self.fail_codes:
+            return error_envelope(self.fail_codes[command])
+        handler = {
+            'record.query': self._record_query,
+            'record.update': self._record_update,
+            'form.create': self._form_create,
+            'todo.create': self._todo_create,
+            'todo.get': self._todo_get,
+            'stage.query': self._stage_query,
+        }.get(command)
+        if handler is None:
+            return error_envelope('UNSUPPORTED_COMMAND')
+        return handler(arguments)
+
+    def complete_form(self, form_id, decision, occurred_at, **extra):
+        key = ('synthetic-org', 'synthetic-forms', form_id)
+        cells = self.records[key]
+        cells[self.fields.decision] = {'id': decision, 'name': decision}
+        cells[self.fields.occurred_at] = occurred_at
+        if 'return_container' in extra:
+            cells[self.fields.return_container] = extra['return_container']
+            cells[self.fields.return_id] = extra['return_id']
+        if 'quantity' in extra:
+            cells[self.fields.quantity] = str(extra['quantity'])
+        if 'physical_ids' in extra:
+            cells[self.fields.physical_ids] = json.dumps(
+                list(extra['physical_ids']), ensure_ascii=True)
+
+    def complete_todo(self, task_id, occurred_at, creator_id=None):
+        todo = self.todos[task_id]
+        internal = creator_id if creator_id is not None else todo['internal_id']
+        self._activities += 1
+        activity = f'SYNTHETIC-activity-{self._activities:04d}'
+        todo['detail']['isDone'] = True
+        todo['detail']['finishTime'] = 9000000000001
+        todo['detail']['activities'] = [
+            {'activityId': activity + '-self', 'action': 'task.self.done', 'creatorId': internal},
+            {'activityId': activity + '-done', 'action': 'task.done', 'creatorId': internal},
+        ]
+        todo['occurred_at'] = occurred_at
+
+    def writes_of(self, command):
+        return [item for item in self.calls if item[0] == command]
+
+    def _key(self, arguments):
+        return (arguments['tenant_id'], arguments['container_id'], arguments['resource_id'])
+
+    def _internal_for(self, contact):
+        if contact not in self.contact_to_internal:
+            self.contact_to_internal[contact] = self._next_internal
+            self._next_internal += 1
+        return self.contact_to_internal[contact]
+
+    def _record_query(self, arguments):
+        key = self._key(arguments)
+        if key not in self.records:
+            return ok_envelope(data={'records': [], 'hasMore': False})
+        record = {
+            'recordId': arguments['resource_id'],
+            'cells': deepcopy(self.records[key]),
+        }
+        return ok_envelope(data={'records': [record], 'hasMore': False})
+
+    def _record_update(self, arguments):
+        if self.drop_after_updates is not None and self.update_count >= self.drop_after_updates:
+            return None
+        key = self._key(arguments)
+        if key not in self.records:
+            return error_envelope('RECORD_NOT_FOUND')
+        self.records[key] = dict(arguments['cells'])
+        self.update_count += 1
+        return ok_envelope(result={'recordId': arguments['resource_id']})
+
+    def _form_create(self, arguments):
+        self._forms += 1
+        form_id = f'SYNTHETIC-form-{self._forms:04d}'
+        tenant = arguments['tenant_id']
+        cells = {
+            self.fields.loan_container: arguments['loan_container'],
+            self.fields.loan_id: arguments['loan_id'],
+            self.fields.config_version: arguments['config_version'],
+            self.fields.quantity: str(arguments['quantity']),
+            self.fields.physical_ids: json.dumps(list(arguments['physical_ids']),
+                                                 ensure_ascii=True),
+            self.fields.borrower: _put_identity(Identity('contact', tenant, arguments['borrower'])),
+            self.fields.approver: _put_identity(Identity('contact', tenant, arguments['approver'])),
+            self.fields.manager: _put_identity(Identity('contact', tenant, arguments['manager'])),
+            self.fields.action: arguments['action'],
+            self.fields.operation_id: arguments['operation_id'],
+            self.fields.return_container: '',
+            self.fields.return_id: '',
+        }
+        self.seed_record(Resource('form', tenant, 'synthetic-forms', form_id), cells)
+        meta = {
+            'kind': 'form',
+            'resource_id': form_id,
+            'creation_evidence': f'form.create:{form_id}',
+            'readback_evidence': f'form.get:{form_id}',
+            'action': arguments['action'],
+            'operation_id': arguments['operation_id'],
+            'loan_container': arguments['loan_container'],
+            'loan_id': arguments['loan_id'],
+            'config_version': arguments['config_version'],
+            'contact': arguments['actor'],
+        }
+        self.stages[arguments['operation_id']] = meta
+        return ok_envelope(result={'formId': form_id})
+
+    def _todo_create(self, arguments):
+        self._todos += 1
+        task_id = f'SYNTHETIC-todo-{self._todos:04d}'
+        internal = self._internal_for(arguments['actor'])
+        detail = {
+            'taskId': task_id,
+            'isDone': False,
+            'finishTime': 0,
+            'executorIds': [internal],
+            'activities': [],
+        }
+        self.todos[task_id] = {
+            'detail': detail,
+            'internal_id': internal,
+            'occurred_at': None,
+            'operation_id': arguments['operation_id'],
+        }
+        meta = {
+            'kind': 'todo',
+            'resource_id': task_id,
+            'creation_evidence': f'todo.create:{task_id}',
+            'readback_evidence': f'todo.get:{task_id}',
+            'internal_id': internal,
+            'contact': arguments['actor'],
+            'action': arguments['action'],
+            'operation_id': arguments['operation_id'],
+            'loan_container': arguments['loan_container'],
+            'loan_id': arguments['loan_id'],
+            'config_version': arguments['config_version'],
+        }
+        self.stages[arguments['operation_id']] = meta
+        self.by_task[task_id] = meta
+        return ok_envelope(result={'taskId': task_id, 'todoDetailModel': deepcopy(detail)})
+
+    def _todo_get(self, arguments):
+        task_id = arguments['task_id']
+        if task_id not in self.todos:
+            return error_envelope('TASK_NOT_EXIST')
+        todo = self.todos[task_id]
+        result = {'todoDetailModel': deepcopy(todo['detail'])}
+        if todo['occurred_at'] is not None:
+            result['occurredAt'] = todo['occurred_at']
+        return ok_envelope(result=result)
+
+    def _stage_query(self, arguments):
+        if 'operation_id' in arguments:
+            meta = self.stages.get(arguments['operation_id'])
+        else:
+            meta = self.by_task.get(arguments.get('task_id'))
+        if meta is None:
+            return ok_envelope(result={})
+        return ok_envelope(result=dict(meta))

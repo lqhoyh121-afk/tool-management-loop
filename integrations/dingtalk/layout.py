@@ -1,0 +1,66 @@
+"""Adapter-owned field identifiers. Not public contract names."""
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class FieldMap:
+    state: str
+    quantity: str
+    tracked: str
+    physical_ids: str
+    due_at: str
+    config_version: str
+    borrower: str
+    approver: str
+    manager: str
+    item_container: str
+    item_id: str
+    return_container: str
+    return_id: str
+    consumed_events: str
+    application_evidence: str
+    available: str
+    reserved: str
+    borrowed: str
+    available_ids: str
+    reserved_ids: str
+    borrowed_ids: str
+    revision: str
+    decision: str
+    loan_container: str
+    loan_id: str
+    occurred_at: str
+    action: str
+    operation_id: str
+
+
+SYNTHETIC_FIELDS = FieldMap(
+    state='fldSYN-state',
+    quantity='fldSYN-qty',
+    tracked='fldSYN-tracked',
+    physical_ids='fldSYN-pids',
+    due_at='fldSYN-due',
+    config_version='fldSYN-cfg',
+    borrower='fldSYN-borrower',
+    approver='fldSYN-approver',
+    manager='fldSYN-manager',
+    item_container='fldSYN-item-container',
+    item_id='fldSYN-item-id',
+    return_container='fldSYN-return-container',
+    return_id='fldSYN-return-id',
+    consumed_events='fldSYN-events',
+    application_evidence='fldSYN-app-ev',
+    available='fldSYN-avail',
+    reserved='fldSYN-rsv',
+    borrowed='fldSYN-brw',
+    available_ids='fldSYN-avail-ids',
+    reserved_ids='fldSYN-rsv-ids',
+    borrowed_ids='fldSYN-brw-ids',
+    revision='fldSYN-rev',
+    decision='fldSYN-decision',
+    loan_container='fldSYN-loan-container',
+    loan_id='fldSYN-loan-id',
+    occurred_at='fldSYN-occurred',
+    action='fldSYN-action',
+    operation_id='fldSYN-opid',
+)
