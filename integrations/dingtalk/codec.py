@@ -4,7 +4,7 @@ import json
 from contracts.model import (ContractError, Code, Identity, Inventory, Loan,
                              Resource, State, require)
 
-from .cells import (read_creator, read_datetime, read_number, read_single_select,
+from .cells import (read_creator, read_datetime, read_number, read_select_name,
                     read_text, read_text_or_empty)
 from .errors import DingTalkShapeError
 from .identity import RECORD_CREATOR
@@ -51,7 +51,8 @@ def _put_identity(identity):
 
 
 def _select(value):
-    return {'id': f'SYNTHETIC-opt-{value}', 'name': value}
+    """Write path: option name string. Live aitable rejects synthetic option ids."""
+    return value
 
 
 def encode_loan(loan: Loan, fields) -> dict:
@@ -90,7 +91,7 @@ def encode_inventory(stock: Inventory, fields) -> dict:
 
 def decode_loan(ref: Resource, cells, fields) -> Loan:
     try:
-        tracked = read_single_select(cells, fields.tracked).name == 'true'
+        tracked = read_select_name(cells, fields.tracked) == 'true'
         return_ref = None
         return_id = read_text_or_empty(cells, fields.return_id)
         if return_id:
@@ -109,7 +110,7 @@ def decode_loan(ref: Resource, cells, fields) -> Loan:
             _text_list(cells, fields.physical_ids),
             read_datetime(cells, fields.due_at),
             read_text(cells, fields.config_version),
-            State(read_single_select(cells, fields.state).name),
+            State(read_select_name(cells, fields.state)),
             return_ref,
             _text_list(cells, fields.consumed_events),
             read_text(cells, fields.application_evidence),

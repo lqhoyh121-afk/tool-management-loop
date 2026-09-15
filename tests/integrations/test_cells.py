@@ -13,6 +13,7 @@ from integrations.dingtalk.cells import (
     read_creator,
     read_datetime,
     read_number,
+    read_select_name,
     read_single_select,
     read_text,
     read_text_or_empty,
@@ -43,6 +44,8 @@ class NormalReadTests(unittest.TestCase):
         )
         self.assertEqual(read_single_select(cells, SELECT).id, 'SYNTHETIC-option-01')
         self.assertEqual(read_single_select(cells, SELECT).name, '合成选项甲')
+        self.assertEqual(read_select_name(cells, SELECT), '合成选项甲')
+        self.assertEqual(read_select_name({SELECT: '合成选项甲'}, SELECT), '合成选项甲')
 
     def test_number_string_is_parsed_not_left_as_text(self):
         cells = synthetic_cells()

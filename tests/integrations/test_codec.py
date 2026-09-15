@@ -31,6 +31,10 @@ class CodecTests(unittest.TestCase):
         cells = encode_loan(current, fields)
         self.assertIsInstance(cells[fields.quantity], str)
         self.assertIsInstance(cells[fields.due_at], str)
+        self.assertEqual(cells[fields.state], current.state.value)
+        self.assertEqual(cells[fields.tracked], 'false')
+        self.assertIsInstance(cells[fields.state], str)
+        self.assertIsInstance(cells[fields.tracked], str)
         self.assertEqual(cells[fields.borrower], [
             {'corpId': current.borrower.tenant_id, 'userId': current.borrower.user_id},
         ])

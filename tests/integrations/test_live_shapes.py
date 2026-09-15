@@ -137,6 +137,49 @@ class LiveShapeTests(unittest.TestCase):
         self.blocked(Code.UNKNOWN, lambda: self.adapter.submit(intent, self.binding, self.lease))
         self.assertEqual(len(self.transport.writes_of('record.update')), writes)
 
+    def test_encode_loan_writes_select_name_strings(self):
+        current = loan()
+        cells = encode_loan(current, self.fields)
+        self.assertEqual(cells[self.fields.state], current.state.value)
+        self.assertEqual(cells[self.fields.tracked], 'false')
+        self.assertIsInstance(cells[self.fields.state], str)
+        self.assertIsInstance(cells[self.fields.tracked], str)
+
+    def test_synthetic_option_id_write_is_not_success(self):
+        current = loan()
+        cells = encode_loan(current, self.fields)
+        cells[self.fields.state] = {
+            'id': f'SYNTHETIC-opt-{current.state.value}',
+            'name': current.state.value,
+        }
+        payload = self.transport.exchange('record.update', {
+            'tenant_id': current.ref.tenant_id,
+            'container_id': current.ref.container_id,
+            'resource_id': current.ref.resource_id,
+            'cells': cells,
+        })
+        self.assertEqual(payload['status'], 'error')
+        self.assertEqual(payload['error']['code'], 'SELECT_OPTION_NOT_FOUND')
+        self.assertNotEqual(payload['status'], 'success')
+
+    def test_synthetic_option_id_submit_is_unknown(self):
+        from unittest.mock import patch
+        real_encode = encode_loan
+
+        def poisoned(item, fields):
+            cells = real_encode(item, fields)
+            cells[fields.state] = {
+                'id': f'SYNTHETIC-opt-{item.state.value}',
+                'name': item.state.value,
+            }
+            return cells
+
+        intent = plan(loan(), event(Action.APPROVE), stock())
+        with patch('integrations.dingtalk.adapter.encode_loan', poisoned):
+            receipt = self.adapter.submit(intent, self.binding, self.lease)
+        self.assertEqual(receipt.outcome, Outcome.UNKNOWN)
+        self.assertNotEqual(receipt.outcome, Outcome.VERIFIED)
+
 
 if __name__ == '__main__':
     unittest.main()
