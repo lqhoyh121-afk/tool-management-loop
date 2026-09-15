@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 from bootstrap.binding import document_from_files, load_binding, require_complete, save_binding
+from bootstrap.drive import run_bound_drive
 from bootstrap.env_check import check_environment, format_report, has_gate_failure
 from bootstrap.file_preview import PreviewError, format_preview, preview_workbook
 from bootstrap.gate import assert_business_allowed
@@ -19,13 +20,14 @@ MENU = """
 """
 
 
-def main(argv=None, *, stdin=None, stdout=None, picker=None, wait_on_error=None, environ_kwargs=None):
+def main(argv=None, *, stdin=None, stdout=None, picker=None, wait_on_error=None,
+         environ_kwargs=None, ports=None):
     args = argv if argv is not None else sys.argv[1:]
     in_stream = stdin if stdin is not None else sys.stdin
     out_stream = stdout if stdout is not None else sys.stdout
     wait = in_stream.isatty() if wait_on_error is None else wait_on_error
     try:
-        return _run(args, in_stream, out_stream, picker, environ_kwargs or {})
+        return _run(args, in_stream, out_stream, picker, environ_kwargs or {}, ports)
     except KeyboardInterrupt:
         _write(out_stream, '已中断。没有后台业务进程需要清理。')
         return 130
@@ -52,7 +54,7 @@ def _env_kwargs(parsed, environ_kwargs):
     return values
 
 
-def _run(args, in_stream, out_stream, picker, environ_kwargs):
+def _run(args, in_stream, out_stream, picker, environ_kwargs, ports=None):
     parsed = _parse_args(args)
     env_kwargs = _env_kwargs(parsed, environ_kwargs)
     items = check_environment(**env_kwargs)
@@ -68,8 +70,10 @@ def _run(args, in_stream, out_stream, picker, environ_kwargs):
     if parsed.bind:
         save_binding(runtime, document_from_files(parsed.bind))
         _write(out_stream, '绑定已保存。未覆盖既有配置，也未把 ready 文件当作绑定。')
-        if not parsed.confirm_import:
+        if not parsed.confirm_import and not parsed.drive:
             return 0
+    if parsed.drive:
+        return _drive(runtime, locks_dir, out_stream, ports)
     if parsed.confirm_import:
         return _confirm(parsed.confirm_import, runtime, locks_dir, out_stream)
     if parsed.preview:
@@ -91,6 +95,25 @@ def _confirm(path, runtime, locks_dir, out_stream):
     return 0
 
 
+def _drive(runtime, locks_dir, out_stream, ports):
+    kwargs = {}
+    if ports is not None:
+        kwargs = {
+            'reader': ports['reader'],
+            'writer': ports['writer'],
+            'stages': ports['stages'],
+            'sources': ports.get('sources'),
+            'locks': ports.get('locks'),
+            'store': ports.get('store'),
+        }
+    report = run_bound_drive(runtime, locks_dir, **kwargs)
+    _write(out_stream, (
+        f'驱动完成。回查 {len(report.recovered)}，处理 {len(report.processed)}，'
+        f'跳过 {len(report.skipped)}，挂起 {len(report.blocked)}。未盲重发。'
+    ))
+    return 0
+
+
 def _parse_args(args):
     parser = argparse.ArgumentParser(add_help=True, description='工器具借还部署向导')
     parser.add_argument('--check-env', action='store_true', help='只打印环境检查后退出')
@@ -99,6 +122,11 @@ def _parse_args(args):
     parser.add_argument('--lock-root', metavar='DIR', help='机器排他锁目录，默认与运行目录无关')
     parser.add_argument('--bind', metavar='FILE', help='从合成 JSON 写入绑定，已存在则拒绝覆盖')
     parser.add_argument('--confirm-import', metavar='FILE', help='预览后独立回读并保存导入回执，不写钉钉')
+    parser.add_argument(
+        '--drive',
+        action='store_true',
+        help='无交互跑一笔业务驱动：先回查未决流水，再消费申请源与待办/表单完成事件',
+    )
     parser.add_argument(
         '--require-ready',
         action='store_true',

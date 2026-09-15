@@ -147,6 +147,28 @@ https://docs.dingtalk.com/notable/share/form/<shareUuid>?source=link
 
 通用 `aitable view update --config` 不支持表单私有配置：传 `custom` 或 `requiredFields` 会被服务端列为「不支持的 key」，返回成功但配置不变。表单必填、隐藏等只能改网页端或字段配置，且一律以独立回读为准。
 
+## T10 运行层驱动
+
+T07 端到端还差本地操作流水和把收集表/待办完成接进冻结引擎。本卡补这两块；**不改** `contracts/`、`workflow/`、`integrations/dingtalk/`。真实 dws 联调仍归 T07，隔离测试通过不能当成 L4。
+
+无交互重复运行（每次先回查未决流水，不盲重发）：
+
+```text
+python -m bootstrap --drive --runtime 运行目录 --lock-root 锁目录
+```
+
+绑定或 lease 缺失时 fail-closed（`CONFIG_RECONFIRM_REQUIRED` / `SECOND_INSTANCE_BLOCKED`）。第二实例抢同一主账会被拦住。`runtime/ready.json` 不能放行。
+
+生产还须在 `binding.json` 里**显式**给出 T07 本机已确认的字段，仓库不猜测安装路径：
+
+- `dws_cmd`：字符串数组，例如调用方注入的 `node` 与 `dws.js` 路径
+- `form_container` / `todo_container`：阶段入口容器
+- 可选 `fields`：字段 ID 映射；省略则只用合成标识，不能对真实表
+
+工作队列是运行目录下的 `sources.json`（Git 忽略），只存单据/来源引用，不是第二本库存账。`kind` 为 `apply` 或 `event`。`apply` 走 `admit_application` 后建立审批入口；`event` 走 `execute`，同意后系统预留，再按状态建借出/归还入口。回执落 `runtime/operations/<operation_id>.json`。
+
+隔离测试注入假读写端口，不连真实钉钉。协作者不得索要凭据或代跑真实组织。
+
 ## 本阶段会做什么
 
 - 检查 Windows、Python 3.11+、文件选择能力。
