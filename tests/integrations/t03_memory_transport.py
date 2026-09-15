@@ -33,8 +33,11 @@ class MemoryTransport(Transport):
     It is never derived from todo `finishTime` (integer, unit unknown).
     """
 
-    def __init__(self, fields):
+    def __init__(self, fields, form_container='synthetic-forms',
+                 todo_container='synthetic-todos'):
         self.fields = fields
+        self.form_container = form_container
+        self.todo_container = todo_container
         self.records = {}
         self.stages = {}
         self.todos = {}
@@ -76,7 +79,7 @@ class MemoryTransport(Transport):
         return handler(arguments)
 
     def complete_form(self, form_id, decision, occurred_at, **extra):
-        key = ('synthetic-org', 'synthetic-forms', form_id)
+        key = ('synthetic-org', self.form_container, form_id)
         cells = self.records[key]
         cells[self.fields.decision] = {'id': decision, 'name': decision}
         cells[self.fields.occurred_at] = occurred_at
@@ -153,10 +156,11 @@ class MemoryTransport(Transport):
             self.fields.return_container: '',
             self.fields.return_id: '',
         }
-        self.seed_record(Resource('form', tenant, 'synthetic-forms', form_id), cells)
+        self.seed_record(Resource('form', tenant, self.form_container, form_id), cells)
         meta = {
             'kind': 'form',
             'resource_id': form_id,
+            'container': self.form_container,
             'creation_evidence': f'form.create:{form_id}',
             'readback_evidence': f'form.get:{form_id}',
             'action': arguments['action'],
@@ -189,6 +193,7 @@ class MemoryTransport(Transport):
         meta = {
             'kind': 'todo',
             'resource_id': task_id,
+            'container': self.todo_container,
             'creation_evidence': f'todo.create:{task_id}',
             'readback_evidence': f'todo.get:{task_id}',
             'internal_id': internal,

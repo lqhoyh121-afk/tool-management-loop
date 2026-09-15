@@ -185,6 +185,34 @@ class PortTests(unittest.TestCase):
         self.transport.todos[receipt.source.resource_id]['occurred_at'] = None
         self.blocked(Code.EVIDENCE, lambda: self.adapter.read_event(current, receipt.source))
 
+    def test_stage_container_comes_from_query_not_fixture_name(self):
+        self.transport.form_container = 'deployed-collect-forms'
+        self.transport.todo_container = 'deployed-manager-todos'
+        request = StageRequest(stage_operation_id(loan(), Action.APPROVE),
+                               loan(), Action.APPROVE, MANAGER)
+        form = self.adapter.create_stage(request, self.binding, self.lease)
+        self.assertEqual(form.outcome, Outcome.VERIFIED)
+        self.assertEqual(form.source.container_id, 'deployed-collect-forms')
+        self.assertNotEqual(form.source.container_id, 'synthetic-forms')
+
+        current, _inventory = self._advance_to_issue()
+        issue = StageRequest(stage_operation_id(current, Action.ISSUE),
+                             current, Action.ISSUE, MANAGER)
+        todo = self.adapter.create_stage(issue, self.binding, self.lease)
+        self.assertEqual(todo.outcome, Outcome.VERIFIED)
+        self.assertEqual(todo.source.container_id, 'deployed-manager-todos')
+        self.assertNotEqual(todo.source.container_id, 'synthetic-todos')
+
+    def test_stage_query_without_container_is_unknown(self):
+        request = StageRequest(stage_operation_id(loan(), Action.APPROVE),
+                               loan(), Action.APPROVE, MANAGER)
+        form = self.adapter.create_stage(request, self.binding, self.lease)
+        self.assertEqual(form.outcome, Outcome.VERIFIED)
+        del self.transport.stages[request.operation_id]['container']
+        queried = self.adapter.query_stage(request)
+        self.assertEqual(queried.outcome, Outcome.UNKNOWN)
+        self.assertIsNone(queried.source)
+
     def test_stage_timeout_queries_without_recreate(self):
         request = StageRequest(stage_operation_id(loan(), Action.APPROVE),
                                loan(), Action.APPROVE, MANAGER)

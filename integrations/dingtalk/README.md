@@ -47,6 +47,8 @@ Refs #3。在冻结的 `contracts/` 之上实现 ReadPort / WritePort / StagePor
 3. 写超时、限流、部分目标未回读：outcome=unknown；再次 submit 拒绝，只能 `query` 原意图。
 4. `FORBIDDEN` / `PERMISSION_DENIED` → `IDENTITY_REQUIRED`，立刻停止。
 5. 部分写入（借用已改、库存未改）保持 unknown，不重放整个意图，不把缺查询当成 not_applied。
+6. **首版 `query()` 在写入从未落地时仍返回 UNKNOWN，不把“查不到记录”编成 NOT_APPLIED。** 重启后 operator 必须按原 `operation_id` 人工介入（查平台是否已有记录、决定作废或补证据），适配器不会自行改判。T07 联调时验证该运维语义。
+7. 阶段回查的容器 ID 只取 `stage.query` 结果里的 `container` 字段；缺字段、空字符串或非字符串按未观察形态失败。不得写死测试夹具名 `synthetic-forms` / `synthetic-todos`。
 
 阶段入口同样：ISSUE/RETURN 为两条独立待办并保存 `IdentityBinding`；APPROVE 表单同时承载同意/拒绝；创建超时只回查，不重创建。
 

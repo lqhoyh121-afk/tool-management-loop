@@ -198,15 +198,17 @@ class DingTalkAdapter:
         kind = result.get('kind')
         resource_id = result.get('resource_id')
         require(isinstance(resource_id, str) and resource_id, Code.EVIDENCE)
+        container = result.get('container')
+        require(isinstance(container, str) and container, Code.EVIDENCE)
         created = str(result.get('creation_evidence') or '')
         readback = str(result.get('readback_evidence') or '')
         if kind == 'form':
-            source = Resource('form', request.loan.ref.tenant_id, 'synthetic-forms', resource_id)
+            source = Resource('form', request.loan.ref.tenant_id, container, resource_id)
             receipt = StageReceipt(request.operation_id, Outcome.VERIFIED, source,
                                    creation_evidence=created, readback_evidence=readback)
             return replace(receipt, outcome=verify_stage(request, receipt))
         if kind == 'todo':
-            source = Resource('todo', request.loan.ref.tenant_id, 'synthetic-todos', resource_id)
+            source = Resource('todo', request.loan.ref.tenant_id, container, resource_id)
             binding = self._binding_from_stage(request.loan, source, result)
             require(binding.contact == request.actor, Code.WRONG_PERSON)
             receipt = StageReceipt(request.operation_id, Outcome.VERIFIED, source, binding,
