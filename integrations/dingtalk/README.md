@@ -76,7 +76,7 @@ node <injected-dws.js> aitable record update --records-file <Windows-native-path
 node <injected-dws.js> aitable record create --records-file <Windows-native-path> --yes --format json
 node <injected-dws.js> todo task create --executors <contact-userId> --yes --format json
 node <injected-dws.js> todo task get --task-id <ID> --format json
-node <injected-dws.js> chat message send --yes --format json
+node <injected-dws.js> chat message send --user <userId> --title <title> --text <text> --yes --format json
 ```
 
 **停止点（任一出现即停，不盲发、不声称成功）：**

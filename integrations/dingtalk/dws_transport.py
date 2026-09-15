@@ -29,11 +29,12 @@ def split_container(container_id):
 
 
 def windows_native_path(path):
-    """``--records-file`` only accepts a Windows native absolute path."""
-    raw = os.fspath(path)
-    if os.name == 'nt' and '/' in raw:
-        raise UnsupportedShapeError('--records-file 只认 Windows 原生路径')
-    abs_path = os.path.abspath(raw)
+    """``--records-file`` only accepts a Windows native absolute path.
+
+    Forward slashes are legal on Windows; normalize with ``abspath`` first,
+    then require a drive and backslash separators in the result.
+    """
+    abs_path = os.path.abspath(os.fspath(path))
     if os.name == 'nt':
         drive, tail = os.path.splitdrive(abs_path)
         if not drive or '/' in abs_path or not tail.startswith('\\'):
@@ -121,10 +122,18 @@ class DwsTransport:
             return ['todo', 'task', 'get',
                     '--task-id', arguments['task_id']] + common
         if command == 'chat.send':
-            return ['chat', 'message', 'send',
-                    '--to', arguments['to'],
-                    '--content', arguments['content'],
-                    '--yes'] + common
+            title = arguments.get('title')
+            body = arguments.get('text')
+            if not isinstance(title, str) or not title or not isinstance(body, str) or not body:
+                raise UnsupportedShapeError('chat.send 需要 title 与 text')
+            if arguments.get('user'):
+                recipient = ['--user', arguments['user']]
+            elif arguments.get('open_dingtalk_id'):
+                recipient = ['--open-dingtalk-id', arguments['open_dingtalk_id']]
+            else:
+                raise UnsupportedShapeError('chat.send 需要 user 或 open_dingtalk_id')
+            return ['chat', 'message', 'send'] + recipient + [
+                '--title', title, '--text', body, '--yes'] + common
         raise UnsupportedShapeError(f'未映射的内部命令: {command}')
 
     def _form_cells(self, arguments):
@@ -152,18 +161,13 @@ class DwsTransport:
         return windows_native_path(path)
 
     def _run(self, argv):
-        try:
-            env = os.environ.copy()
-            env.update(self.extra_env)
-            completed = subprocess.run(
-                self.dws_cmd + argv,
-                capture_output=True, text=True, encoding='utf-8',
-                timeout=self.timeout, check=False, env=env,
-            )
-        except subprocess.TimeoutExpired:
-            raise
-        except OSError:
-            raise
+        env = os.environ.copy()
+        env.update(self.extra_env)
+        completed = subprocess.run(
+            self.dws_cmd + argv,
+            capture_output=True, text=True, encoding='utf-8',
+            timeout=self.timeout, check=False, env=env,
+        )
         raw = (completed.stdout or '').strip() or (completed.stderr or '').strip()
         if not raw:
             raise UnknownResultError('dws 无输出')
@@ -185,32 +189,49 @@ class DwsTransport:
 
     def _remember_stage(self, command, arguments, payload):
         if command == 'form.create':
-            ids = (payload.get('data') or {}).get('newRecordIds') or []
-            if not isinstance(ids, list) or not ids or not isinstance(ids[0], str) or not ids[0]:
-                return
-            resource_id = ids[0]
-            kind = 'form'
-            container = self.form_container
-            created = f'aitable.record.create:{resource_id}'
-            readback = f'aitable.record.query:{resource_id}'
+            meta = self._form_stage_meta(arguments, payload)
         else:
-            result = payload.get('result') or {}
-            resource_id = result.get('taskId')
-            if not isinstance(resource_id, str) or not resource_id:
-                return
-            kind = 'todo'
-            container = self.todo_container
-            created = f'todo.task.create:{resource_id}'
-            readback = f'todo.task.get:{resource_id}'
-        detail = (payload.get('result') or {}).get('todoDetailModel') or {}
+            meta = self._todo_stage_meta(arguments, payload)
+        if meta is None:
+            return
+        store = self._load_stages()
+        store['by_operation'][arguments['operation_id']] = meta
+        store['by_task'][meta['resource_id']] = meta
+        self._save_stages(store)
+
+    def _form_stage_meta(self, arguments, payload):
+        ids = (payload.get('data') or {}).get('newRecordIds') or []
+        if not isinstance(ids, list) or not ids or not isinstance(ids[0], str) or not ids[0]:
+            return None
+        resource_id = ids[0]
+        return {
+            'kind': 'form',
+            'resource_id': resource_id,
+            'container': self.form_container,
+            'creation_evidence': f'aitable.record.create:{resource_id}',
+            'readback_evidence': f'aitable.record.query:{resource_id}',
+            'action': arguments['action'],
+            'operation_id': arguments['operation_id'],
+            'loan_container': arguments['loan_container'],
+            'loan_id': arguments['loan_id'],
+            'config_version': arguments['config_version'],
+            'contact': arguments['actor'],
+        }
+
+    def _todo_stage_meta(self, arguments, payload):
+        result = payload.get('result') or {}
+        resource_id = result.get('taskId')
+        if not isinstance(resource_id, str) or not resource_id:
+            return None
+        detail = result.get('todoDetailModel') or {}
         executors = detail.get('executorIds') or []
         internal_id = executors[0] if executors else arguments.get('actor')
-        meta = {
-            'kind': kind,
+        return {
+            'kind': 'todo',
             'resource_id': resource_id,
-            'container': container,
-            'creation_evidence': created,
-            'readback_evidence': readback,
+            'container': self.todo_container,
+            'creation_evidence': f'todo.task.create:{resource_id}',
+            'readback_evidence': f'todo.task.get:{resource_id}',
             'action': arguments['action'],
             'operation_id': arguments['operation_id'],
             'loan_container': arguments['loan_container'],
@@ -219,10 +240,6 @@ class DwsTransport:
             'contact': arguments['actor'],
             'internal_id': internal_id,
         }
-        store = self._load_stages()
-        store['by_operation'][arguments['operation_id']] = meta
-        store['by_task'][resource_id] = meta
-        self._save_stages(store)
 
     def _stage_query(self, arguments):
         store = self._load_stages()

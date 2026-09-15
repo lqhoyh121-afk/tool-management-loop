@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
 import sys
 import tempfile
@@ -36,7 +35,7 @@ def _load(name, path):
 _ROOT = Path(__file__).resolve().parents[2]
 _fixtures = _load('t031_port_fixtures', _ROOT / 'tests' / 'contracts' / 'fixtures.py')
 _synthetic = _load('t031_port_synthetic', _ROOT / 'tests' / 'contracts' / 'synthetic.py')
-NOW, MANAGER, BORROWER = _fixtures.NOW, _fixtures.MANAGER, _fixtures.BORROWER
+MANAGER = _fixtures.MANAGER
 SyntheticJournal, SyntheticLease = _synthetic.SyntheticJournal, _synthetic.SyntheticLease
 
 LOAN = Resource('record', 'synthetic-org', 'baseLoan/tblLoan', 'recLoan')
@@ -107,8 +106,9 @@ class DwsTransportTests(unittest.TestCase):
         if os.name == 'nt':
             self.assertNotIn('/', native)
             self.assertIn('\\', native)
-            with self.assertRaises(UnsupportedShapeError):
-                windows_native_path('/tmp/records.json')
+            mixed = str(self.work / 'payload.json').replace('\\', '/')
+            self.assertIn('/', mixed)
+            self.assertNotIn('/', windows_native_path(mixed))
 
     def test_query_single_page_uses_data_records(self):
         payload = self.transport.exchange('record.query', {
@@ -211,10 +211,48 @@ class DwsTransportTests(unittest.TestCase):
 
     def test_chat_send_is_mapped(self):
         payload = self.transport.exchange('chat.send', {
-            'to': 'synthetic-manager',
-            'content': 'SYNTHETIC-notice',
+            'user': 'synthetic-manager',
+            'title': 'SYNTHETIC-title',
+            'text': 'SYNTHETIC-notice',
         })
         self.assertEqual(payload['result']['openTaskId'], 'SYNTHETIC-chat')
+        fallback = self.transport.exchange('chat.send', {
+            'open_dingtalk_id': 'SYNTHETIC-open-id',
+            'title': 'SYNTHETIC-title',
+            'text': 'SYNTHETIC-notice',
+        })
+        self.assertEqual(fallback['result']['openTaskId'], 'SYNTHETIC-chat')
+
+    def test_fake_dws_rejects_unknown_chat_flags(self):
+        from t031_fake_dws import require_spec
+        argv = ['chat', 'message', 'send', '--to', 'x', '--content', 'y',
+                '--yes', '--format', 'json']
+        payload = require_spec('chat message send', argv)
+        self.assertEqual(payload['error']['code'], 'UNKNOWN_FLAG')
+        missing = require_spec('chat message send', [
+            'chat', 'message', 'send', '--user', 'synthetic-manager',
+            '--text', 'SYNTHETIC-notice', '--yes', '--format', 'json'])
+        self.assertEqual(missing['error']['code'], 'MISSING_FLAG')
+
+    def test_stage_query_by_task_id(self):
+        current = loan()
+        inventory = stock()
+        intent = plan(current, event(Action.APPROVE), inventory)
+        receipt = self.adapter.submit(intent, self.binding, self.lease)
+        current, inventory = verify(intent, receipt).loan, receipt.inventory
+        reserve = replace(event(Action.RESERVE), actor=None, evidence_kind='system')
+        intent = plan(current, reserve, inventory)
+        receipt = self.adapter.submit(intent, self.binding, self.lease)
+        current = verify(intent, receipt).loan
+        issue = StageRequest(stage_operation_id(current, Action.ISSUE),
+                             current, Action.ISSUE, MANAGER)
+        todo = self.adapter.create_stage(issue, self.binding, self.lease)
+        queried = self.transport.exchange('stage.query', {
+            'task_id': todo.source.resource_id,
+        })
+        self.assertEqual(queried['result']['resource_id'], todo.source.resource_id)
+        self.assertEqual(queried['result']['container'], TODO_CONTAINER)
+        self.assertEqual(queried['result']['kind'], 'todo')
 
 
 if __name__ == '__main__':

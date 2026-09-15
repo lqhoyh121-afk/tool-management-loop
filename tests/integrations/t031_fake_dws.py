@@ -52,14 +52,88 @@ def has(argv, name):
     return name in argv
 
 
+BOOLEAN = {'--all', '--yes'}
+
+SPECS = {
+    'aitable record query': {
+        'required': {'--base-id', '--table-id', '--record-ids', '--format'},
+        'optional': {'--all'},
+    },
+    'aitable record update': {
+        'required': {'--base-id', '--table-id', '--records-file', '--yes', '--format'},
+        'optional': set(),
+    },
+    'aitable record create': {
+        'required': {'--base-id', '--table-id', '--records-file', '--yes', '--format'},
+        'optional': set(),
+    },
+    'todo task create': {
+        'required': {'--title', '--executors', '--yes', '--format'},
+        'optional': set(),
+    },
+    'todo task get': {
+        'required': {'--task-id', '--format'},
+        'optional': set(),
+    },
+    'chat message send': {
+        'required': {'--title', '--text', '--yes', '--format'},
+        'optional': {'--user', '--open-dingtalk-id'},
+        'one_of': ({'--user', '--open-dingtalk-id'},),
+    },
+}
+
+
+def parse_flags(argv):
+    flags = {}
+    i = 0
+    while i < len(argv):
+        name = argv[i]
+        if not isinstance(name, str) or not name.startswith('--'):
+            return None, f'unexpected positional {name!r}'
+        if name in BOOLEAN:
+            flags[name] = True
+            i += 1
+            continue
+        if i + 1 >= len(argv) or str(argv[i + 1]).startswith('--'):
+            return None, f'missing value for {name}'
+        flags[name] = argv[i + 1]
+        i += 2
+    return flags, None
+
+
+def require_spec(verb, argv):
+    spec = SPECS.get(verb)
+    if spec is None:
+        return err('UNSUPPORTED_COMMAND')
+    flags, problem = parse_flags(argv[3:])
+    if problem:
+        return err('UNKNOWN_FLAG', problem)
+    allowed = spec['required'] | spec['optional']
+    unknown = set(flags) - allowed
+    if unknown:
+        return err('UNKNOWN_FLAG', sorted(unknown)[0])
+    missing = spec['required'] - set(flags)
+    if missing:
+        return err('MISSING_FLAG', sorted(missing)[0])
+    for group in spec.get('one_of', ()):
+        present = [name for name in group if name in flags]
+        if len(present) != 1:
+            return err('MISSING_FLAG', sorted(group)[0])
+    return None
+
+
 def key(base_id, table_id, record_id):
     return f'{base_id}/{table_id}/{record_id}'
 
 
 def main(argv):
+    verb = ' '.join(argv[:3])
+    spec_error = require_spec(verb, argv)
+    if spec_error:
+        print(json.dumps(spec_error, ensure_ascii=True))
+        return 0
     state_path = Path(os.environ['FAKE_DWS_STATE'])
     state = load_state(state_path)
-    verb = ' '.join(argv[:3])
     if verb in state.get('timeout', []):
         time.sleep(120)
     fail = state.get('fail', {}).get(verb)
