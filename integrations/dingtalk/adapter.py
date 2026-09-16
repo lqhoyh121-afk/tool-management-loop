@@ -20,7 +20,7 @@ from .errors import (BusinessErrorResponse, DingTalkShapeError,
                      UnknownResultError)
 from .identity import TODO
 from .todo import completion_events, finish_time, read_todo_detail
-from .transport import require_envelope
+from .transport import require_envelope, require_todo_envelope
 
 
 def _closed(exc, code=Code.EVIDENCE):
@@ -146,7 +146,10 @@ class DingTalkAdapter:
                 'quantity': request.loan.quantity,
                 'physical_ids': list(request.loan.physical_ids),
             })
-            require_envelope(payload)
+            if command == 'todo.create':
+                require_todo_envelope(payload)
+            else:
+                require_envelope(payload)
         except UnknownResultError:
             receipt = StageReceipt(request.operation_id, Outcome.UNKNOWN)
             self.journal.save_receipt(receipt)
@@ -154,6 +157,10 @@ class DingTalkAdapter:
         except BusinessErrorResponse as exc:
             if _business_code(exc) is Code.IDENTITY:
                 raise ContractError(Code.IDENTITY) from exc
+            receipt = StageReceipt(request.operation_id, Outcome.UNKNOWN)
+            self.journal.save_receipt(receipt)
+            return receipt
+        except DingTalkShapeError:
             receipt = StageReceipt(request.operation_id, Outcome.UNKNOWN)
             self.journal.save_receipt(receipt)
             return receipt
@@ -295,14 +302,14 @@ class DingTalkAdapter:
                 'tenant_id': source.tenant_id,
                 'task_id': source.resource_id,
             })
-            envelope = require_envelope(payload)
+            envelope = require_todo_envelope(payload)
             detail = read_todo_detail(envelope)
         except UnknownResultError as exc:
             _closed(exc, Code.UNKNOWN)
         except BusinessErrorResponse as exc:
             _closed(exc, _business_code(exc))
         except DingTalkShapeError as exc:
-            _closed(exc)
+            _closed(exc, Code.UNKNOWN)
         events = completion_events(detail)
         require(bool(events), Code.EVIDENCE)
         actors = {item.actor.value for item in events}
