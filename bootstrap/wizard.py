@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from bootstrap.binding import document_from_files, load_binding, require_complete, save_binding
-from bootstrap.drive import run_bound_drive
+from bootstrap.drive import format_drive_lines, run_bound_drive
 from bootstrap.env_check import check_environment, format_report, has_gate_failure
 from bootstrap.file_preview import PreviewError, format_preview, preview_workbook
 from bootstrap.gate import assert_business_allowed
@@ -106,8 +106,6 @@ def _drive(runtime, locks_dir, out_stream, ports):
             'locks': ports.get('locks'),
             'store': ports.get('store'),
         }
-    from bootstrap.drive import format_drive_lines
-
     report = run_bound_drive(runtime, locks_dir, **kwargs)
     for line in format_drive_lines(report):
         _write(out_stream, line)

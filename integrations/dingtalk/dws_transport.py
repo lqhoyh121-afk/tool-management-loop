@@ -226,7 +226,9 @@ class DwsTransport:
         resource_id = result.get('taskId')
         if not isinstance(resource_id, str) or not resource_id:
             return None
-        detail = result.get('todoDetailModel') or {}
+        detail = self._todo_detail_for_stage(resource_id)
+        if detail is None:
+            detail = result.get('todoDetailModel') or {}
         executors = detail.get('executorIds') or []
         internal_id = executors[0] if executors else arguments.get('actor')
         return {
@@ -243,6 +245,18 @@ class DwsTransport:
             'contact': arguments['actor'],
             'internal_id': internal_id,
         }
+
+    def _todo_detail_for_stage(self, task_id):
+        """Re-read todo after create; live create may not return todo internal executorIds."""
+        try:
+            payload = self._run(self._argv('todo.get', {'task_id': task_id}))
+        except (UnknownResultError, UnsupportedShapeError, subprocess.TimeoutExpired, OSError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        result = payload.get('result') or {}
+        detail = result.get('todoDetailModel')
+        return detail if isinstance(detail, dict) else None
 
     def _stage_query(self, arguments):
         store = self._load_stages()

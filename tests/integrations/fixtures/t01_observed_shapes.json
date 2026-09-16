@@ -96,7 +96,7 @@
     "todo_detail_done_cross_creator": {
       "_synthetic": true,
       "_source": "docs/evidence/T01-FOLLOWUP.md · 跨创建者完成身份；主控核对 creatorId/finishTime 为 int",
-      "_observed": "T07 真机 #34 封套 + 完成后 task.self.done/task.done；finishTime 为非 0 整数",
+      "_observed": "T07 真机 #34 封套 + 完成后 task.self.done/task.done；finishTime=9000000000001 为合成占位整数，非真机毫秒样例",
       "payload": {
         "success": true,
         "errorCode": null,
@@ -118,6 +118,32 @@
               },
               {
                 "activityId": "SYNTHETIC-activity-0002",
+                "action": "task.done",
+                "creatorId": 9000000002
+              }
+            ]
+          }
+        }
+      }
+    },
+    "todo_detail_live_finish_ms": {
+      "_synthetic": true,
+      "_source": "docs/evidence/T01-HANDOFF.md · finishTime 整数形态；GitHub issue #37 T07 真机毫秒核对（展示例 2026-09-15 17:55 Asia/Shanghai）",
+      "_observed": "finishTime=1789466100000 为 T07 核对过的毫秒锚点（非 round-trip 自造）；createdTime 与 finishTime 差 135941 ms",
+      "payload": {
+        "success": true,
+        "errorCode": null,
+        "errorMsg": null,
+        "arguments": [],
+        "result": {
+          "todoDetailModel": {
+            "taskId": "SYNTHETIC-task-live-ms",
+            "isDone": true,
+            "executorIds": [9000000002],
+            "finishTime": 1789466100000,
+            "activities": [
+              {
+                "activityId": "SYNTHETIC-activity-live",
                 "action": "task.done",
                 "creatorId": 9000000002
               }

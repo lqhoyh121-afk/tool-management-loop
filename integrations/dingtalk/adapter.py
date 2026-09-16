@@ -19,7 +19,8 @@ from .envelope import extract_records, record_cells, record_id
 from .errors import (BusinessErrorResponse, DingTalkShapeError,
                      UnknownResultError)
 from .identity import TODO
-from .todo import completion_at, completion_events, finish_time, read_todo_detail
+from .todo import (completion_at, completion_events, executor_refs, finish_time,
+                   read_todo_detail)
 from .transport import require_envelope, require_todo_envelope
 
 
@@ -316,8 +317,8 @@ class DingTalkAdapter:
         require(len(actors) == 1, Code.EVIDENCE)
         actor_ref = events[0].actor
         actor_ref.require(TODO)
-        require(finish_time(detail) is not None, Code.EVIDENCE)
         try:
+            require(finish_time(detail) is not None, Code.EVIDENCE)
             occurred = completion_at(detail)
         except DingTalkShapeError as exc:
             _closed(exc)
@@ -337,12 +338,15 @@ class DingTalkAdapter:
             raise
         except (DingTalkShapeError, KeyError, TypeError, ValueError) as exc:
             _closed(exc)
-        require(binding.internal.user_id == actor_ref.value, Code.WRONG_PERSON)
+        executors = executor_refs(detail)
+        require(any(actor_ref.same_person_as(item) for item in executors),
+                Code.WRONG_PERSON)
+        completer = Identity('todo', source.tenant_id, actor_ref.value)
         action = Action(queried['action'])
         require(action in (Action.ISSUE, Action.RETURN), Code.STATE)
         return Event(
             action, f'{source.resource_id}:completion', loan.ref, source,
-            binding.internal, occurred, loan.config_version,
+            completer, occurred, loan.config_version,
             'todo_completion', True, binding=binding,
             evidence_ref=f'todo:{source.resource_id}:completion',
         )

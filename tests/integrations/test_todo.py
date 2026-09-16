@@ -89,6 +89,19 @@ class DetailReadTests(unittest.TestCase):
         when = datetime(2026, 9, 14, 18, 0, tzinfo=timezone(timedelta(hours=8)))
         self.assertEqual(format_completion_display(when), '2026-09-14 18:00')
 
+    def test_live_finish_time_ms_anchor(self):
+        detail = read_todo_detail(sample('todo_detail_live_finish_ms'))
+        when = completion_at(detail)
+        expected = datetime(2026, 9, 15, 17, 55, tzinfo=timezone(timedelta(hours=8)))
+        self.assertEqual(when, expected)
+        self.assertEqual(format_completion_display(when), '2026-09-15 17:55')
+
+    def test_completion_at_rejects_unconvertible_finish_time(self):
+        detail = read_todo_detail(sample('todo_detail_done_cross_creator'))
+        detail['finishTime'] = 10**14
+        with self.assertRaises(UnsupportedShapeError):
+            completion_at(detail)
+
     def test_person_id_int_canonicalizes_and_rejects_bool(self):
         detail = read_todo_detail(sample('todo_detail_done_cross_creator'))
         detail['executorIds'] = [True]

@@ -127,7 +127,12 @@ def completion_at(detail):
     raw = finish_time(detail)
     if raw is None:
         return None
-    return datetime.fromtimestamp(raw / 1000, tz=_SHANGHAI)
+    try:
+        return datetime.fromtimestamp(raw / 1000, tz=_SHANGHAI)
+    except (OSError, OverflowError, ValueError) as exc:
+        raise UnsupportedShapeError(
+            f'finishTime 超出可换算范围: {raw!r}'
+        ) from exc
 
 
 def format_completion_display(when):
