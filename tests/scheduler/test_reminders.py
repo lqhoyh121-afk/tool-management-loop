@@ -94,9 +94,10 @@ class ReminderTests(unittest.TestCase):
         again = self.runner(at(4, 12, 0), store=store).run([borrowed(due(5))])
         self.assertEqual(again.issued, ())
 
-    def test_due_day_is_not_overdue(self):
+    def test_due_day_sends_one_reminder(self):
         report = self.runner(at(5, 9, 30)).run([borrowed(due(5))])
-        self.assertEqual(report.issued, ())
+        self.assertEqual(self.kinds(report), [OVERDUE])
+        self.assertTrue(report.issued[0].key.endswith('2030-01-05'))
 
     def test_overdue_once_per_business_day(self):
         store = self.store()

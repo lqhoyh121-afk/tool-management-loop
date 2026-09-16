@@ -50,7 +50,7 @@ Loan 记录字段名【待 contracts 冻结】；去重键正式形态【待 con
 
 `scheduler/reminder.py` 纯求值 + `scheduler/runner.py` 编排，消费冻结契约（`Loan.state`/`due_at`、`business_date`）：
 
-- 评估规则（`evaluate`）：仅 `borrowed` 参与提醒；归还待确认（含归还写入未定的可见形态，契约 §3"保持旧业务状态"）暂停；预计归还日前一业务日发一次 `before_due`（键含预计归还业务日）；到期日当天不发；次日起每业务日一条 `overdue`（键含当天业务日）——跨天停机自然合并为启动日一条。
+- 评估规则（`evaluate`）：仅 `borrowed` 参与提醒；归还待确认（含归还写入未定的可见形态，契约 §3"保持旧业务状态"）暂停；预计归还日前一业务日发一次 `before_due`（键含预计归还业务日）；到期日当天起每业务日一条 `overdue`（键含当天业务日，接线侧按发送日是否等于到期日区分「今天到期」/「已逾期」文案）——跨天停机自然合并为启动日一条。
 - 窗口（`ReminderRunner.run`）：Asia/Shanghai 09:30 前/18:00 后不发送；注入时钟，不触碰系统时间。
 - 防重与回查：发送结果 unknown 记入 pending，先按原键回查（确认送达→落 sent；确认未送达→允许一次重发；仍未知→该单当日阻断，不换日期键绕开）；`FileDedupStore` 以 JSON 文件持久化 sent/pending/启停状态，重启不重发——它是本地运行流水，不是第二套库存主账。
 - 收件人恒为 `loan.borrower`，管理人不出现在任何提醒。

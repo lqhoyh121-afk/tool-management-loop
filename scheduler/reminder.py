@@ -33,9 +33,10 @@ def evaluate(loan, now):
     Only borrowed loans are reminded (C1). Awaiting return confirmation
     (which is also how an unresolved return write presents) pauses (C4/C5).
     The day before the due business date sends before_due once (C2, D3);
-    from the business day after the due date each business day sends one
-    overdue reminder (C3, D3). Cross-day downtime collapses into a single
-    reminder keyed by the current send day (C9/D2).
+    from the due business date onward each business day sends one overdue
+    reminder (C3, D3); bootstrap copy distinguishes due day vs later days.
+    Cross-day downtime collapses into a single reminder keyed by the current
+    send day (C9/D2).
     """
     if loan.state != State.BORROWED:
         return []
@@ -43,7 +44,7 @@ def evaluate(loan, now):
     due_day = business_date(loan.due_at)
     if today == due_day - timedelta(days=1):
         kind, day = BEFORE_DUE, due_day
-    elif today > due_day:
+    elif today >= due_day:
         kind, day = OVERDUE, today
     else:
         return []
