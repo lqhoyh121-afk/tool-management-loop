@@ -4,7 +4,7 @@ from pathlib import Path
 
 from contracts.model import Code, ContractError, Identity, Resource, require, text
 from contracts.ports import LedgerScope, RuntimeBinding
-from integrations.dingtalk.layout import EntryFieldMap, FieldMap
+from integrations.dingtalk.layout import ApplicationFieldMap, EntryFieldMap, FieldMap
 
 BINDING_NAME = 'binding.json'
 TMP_NAME = 'binding.json.tmp'
@@ -59,13 +59,13 @@ def binding_from_document(data):
         *flags,
     )
     require_complete(binding)
-    fields, entry_fields = field_maps_from_document(data)
+    fields, entry_fields, apply_fields = field_maps_from_document(data)
     entry = data.get('application_entry')
     require(entry is not None, Code.EVIDENCE)
     application = _resource(entry)
     require(application.kind in ('form', 'record'), Code.EVIDENCE)
     require(application.tenant_id == binding.account.tenant_id, Code.IDENTITY)
-    return binding, application, fields, entry_fields
+    return binding, application, fields, entry_fields, apply_fields
 
 
 def require_complete(binding):
@@ -87,21 +87,24 @@ def field_maps_from_document(data):
     require(isinstance(data, dict), Code.INVALID)
     raw_fields = data.get('fields')
     raw_entry = data.get('entry_fields')
+    raw_apply = data.get('apply_fields')
     require(isinstance(raw_fields, dict), Code.CONFIG)
     require(isinstance(raw_entry, dict), Code.CONFIG)
+    require(isinstance(raw_apply, dict), Code.CONFIG)
     try:
         fields = FieldMap(**raw_fields)
         entry_fields = EntryFieldMap(**raw_entry)
+        apply_fields = ApplicationFieldMap(**raw_apply)
     except TypeError as exc:
         raise ContractError(Code.CONFIG) from exc
-    return fields, entry_fields
+    return fields, entry_fields, apply_fields
 
 
 def load_binding(runtime):
     data = read_binding_document(runtime)
     if data is None:
         return None, None
-    binding, application, _, _ = binding_from_document(data)
+    binding, application, _, _, _ = binding_from_document(data)
     return binding, application
 
 
@@ -114,7 +117,7 @@ def save_binding(runtime, document):
         raise ContractError(Code.EVIDENCE)
     if path.exists():
         raise ContractError(Code.CONFIG)
-    binding, application, _, _ = binding_from_document(document)
+    binding, application, _, _, _ = binding_from_document(document)
     payload = json.dumps(document, ensure_ascii=True, indent=2) + '\n'
     tmp.write_text(payload, encoding='utf-8')
     tmp.replace(path)

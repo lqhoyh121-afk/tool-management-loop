@@ -2,7 +2,8 @@
 from copy import deepcopy
 from dataclasses import asdict
 
-from integrations.dingtalk.layout import SYNTHETIC_ENTRY_FIELDS, SYNTHETIC_FIELDS
+from integrations.dingtalk.layout import (
+    SYNTHETIC_APPLY_FIELDS, SYNTHETIC_ENTRY_FIELDS, SYNTHETIC_FIELDS)
 
 DOC = {
     'account': {'namespace': 'contact', 'tenant_id': 'synthetic-org',
@@ -21,11 +22,12 @@ DOC = {
     'application_entry': {
         'kind': 'form',
         'tenant_id': 'synthetic-org',
-        'container_id': 'synthetic-forms',
+        'container_id': 'synthetic-apply-forms',
         'resource_id': 'synthetic-apply-entry',
     },
     'fields': asdict(SYNTHETIC_FIELDS),
     'entry_fields': asdict(SYNTHETIC_ENTRY_FIELDS),
+    'apply_fields': asdict(SYNTHETIC_APPLY_FIELDS),
 }
 
 

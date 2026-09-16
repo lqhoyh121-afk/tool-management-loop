@@ -53,6 +53,15 @@ class EntryFieldMap:
     operation_id: str
 
 
+@dataclass(frozen=True)
+class ApplicationFieldMap:
+    """Application collection table field IDs. Distinct from stage-entry EntryFieldMap."""
+    quantity: str
+    physical_ids: str
+    borrower: str
+    occurred_at: str
+
+
 SYNTHETIC_FIELDS = FieldMap(
     state='fldSYN-state',
     quantity='fldSYN-qty',
@@ -100,4 +109,11 @@ SYNTHETIC_ENTRY_FIELDS = EntryFieldMap(
     occurred_at='fldSYN-occurred',
     action='fldSYN-action',
     operation_id='fldSYN-opid',
+)
+
+SYNTHETIC_APPLY_FIELDS = ApplicationFieldMap(
+    quantity='fldSYN-apply-qty',
+    physical_ids='fldSYN-apply-pids',
+    borrower='fldSYN-apply-borrower',
+    occurred_at='fldSYN-apply-occurred',
 )
