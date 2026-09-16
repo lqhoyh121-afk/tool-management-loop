@@ -28,6 +28,7 @@ from scheduler.runner import FileDedupStore, ReminderRunner
 from .binding import field_maps_from_document, read_binding_document
 from .drive import live_adapter
 from .journal import FileJournal
+from .snapshot import parse_loan_ref
 from .paths import runtime_dir
 
 LOCAL_TZ = timezone(timedelta(hours=8))
@@ -102,12 +103,9 @@ class ChatSender:
         return 'ok' if self.receipts.record(reminder.key, payload) else 'unknown'
 
 
-def parse_ref(raw):
-    """``tenant/container/resource`` into a record Resource; no guessed shapes."""
-    parts = (raw or '').split('/')
-    require(len(parts) == 3 and all(part.strip() for part in parts), Code.CONFIG)
-    return Resource(kind='record', tenant_id=parts[0], container_id=parts[1],
-                    resource_id=parts[2])
+def parse_ref(raw, *, expected_container=None):
+    """Backward-compatible alias for :func:`bootstrap.snapshot.parse_loan_ref`."""
+    return parse_loan_ref(raw, expected_container=expected_container)
 
 
 def _refs_from_intent(intent):
@@ -235,7 +233,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='工器具归还提醒：按冻结口径发一轮，不写台账')
     parser.add_argument('--runtime', default=None, help='运行时目录，默认 runtime/')
     parser.add_argument('--loan', action='append', default=[],
-                        help='tenant/container/resource，可重复；不填则用日志与 sources.json')
+                        help='tenant/container/record，或 tenant/base/table/record（容器含 / 时用四段）；可重复')
     parser.add_argument('--dry-run', action='store_true', help='只算不发、不落盘')
     parser.add_argument('--now', default=None,
                         help='仅与 --dry-run 同用：把「现在」定在 YYYY-MM-DD HH:MM（上海时区）预演那一轮')
