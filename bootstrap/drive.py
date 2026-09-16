@@ -201,16 +201,26 @@ class DriveLoop:
             items.append(WorkItem('event', intent.loan.ref, receipt.source))
         return tuple(items)
 
+    def _resolve_loan_ref(self, item):
+        resolver = getattr(self.engine.reader, 'resolve_return_form_loan', None)
+        if resolver is None:
+            return item.loan_ref
+        matched = resolver(item.source, item.loan_ref)
+        if matched is None:
+            return item.loan_ref
+        return matched
+
     def _handle(self, item):
-        loan = self.engine.reader.read_loan(item.loan_ref)
+        loan_ref = self._resolve_loan_ref(item)
+        loan = self.engine.reader.read_loan(loan_ref)
         check_binding(self.engine.binding, loan)
         self.locks.assert_held(self.engine.lease)
         if item.kind == 'apply':
-            self.engine.admit_application(item.loan_ref, item.source)
-            current = self.engine.reader.read_loan(item.loan_ref)
+            self.engine.admit_application(loan_ref, item.source)
+            current = self.engine.reader.read_loan(loan_ref)
             self._ensure_current_stage(current)
             return
-        execution = self.engine.execute(item.loan_ref, item.source)
+        execution = self.engine.execute(loan_ref, item.source)
         if execution.outcome == Outcome.UNKNOWN:
             raise ContractError(Code.UNKNOWN)
         if execution.outcome != Outcome.VERIFIED:
@@ -242,7 +252,8 @@ def start_engine(reader, writer, stages, store, locks, binding):
 
 
 def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=None,
-                 apply_fields=None, application_container=None):
+                 apply_fields=None, application_container=None,
+                 return_form_fields=None, loan_container=None):
     """Build DingTalkAdapter only from explicit binding fields. Never guess dws."""
     from integrations.dingtalk.adapter import DingTalkAdapter
     from integrations.dingtalk.dws_transport import DwsTransport
@@ -254,14 +265,19 @@ def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=No
     todo_container = document.get('todo_container')
     require(isinstance(form_container, str) and form_container.strip(), Code.CONFIG)
     require(isinstance(todo_container, str) and todo_container.strip(), Code.CONFIG)
-    if fields is None or entry_fields is None or apply_fields is None:
-        fields, entry_fields, apply_fields = field_maps_from_document(document)
+    if (fields is None or entry_fields is None or apply_fields is None
+            or return_form_fields is None):
+        fields, entry_fields, apply_fields, return_form_fields = field_maps_from_document(
+            document)
     if application_container is None:
         entry = document.get('application_entry')
         require(isinstance(entry, dict), Code.CONFIG)
         application_container = entry.get('container_id')
         require(isinstance(application_container, str) and application_container.strip(),
                 Code.CONFIG)
+    if loan_container is None:
+        loan_container = document.get('loan_container')
+        require(isinstance(loan_container, str) and loan_container.strip(), Code.CONFIG)
     transport = DwsTransport(
         cmd, fields, form_container=form_container, todo_container=todo_container,
         work_dir=runtime, entry_fields=entry_fields,
@@ -269,6 +285,8 @@ def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=No
     return DingTalkAdapter(
         transport, journal, locks, fields, entry_fields,
         apply_fields=apply_fields, application_container=application_container,
+        return_form_fields=return_form_fields, entry_container=form_container,
+        loan_container=loan_container,
     )
 
 
@@ -277,9 +295,11 @@ def run_bound_drive(runtime, lock_root, reader=None, writer=None, stages=None,
     runtime = Path(runtime)
     document = read_binding_document(runtime)
     if document is None:
-        binding, _entry, fields, entry_fields, apply_fields = None, None, None, None, None
+        binding, _entry, fields, entry_fields, apply_fields, return_form_fields = (
+            None, None, None, None, None, None)
     else:
-        binding, _entry, fields, entry_fields, apply_fields = binding_from_document(document)
+        binding, _entry, fields, entry_fields, apply_fields, return_form_fields = (
+            binding_from_document(document))
     require_complete(binding)
     locks = locks or MachineLock(lock_root)
     store = store or FileJournal(runtime / 'operations')

@@ -6,9 +6,9 @@ helpers. Commands are adapter-internal names, not a claim of real dws verbs.
 from copy import deepcopy
 import json
 
-from contracts.model import Identity, Resource
+from contracts.model import Identity, Resource, State
 
-from integrations.dingtalk.codec import _put_identity
+from integrations.dingtalk.codec import _put_identity, decode_loan
 from integrations.dingtalk.transport import Transport
 
 
@@ -110,6 +110,7 @@ class MemoryTransport(Transport):
             'todo.create': self._todo_create,
             'todo.get': self._todo_get,
             'stage.query': self._stage_query,
+            'loan.query_borrowed': self._loan_query_borrowed,
         }.get(command)
         if handler is None:
             return error_envelope('UNSUPPORTED_COMMAND')
@@ -279,6 +280,23 @@ class MemoryTransport(Transport):
             return todo_error_envelope('TASK_NOT_EXIST')
         todo = self.todos[task_id]
         return todo_ok_envelope(result={'todoDetailModel': deepcopy(todo['detail'])})
+
+    def _loan_query_borrowed(self, arguments):
+        tenant = arguments['tenant_id']
+        container = arguments['loan_container']
+        borrower = arguments['borrower']
+        matches = []
+        for (record_tenant, record_container, resource_id), cells in self.records.items():
+            if record_tenant != tenant or record_container != container:
+                continue
+            ref = Resource('record', tenant, container, resource_id)
+            try:
+                current = decode_loan(ref, cells, self.fields)
+            except Exception:
+                continue
+            if current.state == State.BORROWED and current.borrower.user_id == borrower:
+                matches.append(resource_id)
+        return ok_envelope(result={'loan_ids': sorted(matches)})
 
     def _stage_query(self, arguments):
         if 'operation_id' in arguments:

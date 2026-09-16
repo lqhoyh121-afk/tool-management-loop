@@ -9,7 +9,7 @@ from dataclasses import replace
 
 from contracts.flow import Receipt, verify
 from contracts.model import (Action, Code, ContractError, Event, Identity,
-                             IdentityBinding, Outcome, Resource, require, text)
+                             IdentityBinding, Outcome, Resource, State, require, text)
 from contracts.ports import StageReceipt, StageRequest, check_binding, verify_stage
 
 from .cells import (MissingFieldError, read_datetime, read_single_select,
@@ -58,7 +58,8 @@ class DingTalkAdapter:
     """Implements ReadPort, WritePort and StagePort against `transport`."""
 
     def __init__(self, transport, journal, leases, fields, entry_fields,
-                 apply_fields=None, application_container=None):
+                 apply_fields=None, application_container=None,
+                 return_form_fields=None, entry_container=None, loan_container=None):
         self.transport = transport
         self.journal = journal
         self.leases = leases
@@ -66,6 +67,9 @@ class DingTalkAdapter:
         self.entry_fields = entry_fields
         self.apply_fields = apply_fields
         self.application_container = application_container or ''
+        self.return_form_fields = return_form_fields
+        self.entry_container = entry_container or ''
+        self.loan_container = loan_container or ''
 
     def read_loan(self, ref):
         return decode_loan(ref, self._record_cells(ref), self.fields)
@@ -272,12 +276,93 @@ class DingTalkAdapter:
         internal = Identity('todo', contact.tenant_id, internal_id)
         return IdentityBinding(contact, internal, source, created, readback)
 
+    def resolve_return_form_loan(self, source, hint_ref):
+        """Return the sole borrowed loan for a minimal return-form row, else None."""
+        if source.kind != 'form' or self.return_form_fields is None:
+            return None
+        cells = self._record_cells(source)
+        if not self._is_return_form_submission(cells, source):
+            return None
+        actor = _identity(cells, self.return_form_fields.borrower, source.tenant_id)
+        loan_container = self.loan_container or hint_ref.container_id
+        text(loan_container)
+        matches = self._borrowed_loan_ids(source.tenant_id, loan_container, actor.user_id)
+        require(len(matches) == 1, Code.EVIDENCE)
+        matched = Resource('record', source.tenant_id, loan_container, matches[0])
+        return matched
+
+    def _cell_has_text(self, cells, field_id):
+        if field_id not in cells or cells[field_id] is None:
+            return False
+        try:
+            return bool(read_text(cells, field_id).strip())
+        except DingTalkShapeError:
+            return False
+
+    def _is_return_form_submission(self, cells, source):
+        if self.return_form_fields is None:
+            return False
+        if self.entry_container and source.container_id != self.entry_container:
+            return False
+        entry = self.entry_fields
+        if self._cell_has_text(cells, entry.loan_id):
+            return False
+        if self._cell_has_text(cells, entry.loan_container):
+            return False
+        fields = self.return_form_fields
+        return (fields.borrower in cells and cells[fields.borrower] is not None
+                and fields.occurred_at in cells and cells[fields.occurred_at] is not None)
+
+    def _borrowed_loan_ids(self, tenant_id, loan_container, borrower_user_id):
+        payload = self.transport.exchange('loan.query_borrowed', {
+            'tenant_id': tenant_id,
+            'loan_container': loan_container,
+            'borrower': borrower_user_id,
+        })
+        result = require_envelope(payload).get('result')
+        require(isinstance(result, dict), Code.EVIDENCE)
+        loan_ids = result.get('loan_ids')
+        require(isinstance(loan_ids, list), Code.EVIDENCE)
+        cleaned = []
+        for item in loan_ids:
+            require(isinstance(item, str) and item.strip(), Code.EVIDENCE)
+            cleaned.append(item)
+        return cleaned
+
     def _read_form_event(self, loan, source):
         cells = self._record_cells(source)
         if (self.apply_fields is not None
                 and source.container_id == self.application_container):
             return self._read_application_event(loan, source, cells)
+        if self._is_return_form_submission(cells, source):
+            return self._read_return_form_event(loan, source, cells)
         return self._read_entry_form_event(loan, source, cells)
+
+    def _read_return_form_event(self, loan, source, cells):
+        fields = self.return_form_fields
+        try:
+            actor = _identity(cells, fields.borrower, loan.ref.tenant_id)
+            occurred = read_datetime(cells, fields.occurred_at)
+            loan_container = self.loan_container or loan.ref.container_id
+            matches = self._borrowed_loan_ids(source.tenant_id, loan_container, actor.user_id)
+            require(len(matches) == 1, Code.EVIDENCE)
+            require(matches[0] == loan.ref.resource_id, Code.WRONG_LOAN)
+            require(actor == loan.borrower, Code.WRONG_PERSON)
+            require(loan.state == State.BORROWED, Code.STATE)
+            return_ref = Resource(
+                'record', source.tenant_id, source.container_id, source.resource_id)
+            require(return_ref != loan.ref, Code.WRONG_LOAN)
+            action = Action.REQUEST_RETURN
+        except ContractError:
+            raise
+        except DingTalkShapeError as exc:
+            _closed(exc)
+        return Event(
+            action, f'{source.resource_id}:{action.value}', loan.ref, source,
+            actor, occurred, loan.config_version, 'form', True,
+            return_ref=return_ref, quantity=loan.quantity, physical_ids=loan.physical_ids,
+            evidence_ref=f'form:{source.resource_id}',
+        )
 
     def _read_application_event(self, loan, source, cells):
         fields = self.apply_fields

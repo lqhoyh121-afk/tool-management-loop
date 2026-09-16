@@ -95,6 +95,8 @@ class DwsTransport:
     def exchange(self, command, arguments):
         arguments = dict(arguments)
         try:
+            if command == 'loan.query_borrowed':
+                raise UnsupportedShapeError('loan.query_borrowed 尚未在 dws 连接层实现')
             if command == 'stage.query':
                 return self._stage_query(arguments)
             argv = self._argv(command, arguments)

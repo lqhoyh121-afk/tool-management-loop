@@ -62,6 +62,13 @@ class ApplicationFieldMap:
     occurred_at: str
 
 
+@dataclass(frozen=True)
+class ReturnFormFieldMap:
+    """Return form view on the stage-entry table; only borrower and return time."""
+    borrower: str
+    occurred_at: str
+
+
 SYNTHETIC_FIELDS = FieldMap(
     state='fldSYN-state',
     quantity='fldSYN-qty',
@@ -116,4 +123,9 @@ SYNTHETIC_APPLY_FIELDS = ApplicationFieldMap(
     physical_ids='fldSYN-apply-pids',
     borrower='fldSYN-apply-borrower',
     occurred_at='fldSYN-apply-occurred',
+)
+
+SYNTHETIC_RETURN_FORM_FIELDS = ReturnFormFieldMap(
+    borrower='fldSYN-return-borrower',
+    occurred_at='fldSYN-return-occurred',
 )
