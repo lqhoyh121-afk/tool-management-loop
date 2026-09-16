@@ -1,5 +1,6 @@
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -16,9 +17,11 @@ from integrations.dingtalk.errors import (
 from integrations.dingtalk.identity import CONTACT, TODO, PersonRef
 from integrations.dingtalk.todo import (
     completed_by,
+    completion_at,
     completion_events,
     executor_refs,
     finish_time,
+    format_completion_display,
     read_todo_detail,
 )
 
@@ -72,6 +75,33 @@ class DetailReadTests(unittest.TestCase):
         detail['finishTime'] = True
         with self.assertRaises(UnsupportedShapeError):
             finish_time(detail)
+
+    def test_completion_at_converts_finish_time_milliseconds(self):
+        expected = datetime(2026, 9, 14, 18, 0, tzinfo=timezone(timedelta(hours=8)))
+        detail = read_todo_detail(sample('todo_detail_done_cross_creator'))
+        detail['finishTime'] = int(expected.timestamp() * 1000)
+        self.assertEqual(completion_at(detail), expected)
+
+    def test_completion_at_absent_when_finish_time_zero(self):
+        self.assertIsNone(completion_at(read_todo_detail(sample('todo_detail_open'))))
+
+    def test_format_completion_display_shanghai(self):
+        when = datetime(2026, 9, 14, 18, 0, tzinfo=timezone(timedelta(hours=8)))
+        self.assertEqual(format_completion_display(when), '2026-09-14 18:00')
+
+    def test_live_finish_time_ms_anchor(self):
+        detail = read_todo_detail(sample('todo_detail_live_finish_ms'))
+        when = completion_at(detail)
+        expected = datetime.fromtimestamp(
+            1789466249929 / 1000, tz=timezone(timedelta(hours=8)))
+        self.assertEqual(when, expected)
+        self.assertEqual(format_completion_display(when), '2026-09-15 17:57')
+
+    def test_completion_at_rejects_unconvertible_finish_time(self):
+        detail = read_todo_detail(sample('todo_detail_done_cross_creator'))
+        detail['finishTime'] = 10**14
+        with self.assertRaises(UnsupportedShapeError):
+            completion_at(detail)
 
     def test_person_id_int_canonicalizes_and_rejects_bool(self):
         detail = read_todo_detail(sample('todo_detail_done_cross_creator'))

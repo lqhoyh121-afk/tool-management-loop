@@ -56,13 +56,12 @@ class AitableTodoTransport(MemoryTransport):
                 'todoDetailModel': {
                     'taskId': arguments['task_id'],
                     'isDone': True,
-                    'finishTime': 9000000000001,
+                    'finishTime': int(NOW.timestamp() * 1000),
                     'executorIds': [9000000100],
                     'activities': [
                         {'activityId': 'SYN-a', 'action': 'task.done', 'creatorId': 9000000100},
                     ],
                 },
-                'occurredAt': NOW.isoformat(),
             })
         return super().exchange(command, arguments)
 
@@ -155,6 +154,35 @@ class TodoEnvelopeAdapterTests(unittest.TestCase):
         self.transport.complete_todo(receipt.source.resource_id, NOW.isoformat())
         event_read = self.adapter.read_event(current, receipt.source)
         self.assertEqual(event_read.action, Action.ISSUE)
+
+    def test_issue_todo_without_result_occurred_at_reaches_borrowed(self):
+        """Live todo.get has finishTime/activities but no result.occurredAt (#47)."""
+        approved = plan(loan(), event(Action.APPROVE), stock())
+        self.adapter.submit(approved, self.binding, self.lease)
+        current = self.adapter.read_loan(LOAN)
+        reserve = replace(event(Action.RESERVE), actor=None, evidence_kind='system')
+        inventory = self.adapter.read_inventory(ITEM)
+        reserve_receipt = self.adapter.submit(
+            plan(current, reserve, inventory), self.binding, self.lease)
+        current = self.adapter.read_loan(LOAN)
+        inventory = reserve_receipt.inventory
+        request = StageRequest(stage_operation_id(current, Action.ISSUE),
+                               current, Action.ISSUE, MANAGER)
+        receipt = self.adapter.create_stage(request, self.binding, self.lease)
+        self.transport.complete_todo(receipt.source.resource_id, NOW.isoformat())
+        payload = self.transport.exchange('todo.get', {
+            'tenant_id': receipt.source.tenant_id,
+            'task_id': receipt.source.resource_id,
+        })
+        result = payload.get('result')
+        self.assertIsInstance(result, dict)
+        self.assertNotIn('occurredAt', result)
+        self.assertIn('todoDetailModel', result)
+        done = self.adapter.read_event(current, receipt.source)
+        intent = plan(current, done, inventory)
+        written = self.adapter.submit(intent, self.binding, self.lease)
+        self.assertEqual(verify(intent, written).outcome, Outcome.VERIFIED)
+        self.assertEqual(written.loan.state, State.BORROWED)
 
 
 if __name__ == '__main__':

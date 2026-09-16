@@ -19,7 +19,8 @@ from .envelope import extract_records, record_cells, record_id
 from .errors import (BusinessErrorResponse, DingTalkShapeError,
                      UnknownResultError)
 from .identity import TODO
-from .todo import completion_events, finish_time, read_todo_detail
+from .todo import (completion_at, completion_events, executor_refs, finish_time,
+                   read_todo_detail)
 from .transport import require_envelope, require_todo_envelope
 
 
@@ -316,13 +317,12 @@ class DingTalkAdapter:
         require(len(actors) == 1, Code.EVIDENCE)
         actor_ref = events[0].actor
         actor_ref.require(TODO)
-        require(finish_time(detail) is not None, Code.EVIDENCE)
-        result = envelope.get('result')
-        require(isinstance(result, dict) and 'occurredAt' in result, Code.EVIDENCE)
         try:
-            occurred = read_datetime({'t': result['occurredAt']}, 't')
+            require(finish_time(detail) is not None, Code.EVIDENCE)
+            occurred = completion_at(detail)
         except DingTalkShapeError as exc:
             _closed(exc)
+        require(occurred is not None, Code.EVIDENCE)
         try:
             meta_payload = self.transport.exchange('stage.query', {
                 'task_id': source.resource_id,
@@ -338,12 +338,16 @@ class DingTalkAdapter:
             raise
         except (DingTalkShapeError, KeyError, TypeError, ValueError) as exc:
             _closed(exc)
-        require(binding.internal.user_id == actor_ref.value, Code.WRONG_PERSON)
+        executors = executor_refs(detail)
+        require(executors, Code.EVIDENCE)
+        require(actor_ref.same_person_as(executors[0]), Code.WRONG_PERSON)
+        completer = Identity('todo', source.tenant_id, actor_ref.value)
+        binding = replace(binding, internal=completer)
         action = Action(queried['action'])
         require(action in (Action.ISSUE, Action.RETURN), Code.STATE)
         return Event(
             action, f'{source.resource_id}:completion', loan.ref, source,
-            binding.internal, occurred, loan.config_version,
+            completer, occurred, loan.config_version,
             'todo_completion', True, binding=binding,
             evidence_ref=f'todo:{source.resource_id}:completion',
         )
