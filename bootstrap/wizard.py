@@ -106,11 +106,11 @@ def _drive(runtime, locks_dir, out_stream, ports):
             'locks': ports.get('locks'),
             'store': ports.get('store'),
         }
+    from bootstrap.drive import format_drive_lines
+
     report = run_bound_drive(runtime, locks_dir, **kwargs)
-    _write(out_stream, (
-        f'驱动完成。回查 {len(report.recovered)}，处理 {len(report.processed)}，'
-        f'跳过 {len(report.skipped)}，挂起 {len(report.blocked)}。未盲重发。'
-    ))
+    for line in format_drive_lines(report):
+        _write(out_stream, line)
     return 0
 
 

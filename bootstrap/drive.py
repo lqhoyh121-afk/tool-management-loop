@@ -41,11 +41,63 @@ class WorkItem:
 
 
 @dataclass(frozen=True)
+class DriveOutcome:
+    kind: str
+    loan_id: str
+    source_kind: str
+    source_id: str
+    code: str
+
+
+@dataclass(frozen=True)
 class DriveReport:
     recovered: tuple
     processed: tuple
     skipped: tuple
     blocked: tuple
+
+
+def _drive_outcome(item, code):
+    return DriveOutcome(
+        kind=item.kind,
+        loan_id=item.loan_ref.resource_id,
+        source_kind=item.source.kind,
+        source_id=item.source.resource_id,
+        code=code,
+    )
+
+
+def _code_counts(outcomes):
+    counts = {}
+    for outcome in outcomes:
+        counts[outcome.code] = counts.get(outcome.code, 0) + 1
+    return counts
+
+
+def format_outcome_summary(outcomes):
+    if not outcomes:
+        return '0'
+    parts = [f'{code}×{count}' for code, count in sorted(_code_counts(outcomes).items())]
+    return f'{len(outcomes)}（{"，".join(parts)}）'
+
+
+def format_drive_lines(report):
+    lines = [
+        '驱动完成。回查 {recovered}，处理 {processed}，跳过 {skipped}，'
+        '挂起 {blocked}。未盲重发。'.format(
+            recovered=len(report.recovered),
+            processed=len(report.processed),
+            skipped=format_outcome_summary(report.skipped),
+            blocked=format_outcome_summary(report.blocked),
+        ),
+    ]
+    for label, outcomes in (('跳过', report.skipped), ('挂起', report.blocked)):
+        for outcome in outcomes:
+            lines.append(
+                f'  {label} {outcome.kind} loan={outcome.loan_id} '
+                f'{outcome.source_kind}={outcome.source_id} {outcome.code}'
+            )
+    return lines
 
 
 class FileSources:
@@ -93,7 +145,7 @@ class DriveLoop:
         blocked_loans = set(self._unresolved_loans())
         for item in self._work():
             if item.loan_ref in blocked_loans:
-                blocked.append(item)
+                blocked.append(_drive_outcome(item, Code.UNKNOWN.value))
                 continue
             try:
                 self._handle(item)
@@ -102,9 +154,9 @@ class DriveLoop:
                     raise
                 if exc.code == Code.UNKNOWN:
                     blocked_loans.add(item.loan_ref)
-                    blocked.append(item)
+                    blocked.append(_drive_outcome(item, Code.UNKNOWN.value))
                     continue
-                skipped.append((item, exc.code.value))
+                skipped.append(_drive_outcome(item, exc.code.value))
                 continue
             processed.append(item)
         return DriveReport(tuple(recovered), tuple(processed), tuple(skipped), tuple(blocked))

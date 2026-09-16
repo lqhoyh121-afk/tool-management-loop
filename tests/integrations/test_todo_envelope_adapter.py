@@ -56,13 +56,12 @@ class AitableTodoTransport(MemoryTransport):
                 'todoDetailModel': {
                     'taskId': arguments['task_id'],
                     'isDone': True,
-                    'finishTime': 9000000000001,
+                    'finishTime': int(NOW.timestamp() * 1000),
                     'executorIds': [9000000100],
                     'activities': [
                         {'activityId': 'SYN-a', 'action': 'task.done', 'creatorId': 9000000100},
                     ],
                 },
-                'occurredAt': NOW.isoformat(),
             })
         return super().exchange(command, arguments)
 

@@ -19,7 +19,7 @@ from .envelope import extract_records, record_cells, record_id
 from .errors import (BusinessErrorResponse, DingTalkShapeError,
                      UnknownResultError)
 from .identity import TODO
-from .todo import completion_events, finish_time, read_todo_detail
+from .todo import completion_at, completion_events, finish_time, read_todo_detail
 from .transport import require_envelope, require_todo_envelope
 
 
@@ -317,12 +317,11 @@ class DingTalkAdapter:
         actor_ref = events[0].actor
         actor_ref.require(TODO)
         require(finish_time(detail) is not None, Code.EVIDENCE)
-        result = envelope.get('result')
-        require(isinstance(result, dict) and 'occurredAt' in result, Code.EVIDENCE)
         try:
-            occurred = read_datetime({'t': result['occurredAt']}, 't')
+            occurred = completion_at(detail)
         except DingTalkShapeError as exc:
             _closed(exc)
+        require(occurred is not None, Code.EVIDENCE)
         try:
             meta_payload = self.transport.exchange('stage.query', {
                 'task_id': source.resource_id,

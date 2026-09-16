@@ -178,13 +178,13 @@ class PortTests(unittest.TestCase):
         written = self.adapter.submit(intent, self.binding, self.lease)
         self.assertEqual(verify(intent, written).outcome, Outcome.VERIFIED)
 
-    def test_todo_without_iso_time_is_not_converted_from_finish_time(self):
+    def test_todo_without_finish_time_blocks(self):
         current, _inventory = self._advance_to_issue()
         request = StageRequest(stage_operation_id(current, Action.ISSUE),
                                current, Action.ISSUE, MANAGER)
         receipt = self.adapter.create_stage(request, self.binding, self.lease)
         self.transport.complete_todo(receipt.source.resource_id, NOW.isoformat())
-        self.transport.todos[receipt.source.resource_id]['occurred_at'] = None
+        self.transport.todos[receipt.source.resource_id]['detail']['finishTime'] = 0
         self.blocked(Code.EVIDENCE, lambda: self.adapter.read_event(current, receipt.source))
 
     def test_stage_container_comes_from_query_not_fixture_name(self):

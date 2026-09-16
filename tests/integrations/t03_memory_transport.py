@@ -60,8 +60,8 @@ def _synthetic_option_write(cells):
 class MemoryTransport(Transport):
     """Records, forms and todos in process memory.
 
-    `occurredAt` on todo.get is a separate ISO evidence field used by tests.
-    It is never derived from todo `finishTime` (integer, unit unknown).
+    Todo completion time is carried only in ``finishTime`` (milliseconds), matching
+    live ``todo task get``; tests must not fabricate ``result.occurredAt``.
     """
 
     def __init__(self, fields, entry_fields, form_container='synthetic-forms',
@@ -136,13 +136,15 @@ class MemoryTransport(Transport):
         internal = creator_id if creator_id is not None else todo['internal_id']
         self._activities += 1
         activity = f'SYNTHETIC-activity-{self._activities:04d}'
+        if isinstance(occurred_at, str):
+            from datetime import datetime
+            occurred_at = datetime.fromisoformat(occurred_at)
         todo['detail']['isDone'] = True
-        todo['detail']['finishTime'] = 9000000000001
+        todo['detail']['finishTime'] = int(occurred_at.timestamp() * 1000)
         todo['detail']['activities'] = [
             {'activityId': activity + '-self', 'action': 'task.self.done', 'creatorId': internal},
             {'activityId': activity + '-done', 'action': 'task.done', 'creatorId': internal},
         ]
-        todo['occurred_at'] = occurred_at
 
     def writes_of(self, command):
         return [item for item in self.calls if item[0] == command]
@@ -250,7 +252,6 @@ class MemoryTransport(Transport):
         self.todos[task_id] = {
             'detail': detail,
             'internal_id': internal,
-            'occurred_at': None,
             'operation_id': arguments['operation_id'],
         }
         meta = {
@@ -276,10 +277,7 @@ class MemoryTransport(Transport):
         if task_id not in self.todos:
             return todo_error_envelope('TASK_NOT_EXIST')
         todo = self.todos[task_id]
-        result = {'todoDetailModel': deepcopy(todo['detail'])}
-        if todo['occurred_at'] is not None:
-            result['occurredAt'] = todo['occurred_at']
-        return todo_ok_envelope(result=result)
+        return todo_ok_envelope(result={'todoDetailModel': deepcopy(todo['detail'])})
 
     def _stage_query(self, arguments):
         if 'operation_id' in arguments:

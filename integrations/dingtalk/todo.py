@@ -7,18 +7,22 @@
 
 主控对原始回执的类型核对：完成活动 ``creatorId`` 是 int，``finishTime`` 是 int；
 未完成时 ``finishTime`` 为 0（见 ``docs/evidence/t01-trusted-application.md``）。
-时间单位未另给说明，本层原样保留整数，不换算成 datetime，也不臆造 ISO 字符串。
+T07 真机核对：``finishTime`` 单位为毫秒；``completion_at`` 在连接层唯一换算为
+Asia/Shanghai 带时区 datetime。``finish_time`` 仍原样返回整数，供形态校验与原始值保留。
 
 报告同时记录：完成事件里没有明确审批结果字段，"勾完成"不等于"同意"；实际
 完成者不能只依据 ``isDone`` 或 ``modifierId`` 判定。
 """
+from datetime import datetime
 from typing import NamedTuple
+from zoneinfo import ZoneInfo
 
 from .envelope import read_todo_envelope
 from .errors import MissingFieldError, UnsupportedShapeError
 from .identity import TODO, PersonRef
 
 DONE_ACTIONS = ('task.self.done', 'task.done')
+_SHANGHAI = ZoneInfo('Asia/Shanghai')
 
 
 class CompletionEvent(NamedTuple):
@@ -98,7 +102,7 @@ def completed_by(detail, person):
 def finish_time(detail):
     """返回报文中的整数完成时间；未完成（0）时返回 None。
 
-    不换算时区或纪元单位。主控未给出单位说明前，调用方只能把非 0 整数当原始值。
+    不换算时区或纪元；单位由 T07 真机核对为毫秒，但本函数仍只返回原始整数。
     """
     if 'finishTime' not in detail:
         raise MissingFieldError('待办详情缺少 finishTime')
@@ -112,6 +116,24 @@ def finish_time(detail):
     if value == 0:
         return None
     return value
+
+
+def completion_at(detail):
+    """把 ``finishTime`` 毫秒换算为 Asia/Shanghai 带时区 datetime。
+
+    这是连接层把待办完成时间写入 ``Event.occurred_at`` 的唯一入口；不读
+    ``result.occurredAt``，也不在其他模块重复换算。
+    """
+    raw = finish_time(detail)
+    if raw is None:
+        return None
+    return datetime.fromtimestamp(raw / 1000, tz=_SHANGHAI)
+
+
+def format_completion_display(when):
+    """展示用 ``YYYY-MM-DD HH:mm``（Asia/Shanghai）；内部仍须保留带时区 datetime。"""
+    local = when.astimezone(_SHANGHAI)
+    return local.strftime('%Y-%m-%d %H:%M')
 
 
 def _person_id(value, where):

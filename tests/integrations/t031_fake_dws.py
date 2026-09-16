@@ -256,7 +256,7 @@ def main(argv):
             'executorIds': [internal],
             'activities': [],
         }
-        state['todos'][task_id] = {'detail': detail, 'occurred_at': None}
+        state['todos'][task_id] = {'detail': detail}
         save_state(state_path, state)
         print(json.dumps(todo_ok(result={'taskId': task_id, 'todoDetailModel': detail}),
                          ensure_ascii=True))
@@ -267,10 +267,8 @@ def main(argv):
         if todo is None:
             print(json.dumps(todo_err('TASK_NOT_EXIST'), ensure_ascii=True))
             return 0
-        result = {'todoDetailModel': todo['detail']}
-        if todo.get('occurred_at'):
-            result['occurredAt'] = todo['occurred_at']
-        print(json.dumps(todo_ok(result=result), ensure_ascii=True))
+        print(json.dumps(todo_ok(result={'todoDetailModel': todo['detail']}),
+                         ensure_ascii=True))
         return 0
     if argv[:3] == ['chat', 'message', 'send']:
         print(json.dumps(ok(result={'openTaskId': 'SYNTHETIC-chat'}),
