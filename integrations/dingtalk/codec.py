@@ -4,7 +4,7 @@ import json
 from contracts.model import (ContractError, Code, Identity, Inventory, Loan,
                              Resource, State, require)
 
-from .cells import (read_creator, read_datetime, read_number, read_select_name,
+from .cells import (read_creator, read_datetime, read_number, read_single_select,
                     read_text, read_text_or_empty)
 from .errors import DingTalkShapeError
 from .identity import RECORD_CREATOR
@@ -91,7 +91,7 @@ def encode_inventory(stock: Inventory, fields) -> dict:
 
 def decode_loan(ref: Resource, cells, fields) -> Loan:
     try:
-        tracked = read_select_name(cells, fields.tracked) == 'true'
+        tracked = read_single_select(cells, fields.tracked).name == 'true'
         return_ref = None
         return_id = read_text_or_empty(cells, fields.return_id)
         if return_id:
@@ -110,7 +110,7 @@ def decode_loan(ref: Resource, cells, fields) -> Loan:
             _text_list(cells, fields.physical_ids),
             read_datetime(cells, fields.due_at),
             read_text(cells, fields.config_version),
-            State(read_select_name(cells, fields.state)),
+            State(read_single_select(cells, fields.state).name),
             return_ref,
             _text_list(cells, fields.consumed_events),
             read_text(cells, fields.application_evidence),

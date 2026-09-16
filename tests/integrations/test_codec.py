@@ -38,6 +38,10 @@ class CodecTests(unittest.TestCase):
         self.assertEqual(cells[fields.borrower], [
             {'corpId': current.borrower.tenant_id, 'userId': current.borrower.user_id},
         ])
+        cells[fields.state] = {
+            'id': 'SYNTHETIC-rand-state', 'name': current.state.value,
+        }
+        cells[fields.tracked] = {'id': 'SYNTHETIC-rand-tracked', 'name': 'false'}
         decoded = decode_loan(current.ref, cells, fields)
         self.assertEqual(decoded, current)
 
@@ -51,6 +55,13 @@ class CodecTests(unittest.TestCase):
         fields = SYNTHETIC_FIELDS
         cells = encode_loan(loan(), fields)
         cells[fields.quantity] = 2
+        with self.assertRaises(ContractError) as caught:
+            decode_loan(loan().ref, cells, fields)
+        self.assertEqual(caught.exception.code, Code.EVIDENCE)
+
+    def test_decode_loan_rejects_bare_string_single_select(self):
+        fields = SYNTHETIC_FIELDS
+        cells = encode_loan(loan(), fields)
         with self.assertRaises(ContractError) as caught:
             decode_loan(loan().ref, cells, fields)
         self.assertEqual(caught.exception.code, Code.EVIDENCE)
@@ -73,7 +84,10 @@ class CodecTests(unittest.TestCase):
             return_ref=Resource('record', loan().ref.tenant_id,
                                 'synthetic-returns', 'synthetic-return'),
         )
-        decoded = decode_loan(current.ref, encode_loan(current, fields), fields)
+        cells = encode_loan(current, fields)
+        cells[fields.state] = {'id': 'SYN-rand', 'name': current.state.value}
+        cells[fields.tracked] = {'id': 'SYN-rand', 'name': 'false'}
+        decoded = decode_loan(current.ref, cells, fields)
         self.assertEqual(decoded, current)
 
 

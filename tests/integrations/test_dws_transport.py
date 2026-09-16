@@ -190,6 +190,22 @@ class DwsTransportTests(unittest.TestCase):
         save_state(self.state_path, state)
         self.blocked(Code.UNKNOWN, lambda: self.adapter.read_loan(LOAN))
 
+    def test_fake_dws_query_materializes_string_single_select(self):
+        state = load_state(self.state_path)
+        slot = f'{LOAN.container_id}/{LOAN.resource_id}'
+        stored = state['records'][slot]
+        self.assertIsInstance(stored[self.fields.state], str)
+        payload = self.transport.exchange('record.query', {
+            'tenant_id': LOAN.tenant_id,
+            'container_id': LOAN.container_id,
+            'resource_id': LOAN.resource_id,
+        })
+        cells = payload['data']['records'][0]['cells']
+        self.assertIsInstance(cells[self.fields.state], dict)
+        self.assertIn('id', cells[self.fields.state])
+        self.assertEqual(cells[self.fields.state]['name'], stored[self.fields.state])
+        self.assertEqual(self.adapter.read_loan(LOAN).state, loan().state)
+
     def test_read_submit_query_roundtrip(self):
         self.assertEqual(self.adapter.read_loan(LOAN).ref, LOAN)
         self.assertEqual(self.adapter.read_inventory(ITEM).available, 5)

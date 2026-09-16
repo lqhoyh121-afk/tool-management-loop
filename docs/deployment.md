@@ -178,7 +178,7 @@ python -m bootstrap --drive --runtime 运行目录 --lock-root 锁目录
 
 ## T10 缺陷：假实现必须对齐钉钉回读形态
 
-隔离传输不得把 singleSelect 的 `id` 设成与 `name` 相同，也不得回传空字符串字段。适配器读选项用 `.name`；空的归还字段按空而不是缺证。申请决定 `apply` 的 actor 是借款人。写超时后若台账和库存仍是发前快照，记 `NOT_SENT` 并允许按原操作重试；部分写入仍是 `UNKNOWN`，不重放。
+隔离传输不得把 singleSelect 的 `id` 设成与 `name` 相同，也不得回传空字符串字段。写入只发选项 name 字符串；读回必须是 `{id, name}`，适配器读 `.name`。假 dws CLI 读侧须把存盘中的 name 字符串物化成 `{id, name}`（与 MemoryTransport 一致），不得让生产解码接受裸字符串。空的归还字段按空而不是缺证。申请决定 `apply` 的 actor 是借款人。写超时后若台账和库存仍是发前快照，记 `NOT_SENT` 并允许按原操作重试；部分写入仍是 `UNKNOWN`，不重放。
 
 ## 本阶段会做什么
 
