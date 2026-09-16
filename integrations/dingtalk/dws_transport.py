@@ -48,6 +48,26 @@ def ok_envelope(**extra):
     return payload
 
 
+def todo_internal_id(raw):
+    """Accept todo-namespace internal IDs; reject contact-shaped strings."""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, int):
+        return format(raw, 'd')
+    if isinstance(raw, str):
+        if not raw or '-' in raw:
+            return None
+        try:
+            parsed = int(raw, 10)
+        except ValueError:
+            return None
+        canonical = format(parsed, 'd')
+        if raw != canonical:
+            return None
+        return canonical
+    return None
+
+
 class DwsTransport:
     """Transport.exchange adapter for node-invoked dws.js (or a test double)."""
 
@@ -226,9 +246,15 @@ class DwsTransport:
         resource_id = result.get('taskId')
         if not isinstance(resource_id, str) or not resource_id:
             return None
-        detail = result.get('todoDetailModel') or {}
+        detail = self._todo_detail_for_stage(resource_id)
+        if detail is None:
+            return None
         executors = detail.get('executorIds') or []
-        internal_id = executors[0] if executors else arguments.get('actor')
+        if not executors:
+            return None
+        internal_id = todo_internal_id(executors[0])
+        if internal_id is None:
+            return None
         return {
             'kind': 'todo',
             'resource_id': resource_id,
@@ -243,6 +269,18 @@ class DwsTransport:
             'contact': arguments['actor'],
             'internal_id': internal_id,
         }
+
+    def _todo_detail_for_stage(self, task_id):
+        """Re-read todo after create; live create may not return todo internal executorIds."""
+        try:
+            payload = self._run(self._argv('todo.get', {'task_id': task_id}))
+        except (UnknownResultError, UnsupportedShapeError, subprocess.TimeoutExpired, OSError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        result = payload.get('result') or {}
+        detail = result.get('todoDetailModel')
+        return detail if isinstance(detail, dict) else None
 
     def _stage_query(self, arguments):
         store = self._load_stages()

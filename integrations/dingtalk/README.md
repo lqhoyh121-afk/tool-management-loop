@@ -12,7 +12,7 @@ Refs #3。在冻结的 `contracts/` 之上实现 ReadPort / WritePort / StagePor
 | `identity.py` | 带来源命名空间的人员标识，不做通用跨命名空间转换。 |
 | `envelope.py` | 报文封套校验与记录列表提取。缺 `success` 不能当成功；`data.records` 与顶层 `records` 并存视为歧义。 |
 | `cells.py` | 多维表单元格取值与形态校验。 |
-| `todo.py` | 待办详情与实际完成事件。`finishTime` 保持整数，不换算 datetime。 |
+| `todo.py` | 待办详情与实际完成事件。`finish_time` 保留原始毫秒整数；`completion_at` 唯一换算为 Asia/Shanghai datetime。 |
 | `layout.py` | 适配器私有字段 ID，不是公共契约名。台账用 `FieldMap`，阶段入口用 `EntryFieldMap`；重叠键在两张表上是不同 ID，禁止共用一套映射。 |
 | `codec.py` | Loan / Inventory 按 T01 单元格类型编解码。角色字段写成 creator 形态 `[{corpId,userId}]`，读出后作为 **contact** Identity；这是本适配器写入后再读回的约定，不是通用 record_creator→contact 转换。 |
 | `transport.py` | 注入传输接口。`None` 表示超时/掉线，结果未知。 |
@@ -41,7 +41,7 @@ Refs #3。在冻结的 `contracts/` 之上实现 ReadPort / WritePort / StagePor
 - 角色/creator：`[{corpId,userId}]`。
 - 待办内部人员 ID、`finishTime`：int；内部 ID 规范为十进制字符串后放入 `Identity(namespace="todo")`。
 - 完成事件：只认 `task.self.done` / `task.done`；同一 task 上两者归一为一条业务事件，不看成两次确认。
-- **`finishTime` 不得当作 `Event.occurred_at`。** 单位未说明。连接层要求待办回执另有带时区 ISO 的 `result.occurredAt`；没有该证据就 fail-closed。T07 若观察不到等价 ISO 时间字段，必须停止，不得用整数时间戳猜纪元。
+- **`finishTime` 为毫秒整数**（T07 真机核对）。连接层经 `completion_at` 换算为 Asia/Shanghai 带时区 datetime 写入 `Event.occurred_at`；展示用 `YYYY-MM-DD HH:mm`。真机 `todo task get` 无 `result.occurredAt`，不得依赖或伪造该字段。
 
 ## 写入与未知结果
 
@@ -85,7 +85,7 @@ node <injected-dws.js> chat message send --user <userId> --title <title> --text 
 
 1. 受限表单无法证明“原单完整引用 + 指定人 + 明确决定”，只靠可编辑标题或说明文本。
 2. 待办完成活动的 creatorId 无法与创建时通讯录执行者做成 **该 task 限定** 的 IdentityBinding。
-3. 没有带时区的完成时间证据，只有 `finishTime` 整数。
+3. 待办已完成但 `finishTime` 为 0 或缺失，无法换算完成时刻。
 4. `success: true` 同时带 `error.code`，或 `view update` 一类“受理但未改变配置”的回执。
 5. 权限不足、限流、超时、只回读到其中一个目标。
 6. 普通人主账未整体拒绝、或字段级权限未验证却当成已隔离。
@@ -115,7 +115,7 @@ node <injected-dws.js> chat message send --user <userId> --title <title> --text 
 | number 单元格 | 本次回读为字符串，需显式数值解析 | 只接受字符串，解析为有限 `Decimal` |
 | date 单元格 | 带时区 ISO 字符串 | 解析为 aware `datetime`；无时区报错 |
 | 待办人员 ID | `executorIds`、`activities[].creatorId` 为 int | `todo` 命名空间；int 转规范十进制字符串 |
-| 实际完成事件 | `task.self.done`、`task.done`；`finishTime` 为 int | 完成活动只认这两种 action；`finishTime` 不换算 |
+| 实际完成事件 | `task.self.done`、`task.done`；`finishTime` 为 int（毫秒） | 完成活动只认这两种 action；`completion_at` 唯一换算 |
 
 ## 人员标识命名空间
 
@@ -130,7 +130,7 @@ node <injected-dws.js> chat message send --user <userId> --title <title> --text 
 1. 真实 `record update` 的 CAS/revision 语义；`SELECT_OPTION_NOT_FOUND` 已在 T07 #30 观测（写 synthetic option id 被拒），其余失败形态仍待补帧。
 2. 程序化创建受限表单是否可代替 T01 的 UI 配置。
 3. `record_creator` 与通讯录 userId 是否在任意人员上恒等（本适配器只依赖自己写入的角色单元格）。
-4. `finishTime` 的整数单位；跨创建者待办内部 ID 映射（T01 未验）。
+4. 跨创建者待办内部 ID 映射（T01 未验）。
 5. 字段级权限、OA、并发、断网重启、跨机器。
 6. 真实组织 L4。本目录的 unittest 只覆盖注入传输。
 

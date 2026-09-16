@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from t03_layout import entry_fields_from
 from t03_memory_transport import MemoryTransport
 
-from contracts.flow import plan, verify
+from contracts.flow import check_event, plan, verify
 from contracts.model import Action, Code, ContractError, Outcome, State
 from contracts.ports import LedgerScope, RuntimeBinding, StageRequest, stage_operation_id
 from integrations.dingtalk.adapter import DingTalkAdapter
@@ -32,6 +32,16 @@ loan, stock, event = _fixtures.loan, _fixtures.stock, _fixtures.event
 MANAGER, ITEM, BORROWER, LOAN, NOW = (
     _fixtures.MANAGER, _fixtures.ITEM, _fixtures.BORROWER, _fixtures.LOAN, _fixtures.NOW)
 SyntheticJournal, SyntheticLease = _synthetic.SyntheticJournal, _synthetic.SyntheticLease
+
+
+class ContactInternalIdTransport(MemoryTransport):
+    """Stage index stores contact userId as internal_id, like live todo.create."""
+
+    def _todo_create(self, arguments):
+        payload = super()._todo_create(arguments)
+        meta = self.stages[arguments['operation_id']]
+        meta['internal_id'] = arguments['actor']
+        return payload
 
 
 class PortTests(unittest.TestCase):
@@ -178,14 +188,49 @@ class PortTests(unittest.TestCase):
         written = self.adapter.submit(intent, self.binding, self.lease)
         self.assertEqual(verify(intent, written).outcome, Outcome.VERIFIED)
 
-    def test_todo_without_iso_time_is_not_converted_from_finish_time(self):
+    def test_todo_without_finish_time_blocks(self):
         current, _inventory = self._advance_to_issue()
         request = StageRequest(stage_operation_id(current, Action.ISSUE),
                                current, Action.ISSUE, MANAGER)
         receipt = self.adapter.create_stage(request, self.binding, self.lease)
         self.transport.complete_todo(receipt.source.resource_id, NOW.isoformat())
-        self.transport.todos[receipt.source.resource_id]['occurred_at'] = None
+        self.transport.todos[receipt.source.resource_id]['detail']['finishTime'] = 0
         self.blocked(Code.EVIDENCE, lambda: self.adapter.read_event(current, receipt.source))
+
+    def test_todo_out_of_range_finish_time_blocks(self):
+        current, _inventory = self._advance_to_issue()
+        request = StageRequest(stage_operation_id(current, Action.ISSUE),
+                               current, Action.ISSUE, MANAGER)
+        receipt = self.adapter.create_stage(request, self.binding, self.lease)
+        self.transport.complete_todo(receipt.source.resource_id, NOW.isoformat())
+        self.transport.todos[receipt.source.resource_id]['detail']['finishTime'] = 10**14
+        self.blocked(Code.EVIDENCE, lambda: self.adapter.read_event(current, receipt.source))
+
+    def test_todo_read_across_contact_internal_id_namespace(self):
+        transport = ContactInternalIdTransport(self.fields, self.entry_fields)
+        adapter = DingTalkAdapter(
+            transport, self.journal, self.leases, self.fields, self.entry_fields)
+        transport.seed_record(loan().ref, encode_loan(loan(), self.fields))
+        transport.seed_record(stock().ref, encode_inventory(stock(), self.fields))
+        current, inventory = loan(), stock()
+        intent = plan(current, event(Action.APPROVE), inventory)
+        receipt = adapter.submit(intent, self.binding, self.lease)
+        current, inventory = verify(intent, receipt).loan, receipt.inventory
+        reserve = replace(event(Action.RESERVE), actor=None, evidence_kind='system')
+        intent = plan(current, reserve, inventory)
+        receipt = adapter.submit(intent, self.binding, self.lease)
+        current, _inventory = verify(intent, receipt).loan, receipt.inventory
+        request = StageRequest(stage_operation_id(current, Action.ISSUE),
+                               current, Action.ISSUE, MANAGER)
+        receipt = adapter.create_stage(request, self.binding, self.lease)
+        transport.complete_todo(receipt.source.resource_id, NOW.isoformat())
+        done = adapter.read_event(current, receipt.source)
+        self.assertEqual(done.action, Action.ISSUE)
+        self.assertEqual(done.actor.namespace, 'todo')
+        check_event(current, done)
+        intent = plan(current, done, _inventory)
+        written = adapter.submit(intent, self.binding, self.lease)
+        self.assertEqual(verify(intent, written).outcome, Outcome.VERIFIED)
 
     def test_stage_container_comes_from_query_not_fixture_name(self):
         self.transport.form_container = 'deployed-collect-forms'

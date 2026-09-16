@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from t04_binding_doc import binding_document
 
 from bootstrap.binding import save_binding
-from bootstrap.drive import DriveLoop, FileSources, StaticSources, WorkItem, dump_sources, run_bound_drive
+from bootstrap.drive import (DriveLoop, FileSources, StaticSources, WorkItem,
+                             dump_sources, format_drive_lines, run_bound_drive)
 from bootstrap.instance import MachineLock
 from bootstrap.journal import FileJournal
 from bootstrap.wizard import main
@@ -239,6 +240,7 @@ class DriveTests(unittest.TestCase):
                 harness.engine, StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),)),
                 harness.journal, harness.locks).run()
             self.assertEqual(len(report.blocked), 1)
+            self.assertEqual(report.blocked[0].code, Code.UNKNOWN.value)
             self.assertEqual(harness.writer.writes, 1)
             op_id = harness.journal.unresolved_ids()[0]
             harness.stop()
@@ -264,6 +266,36 @@ class DriveTests(unittest.TestCase):
         finally:
             if harness.engine.lease is not None:
                 harness.stop()
+
+    def test_skip_reports_error_code(self):
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            approve = harness.event(Action.APPROVE)
+            harness.reader.set_event(fixtures.LOAN, fixtures.FORM, approve)
+            original = harness.reader.read_event
+
+            def read_event(loan, source):
+                if source == ISSUE_TASK:
+                    raise ContractError(Code.EVIDENCE)
+                return original(loan, source)
+
+            harness.reader.read_event = read_event
+            report = DriveLoop(
+                harness.engine,
+                StaticSources((
+                    WorkItem('event', fixtures.LOAN, fixtures.FORM),
+                    WorkItem('event', fixtures.LOAN, ISSUE_TASK),
+                )),
+                harness.journal, harness.locks).run()
+            self.assertEqual(len(report.processed), 1)
+            self.assertEqual(len(report.skipped), 1)
+            self.assertEqual(report.skipped[0].code, Code.EVIDENCE.value)
+            summary = format_drive_lines(report)[0]
+            self.assertIn('EVIDENCE_REQUIRED×1', summary)
+            self.assertIn('跳过 event loan=synthetic-loan todo=synthetic-issue-todo',
+                            '\n'.join(format_drive_lines(report)))
+        finally:
+            harness.stop()
 
     def test_reject_path_does_not_reserve(self):
         harness = DriveHarness(self.runtime, self.locks)
