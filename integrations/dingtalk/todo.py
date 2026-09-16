@@ -13,16 +13,16 @@ Asia/Shanghai 带时区 datetime。``finish_time`` 仍原样返回整数，供�
 报告同时记录：完成事件里没有明确审批结果字段，"勾完成"不等于"同意"；实际
 完成者不能只依据 ``isDone`` 或 ``modifierId`` 判定。
 """
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
-from zoneinfo import ZoneInfo
 
 from .envelope import read_todo_envelope
 from .errors import MissingFieldError, UnsupportedShapeError
 from .identity import TODO, PersonRef
 
 DONE_ACTIONS = ('task.self.done', 'task.done')
-_SHANGHAI = ZoneInfo('Asia/Shanghai')
+# Asia/Shanghai civil time for modern dates (UTC+08, no tzdata dependency).
+_SHANGHAI = timezone(timedelta(hours=8))
 
 
 class CompletionEvent(NamedTuple):

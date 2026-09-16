@@ -1,8 +1,7 @@
 import sys
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -78,7 +77,7 @@ class DetailReadTests(unittest.TestCase):
             finish_time(detail)
 
     def test_completion_at_converts_finish_time_milliseconds(self):
-        expected = datetime(2026, 9, 14, 18, 0, tzinfo=ZoneInfo('Asia/Shanghai'))
+        expected = datetime(2026, 9, 14, 18, 0, tzinfo=timezone(timedelta(hours=8)))
         detail = read_todo_detail(sample('todo_detail_done_cross_creator'))
         detail['finishTime'] = int(expected.timestamp() * 1000)
         self.assertEqual(completion_at(detail), expected)
@@ -87,7 +86,7 @@ class DetailReadTests(unittest.TestCase):
         self.assertIsNone(completion_at(read_todo_detail(sample('todo_detail_open'))))
 
     def test_format_completion_display_shanghai(self):
-        when = datetime(2026, 9, 14, 18, 0, tzinfo=ZoneInfo('Asia/Shanghai'))
+        when = datetime(2026, 9, 14, 18, 0, tzinfo=timezone(timedelta(hours=8)))
         self.assertEqual(format_completion_display(when), '2026-09-14 18:00')
 
     def test_person_id_int_canonicalizes_and_rejects_bool(self):
