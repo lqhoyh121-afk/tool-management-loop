@@ -166,8 +166,10 @@ python -m bootstrap --drive --runtime 运行目录 --lock-root 锁目录
 - `fields`：台账字段 ID（`FieldMap` 全套键），必填
 - `entry_fields`：阶段入口字段 ID（`EntryFieldMap`），必填
 - `apply_fields`：申请收集表字段 ID（`ApplicationFieldMap`），必填
+- `return_form_fields`：归还表单视图字段 ID（`ReturnFormFieldMap`：借用人、归还时间），必填
+- `loan_container`：台账借用单表容器 ID（归还表单按借用人匹配 `borrowed` 单时使用），必填
 
-缺 `fields`、`entry_fields` 或 `apply_fields`、键不完整、或把台账整表拷进 `entry_fields`/`apply_fields`，都是 `CONFIG`。不会回落到合成标识；读申请行用 `apply_fields`（按 `application_entry.container_id` 分流），读阶段入口用 `entry_fields`。真实字段 ID 只放本机绑定，不进仓库。
+缺上述映射、键不完整、或把台账整表拷进 `entry_fields`/`apply_fields`/`return_form_fields`，都是 `CONFIG`。读申请行用 `apply_fields`；读归还表单行（无 loan_id）用 `return_form_fields` 并按借用人唯一匹配；读引擎预建阶段入口行仍用 `entry_fields`。真实字段 ID 只放本机绑定，不进仓库。
 
 工作队列是运行目录下的 `sources.json`（Git 忽略），只存单据/来源引用，不是第二本库存账。`kind` 为 `apply` 或 `event`。`apply` 走 `admit_application` 后建立审批入口；`event` 走 `execute`，同意后系统预留，再按状态建借出/归还入口。回执落 `runtime/operations/<operation_id>.json`。
 
