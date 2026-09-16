@@ -70,6 +70,8 @@ class LiveShapeTests(unittest.TestCase):
     def test_decode_loan_tolerates_omitted_empty_return_fields(self):
         current = loan()
         cells = encode_loan(current, self.fields)
+        cells[self.fields.state] = _live_select(current.state.value)
+        cells[self.fields.tracked] = _live_select('false')
         cells.pop(self.fields.return_id, None)
         cells.pop(self.fields.return_container, None)
         self.assertEqual(decode_loan(current.ref, cells, self.fields).return_ref, None)

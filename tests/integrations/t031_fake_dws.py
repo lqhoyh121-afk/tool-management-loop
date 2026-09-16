@@ -126,6 +126,32 @@ def key(base_id, table_id, record_id):
     return f'{base_id}/{table_id}/{record_id}'
 
 
+_SYNTHETIC_SELECT_FIELDS = frozenset({'fldSYN-state', 'fldSYN-tracked'})
+
+
+def _live_cells(cells):
+    visible = {}
+    seq = 0
+    for field_id, value in cells.items():
+        if value == '':
+            continue
+        if isinstance(value, dict) and 'id' in value and 'name' in value:
+            seq += 1
+            visible[field_id] = {
+                'id': f'SYNTHETIC-rand-{seq:04d}',
+                'name': value['name'],
+            }
+        elif field_id in _SYNTHETIC_SELECT_FIELDS and isinstance(value, str):
+            seq += 1
+            visible[field_id] = {
+                'id': f'SYNTHETIC-rand-{seq:04d}',
+                'name': value,
+            }
+        else:
+            visible[field_id] = value
+    return visible
+
+
 def synthetic_option_write(cells):
     for value in cells.values():
         if not isinstance(value, dict):
@@ -157,7 +183,7 @@ def main(argv):
         item = state['records'].get(key(base_id, table_id, record_id))
         records = [] if item is None else [{
             'recordId': record_id,
-            'cells': item,
+            'cells': _live_cells(item),
         }]
         if has(argv, '--all'):
             print(json.dumps(ok(records=records, hasMore=False), ensure_ascii=True))

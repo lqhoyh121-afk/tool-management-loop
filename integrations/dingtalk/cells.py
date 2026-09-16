@@ -2,7 +2,8 @@
 
 公开 T01 报告观察到的形态：``cells[fieldId]`` 下，creator 是
 ``[{corpId, userId}]``；number 本次回读为字符串，需要显式数值解析；date 是带时区
-ISO 字符串；singleSelect 是 ``{id, name}``。
+ISO 字符串；singleSelect **读回**是 ``{id, name}``（``.name`` 为业务值，``.id`` 为服务端随机串）。
+写入侧（``codec.encode_loan``）只发选项 **name 字符串**；读侧不接受裸字符串冒充 singleSelect。
 
 本模块只做取值和形态校验，不判定业务含义，也不给字段起公共业务名。
 """
@@ -98,16 +99,6 @@ def read_single_select(cells, field_id):
     if not isinstance(option_name, str) or not option_name:
         raise MissingFieldError(f'字段 {field_id} 缺少选项 name')
     return SelectOption(option_id, option_name)
-
-
-def read_select_name(cells, field_id):
-    """Option name from a live ``{id, name}`` cell or a write-path name string."""
-    value = _raw(cells, field_id)
-    if isinstance(value, str):
-        if not value:
-            raise MissingFieldError(f'字段 {field_id} 是空字符串，不能当选项名')
-        return value
-    return read_single_select(cells, field_id).name
 
 
 def read_creator(cells, field_id):

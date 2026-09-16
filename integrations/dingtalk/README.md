@@ -34,7 +34,7 @@ Refs #3。在冻结的 `contracts/` 之上实现 ReadPort / WritePort / StagePor
 
 ## 字段映射（T01）
 
-台账记录走 `FieldMap`（`codec.decode_loan` / `encode_loan` / 库存）。收集表/阶段入口走 `EntryFieldMap`（`adapter._read_form_event` 与 `form.create` 单元格）。`config_version`、`quantity`、`physical_ids`、`borrower`、`approver`、`manager`、`return_container`、`return_id` 这八个键在两张表上是不同字段 ID；缺任一套映射是 CONFIG，不得把台账 `fields` 套到入口。真实 ID 只存在本机 `binding.json`，合成夹具不得冒充生产字段。singleSelect 业务值读 `.name`（钉钉 `.id` 是随机串）。空的 `return_id` / `return_container` 钉钉不回传，解码按空字符串，不得当缺证失败。
+台账记录走 `FieldMap`（`codec.decode_loan` / `encode_loan` / 库存）。收集表/阶段入口走 `EntryFieldMap`（`adapter._read_form_event` 与 `form.create` 单元格）。`config_version`、`quantity`、`physical_ids`、`borrower`、`approver`、`manager`、`return_container`、`return_id` 这八个键在两张表上是不同字段 ID；缺任一套映射是 CONFIG，不得把台账 `fields` 套到入口。真实 ID 只存在本机 `binding.json`，合成夹具不得冒充生产字段。singleSelect **写**只发选项 name 字符串；**读**只接受 `{id, name}` 对象，业务值取 `.name`（`.id` 是服务端随机串，不得回传合成 id）。空的 `return_id` / `return_container` 钉钉不回传，解码按空字符串，不得当缺证失败。
 
 - number：字符串，显式解析为有限小数后再收窄为整数。
 - date：带时区 ISO 字符串。
@@ -108,7 +108,9 @@ node <injected-dws.js> chat message send --user <userId> --title <title> --text 
 | 成功封套 | 主控核对原始回执：`status=success` 且 `error={}`；正式段要求 `success` 键存在且为 true | 空 `error` 表示无业务错误；缺 `success`/`status`/`error` 不能当成功 |
 | 顶层成功掩盖业务错误 | Base 不存在时 `success: true` 同时 `status: error`、`error.code=BASE_NOT_FOUND` | 先查 `error.code` 与 `status`，不把 success 布尔值当成功 |
 | 两种 records 同时出现 | 正式段收紧：不得静默取 `data` | `UnsupportedShapeError` |
-| 未支持错误封套 | 公开报告未确认 `errorCode` / `errorMsg` | 即使带空 `records` 也报错，不当空成功 |
+| 未支持错误封套 | aitable 通道：公开报告未确认顶层 `errorCode` / `errorMsg` | aitable 即使带空 `records` 也报错；todo 通道封套见 #34 |
+| singleSelect 写 | T07 #30：`record update` 只接受选项 name 字符串 | `encode_loan` 写 name；写 synthetic option id 返回 `SELECT_OPTION_NOT_FOUND` |
+| singleSelect 读 | T01/T07：`{id, name}` 对象，业务值在 `.name` | `decode_loan` 只读 `{id, name}`；裸字符串报错 |
 | creator 单元格 | `[{corpId, userId}]`，组织加人员的二元身份；不能用姓名代替 | 解析为 `record_creator`；codec 在本适配器自写自读的角色字段上收成 contact Identity |
 | number 单元格 | 本次回读为字符串，需显式数值解析 | 只接受字符串，解析为有限 `Decimal` |
 | date 单元格 | 带时区 ISO 字符串 | 解析为 aware `datetime`；无时区报错 |
@@ -125,7 +127,7 @@ node <injected-dws.js> chat message send --user <userId> --title <title> --text 
 
 ## 未验证项
 
-1. 真实 `record update` 的完整失败形态、CAS/revision 语义。
+1. 真实 `record update` 的 CAS/revision 语义；`SELECT_OPTION_NOT_FOUND` 已在 T07 #30 观测（写 synthetic option id 被拒），其余失败形态仍待补帧。
 2. 程序化创建受限表单是否可代替 T01 的 UI 配置。
 3. `record_creator` 与通讯录 userId 是否在任意人员上恒等（本适配器只依赖自己写入的角色单元格）。
 4. `finishTime` 的整数单位；跨创建者待办内部 ID 映射（T01 未验）。
