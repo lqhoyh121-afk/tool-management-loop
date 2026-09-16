@@ -1,5 +1,5 @@
 """Injected transport only. No real DingTalk client or credentials."""
-from .envelope import read_envelope
+from .envelope import read_envelope, read_todo_envelope
 from .errors import UnknownResultError
 
 
@@ -18,3 +18,9 @@ def require_envelope(payload):
     if payload is None:
         raise UnknownResultError('没有响应报文，结果未知，须按精确目标回查后再决定')
     return read_envelope(payload)
+
+
+def require_todo_envelope(payload):
+    if payload is None:
+        raise UnknownResultError('没有响应报文，结果未知，须按精确目标回查后再决定')
+    return read_todo_envelope(payload)

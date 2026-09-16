@@ -76,11 +76,12 @@
     "todo_detail_open": {
       "_synthetic": true,
       "_source": "docs/evidence/T01-FOLLOWUP.md · 专用待办初始精确回读；docs/evidence/t01-trusted-application.md · finishTime=0；主控核对 creatorId/finishTime 为 int",
-      "_observed": "result.todoDetailModel；executorIds 与活动 creatorId 为 int；未完成时 isDone 为 false、finishTime 为 0 且无完成活动",
+      "_observed": "T07 真机 #34：顶层 errorCode/errorMsg 为 null、无 status/error；result.todoDetailModel",
       "payload": {
         "success": true,
-        "status": "success",
-        "error": {},
+        "errorCode": null,
+        "errorMsg": null,
+        "arguments": [],
         "result": {
           "todoDetailModel": {
             "taskId": "SYNTHETIC-task-0001",
@@ -95,11 +96,12 @@
     "todo_detail_done_cross_creator": {
       "_synthetic": true,
       "_source": "docs/evidence/T01-FOLLOWUP.md · 跨创建者完成身份；主控核对 creatorId/finishTime 为 int",
-      "_observed": "完成后新增 task.self.done 与 task.done；两事件 creatorId 为 int，等于唯一执行者内部 ID，且不同于创建人内部 ID；finishTime 为非 0 整数，单位未说明，不换算",
+      "_observed": "T07 真机 #34 封套 + 完成后 task.self.done/task.done；finishTime 为非 0 整数",
       "payload": {
         "success": true,
-        "status": "success",
-        "error": {},
+        "errorCode": null,
+        "errorMsg": null,
+        "arguments": [],
         "result": {
           "todoDetailModel": {
             "taskId": "SYNTHETIC-task-0002",
@@ -127,11 +129,12 @@
     "todo_detail_done_without_activity": {
       "_synthetic": true,
       "_source": "docs/evidence/T01-HANDOFF.md · 实际完成者",
-      "_observed": "报告要求不只依赖执行人或 modifierId；本例构造 isDone=true 但没有完成活动，用于验证不据此认定完成者",
+      "_observed": "T07 真机 #34 封套；isDone=true 但没有完成活动，用于验证不据此认定完成者",
       "payload": {
         "success": true,
-        "status": "success",
-        "error": {},
+        "errorCode": null,
+        "errorMsg": null,
+        "arguments": [],
         "result": {
           "todoDetailModel": {
             "taskId": "SYNTHETIC-task-0003",

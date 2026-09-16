@@ -9,7 +9,7 @@
    ``records``；空表曾返回 ``records: null, hasMore: false, pages: 1``。
    ``hasMore`` 必须是布尔 ``false``，缺字段或其它假值不能当空成功。
 
-``errorCode`` / ``errorMsg`` 等未在公开报告确认的错误封套，遇到即报错。
+``errorCode`` / ``errorMsg`` 属于 todo 通道（T07 真机 #34 观测），aitable 通道仍拒绝。
 """
 from .errors import (
     BusinessErrorResponse,
@@ -66,6 +66,52 @@ def read_envelope(payload):
         raise UnsupportedShapeError('success=false 但没有 error.code，无法判定结果')
     if success is not True:
         raise UnsupportedShapeError(f'success 应为布尔 true，收到 {success!r}')
+
+    return payload
+
+
+_AITABLE_KEYS = ('status', 'error')
+
+
+def read_todo_envelope(payload):
+    """校验 todo 通道报文并原样返回。
+
+    T07 真机观测成功形态：``success: true``、``errorCode``/``errorMsg`` 为 ``null``、
+    顶层 ``result``，**无** ``status``/``error``。失败时 ``errorCode`` 为非空字符串。
+    """
+    if payload is None:
+        raise UnknownResultError('没有响应报文，结果未知，须按精确目标回查后再决定')
+    if not isinstance(payload, dict):
+        raise UnsupportedShapeError(f'报文顶层应为对象，收到 {type(payload).__name__}')
+
+    mixed = [key for key in _AITABLE_KEYS if key in payload]
+    if mixed:
+        raise UnsupportedShapeError(
+            f'todo 报文不应含 aitable 字段 {mixed[0]!r}，须按通道分别读取'
+        )
+
+    if 'success' not in payload:
+        raise UnsupportedShapeError('todo 报文缺少 success，不能把缺字段当成功')
+    success = payload['success']
+    if success is not True and success is not False:
+        raise UnsupportedShapeError(f'success 应为布尔值，收到 {success!r}')
+
+    if 'errorCode' not in payload or 'errorMsg' not in payload:
+        raise UnsupportedShapeError('todo 报文缺少 errorCode 或 errorMsg')
+
+    error_code = payload['errorCode']
+    error_msg = payload['errorMsg']
+    if error_code is not None:
+        if not isinstance(error_code, str) or not error_code:
+            raise UnsupportedShapeError('todo 报文 errorCode 应为非空字符串或 null')
+        message = error_msg if isinstance(error_msg, str) else None
+        raise BusinessErrorResponse(error_code, message)
+
+    if success is False:
+        raise UnsupportedShapeError('success=false 但 errorCode 为空，无法判定结果')
+
+    if error_msg is not None and error_msg != '':
+        raise UnsupportedShapeError('errorCode 为空时 errorMsg 必须为空或 null')
 
     return payload
 
