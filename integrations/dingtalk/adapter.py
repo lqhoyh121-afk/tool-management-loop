@@ -339,9 +339,10 @@ class DingTalkAdapter:
         except (DingTalkShapeError, KeyError, TypeError, ValueError) as exc:
             _closed(exc)
         executors = executor_refs(detail)
-        require(any(actor_ref.same_person_as(item) for item in executors),
-                Code.WRONG_PERSON)
+        require(executors, Code.EVIDENCE)
+        require(actor_ref.same_person_as(executors[0]), Code.WRONG_PERSON)
         completer = Identity('todo', source.tenant_id, actor_ref.value)
+        binding = replace(binding, internal=completer)
         action = Action(queried['action'])
         require(action in (Action.ISSUE, Action.RETURN), Code.STATE)
         return Event(

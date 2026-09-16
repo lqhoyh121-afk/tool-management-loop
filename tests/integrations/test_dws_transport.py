@@ -21,6 +21,7 @@ from contracts.ports import LedgerScope, RuntimeBinding, StageRequest, stage_ope
 from integrations.dingtalk.adapter import DingTalkAdapter
 from integrations.dingtalk.codec import encode_inventory, encode_loan
 from integrations.dingtalk.dws_transport import (DwsTransport, split_container,
+                                                 todo_internal_id,
                                                  windows_native_path)
 from integrations.dingtalk.errors import UnsupportedShapeError
 from integrations.dingtalk.layout import SYNTHETIC_FIELDS
@@ -272,6 +273,49 @@ class DwsTransportTests(unittest.TestCase):
             'chat', 'message', 'send', '--user', 'synthetic-manager',
             '--text', 'SYNTHETIC-notice', '--yes', '--format', 'json'])
         self.assertEqual(missing['error']['code'], 'MISSING_FLAG')
+
+    def test_todo_internal_id_rejects_contact_shape(self):
+        self.assertIsNone(todo_internal_id('20250331084503014-F4C7-648B2A8D2'))
+        self.assertEqual(todo_internal_id(9000000101), '9000000101')
+        self.assertEqual(todo_internal_id('9000000101'), '9000000101')
+
+    def test_todo_create_stage_stores_internal_id_from_get(self):
+        current = loan()
+        inventory = stock()
+        intent = plan(current, event(Action.APPROVE), inventory)
+        receipt = self.adapter.submit(intent, self.binding, self.lease)
+        current, inventory = verify(intent, receipt).loan, receipt.inventory
+        reserve = replace(event(Action.RESERVE), actor=None, evidence_kind='system')
+        intent = plan(current, reserve, inventory)
+        receipt = self.adapter.submit(intent, self.binding, self.lease)
+        current = verify(intent, receipt).loan
+        issue = StageRequest(stage_operation_id(current, Action.ISSUE),
+                             current, Action.ISSUE, MANAGER)
+        todo = self.adapter.create_stage(issue, self.binding, self.lease)
+        queried = self.transport.exchange('stage.query', {
+            'task_id': todo.source.resource_id,
+        })
+        internal = queried['result']['internal_id']
+        self.assertNotIn('-', str(internal))
+
+    def test_todo_stage_skips_index_when_post_create_get_unavailable(self):
+        original = self.transport._todo_detail_for_stage
+        self.transport._todo_detail_for_stage = lambda task_id: None
+        try:
+            payload = self.transport.exchange('todo.create', {
+                'tenant_id': LOAN.tenant_id,
+                'actor': MANAGER.user_id,
+                'action': Action.ISSUE.value,
+                'operation_id': 'SYNTHETIC-op-no-stage',
+                'loan_container': LOAN.container_id,
+                'loan_id': LOAN.resource_id,
+                'config_version': 'synthetic-config-v1',
+            })
+            task_id = payload['result']['taskId']
+            queried = self.transport.exchange('stage.query', {'task_id': task_id})
+            self.assertEqual(queried['result'], {})
+        finally:
+            self.transport._todo_detail_for_stage = original
 
     def test_stage_query_by_task_id(self):
         current = loan()

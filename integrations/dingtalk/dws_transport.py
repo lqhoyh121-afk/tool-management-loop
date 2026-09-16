@@ -48,6 +48,26 @@ def ok_envelope(**extra):
     return payload
 
 
+def todo_internal_id(raw):
+    """Accept todo-namespace internal IDs; reject contact-shaped strings."""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, int):
+        return format(raw, 'd')
+    if isinstance(raw, str):
+        if not raw or '-' in raw:
+            return None
+        try:
+            parsed = int(raw, 10)
+        except ValueError:
+            return None
+        canonical = format(parsed, 'd')
+        if raw != canonical:
+            return None
+        return canonical
+    return None
+
+
 class DwsTransport:
     """Transport.exchange adapter for node-invoked dws.js (or a test double)."""
 
@@ -228,9 +248,13 @@ class DwsTransport:
             return None
         detail = self._todo_detail_for_stage(resource_id)
         if detail is None:
-            detail = result.get('todoDetailModel') or {}
+            return None
         executors = detail.get('executorIds') or []
-        internal_id = executors[0] if executors else arguments.get('actor')
+        if not executors:
+            return None
+        internal_id = todo_internal_id(executors[0])
+        if internal_id is None:
+            return None
         return {
             'kind': 'todo',
             'resource_id': resource_id,

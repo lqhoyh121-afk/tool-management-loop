@@ -129,7 +129,7 @@
     "todo_detail_live_finish_ms": {
       "_synthetic": true,
       "_source": "docs/evidence/T01-HANDOFF.md · finishTime 整数形态；GitHub issue #37 T07 真机毫秒核对（展示例 2026-09-15 17:55 Asia/Shanghai）",
-      "_observed": "finishTime=1789466100000 为 T07 核对过的毫秒锚点（非 round-trip 自造）；createdTime 与 finishTime 差 135941 ms",
+      "_observed": "T07 真机 finishTime=1789466249929 ms；createdTime=1789466113988；差 135941 ms",
       "payload": {
         "success": true,
         "errorCode": null,
@@ -140,7 +140,7 @@
             "taskId": "SYNTHETIC-task-live-ms",
             "isDone": true,
             "executorIds": [9000000002],
-            "finishTime": 1789466100000,
+            "finishTime": 1789466249929,
             "activities": [
               {
                 "activityId": "SYNTHETIC-activity-live",

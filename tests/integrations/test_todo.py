@@ -92,9 +92,10 @@ class DetailReadTests(unittest.TestCase):
     def test_live_finish_time_ms_anchor(self):
         detail = read_todo_detail(sample('todo_detail_live_finish_ms'))
         when = completion_at(detail)
-        expected = datetime(2026, 9, 15, 17, 55, tzinfo=timezone(timedelta(hours=8)))
+        expected = datetime.fromtimestamp(
+            1789466249929 / 1000, tz=timezone(timedelta(hours=8)))
         self.assertEqual(when, expected)
-        self.assertEqual(format_completion_display(when), '2026-09-15 17:55')
+        self.assertEqual(format_completion_display(when), '2026-09-15 17:57')
 
     def test_completion_at_rejects_unconvertible_finish_time(self):
         detail = read_todo_detail(sample('todo_detail_done_cross_creator'))

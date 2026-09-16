@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from t03_layout import entry_fields_from
 from t03_memory_transport import MemoryTransport
 
-from contracts.flow import plan, verify
+from contracts.flow import check_event, plan, verify
 from contracts.model import Action, Code, ContractError, Outcome, State
 from contracts.ports import LedgerScope, RuntimeBinding, StageRequest, stage_operation_id
 from integrations.dingtalk.adapter import DingTalkAdapter
@@ -227,6 +227,10 @@ class PortTests(unittest.TestCase):
         done = adapter.read_event(current, receipt.source)
         self.assertEqual(done.action, Action.ISSUE)
         self.assertEqual(done.actor.namespace, 'todo')
+        check_event(current, done)
+        intent = plan(current, done, _inventory)
+        written = adapter.submit(intent, self.binding, self.lease)
+        self.assertEqual(verify(intent, written).outcome, Outcome.VERIFIED)
 
     def test_stage_container_comes_from_query_not_fixture_name(self):
         self.transport.form_container = 'deployed-collect-forms'
