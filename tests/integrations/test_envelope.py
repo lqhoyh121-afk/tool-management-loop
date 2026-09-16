@@ -10,6 +10,7 @@ from t03_fixture_loader import sample
 from integrations.dingtalk.envelope import (
     extract_records,
     read_envelope,
+    read_todo_envelope,
     record_cells,
     record_id,
 )
@@ -84,6 +85,39 @@ class EnvelopeTests(unittest.TestCase):
     def test_non_object_payload_is_refused(self):
         with self.assertRaises(UnsupportedShapeError):
             read_envelope([{'success': True}])
+
+
+class TodoEnvelopeTests(unittest.TestCase):
+    def test_live_success_passes_through(self):
+        payload = sample('todo_detail_open')
+        self.assertIs(read_todo_envelope(payload), payload)
+
+    def test_aitable_keys_on_todo_channel_are_refused(self):
+        payload = sample('todo_detail_open')
+        payload['status'] = 'success'
+        with self.assertRaises(UnsupportedShapeError):
+            read_todo_envelope(payload)
+
+    def test_error_code_is_business_error(self):
+        with self.assertRaises(BusinessErrorResponse) as caught:
+            read_todo_envelope({
+                'success': False,
+                'errorCode': 'INVALID_EXECUTOR',
+                'errorMsg': 'SYNTHETIC-denied',
+                'arguments': [],
+                'result': None,
+            })
+        self.assertEqual(caught.exception.code, 'INVALID_EXECUTOR')
+
+    def test_aitable_reader_still_rejects_error_code(self):
+        with self.assertRaises(UnsupportedShapeError):
+            read_envelope({
+                'success': True,
+                'errorCode': None,
+                'errorMsg': None,
+                'arguments': [],
+                'result': {},
+            })
 
 
 class RecordListTests(unittest.TestCase):

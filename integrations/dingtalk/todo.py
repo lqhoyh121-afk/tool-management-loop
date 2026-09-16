@@ -14,7 +14,7 @@
 """
 from typing import NamedTuple
 
-from .envelope import read_envelope
+from .envelope import read_todo_envelope
 from .errors import MissingFieldError, UnsupportedShapeError
 from .identity import TODO, PersonRef
 
@@ -30,7 +30,7 @@ class CompletionEvent(NamedTuple):
 
 
 def read_todo_detail(payload):
-    envelope = read_envelope(payload)
+    envelope = read_todo_envelope(payload)
     result = envelope.get('result')
     if result is None:
         raise MissingFieldError('待办报文缺少 result')

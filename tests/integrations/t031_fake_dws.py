@@ -26,6 +26,27 @@ def err(code, message='SYNTHETIC-denied'):
     }
 
 
+def todo_ok(**extra):
+    payload = {
+        'success': True,
+        'errorCode': None,
+        'errorMsg': None,
+        'arguments': [],
+    }
+    payload.update(extra)
+    return payload
+
+
+def todo_err(code, message='SYNTHETIC-denied'):
+    return {
+        'success': False,
+        'errorCode': code,
+        'errorMsg': message,
+        'arguments': [],
+        'result': None,
+    }
+
+
 def load_state(path):
     if not path.exists():
         return {
@@ -237,19 +258,19 @@ def main(argv):
         }
         state['todos'][task_id] = {'detail': detail, 'occurred_at': None}
         save_state(state_path, state)
-        print(json.dumps(ok(result={'taskId': task_id, 'todoDetailModel': detail}),
+        print(json.dumps(todo_ok(result={'taskId': task_id, 'todoDetailModel': detail}),
                          ensure_ascii=True))
         return 0
     if argv[:3] == ['todo', 'task', 'get']:
         task_id = flag(argv, '--task-id')
         todo = state['todos'].get(task_id)
         if todo is None:
-            print(json.dumps(err('TASK_NOT_EXIST'), ensure_ascii=True))
+            print(json.dumps(todo_err('TASK_NOT_EXIST'), ensure_ascii=True))
             return 0
         result = {'todoDetailModel': todo['detail']}
         if todo.get('occurred_at'):
             result['occurredAt'] = todo['occurred_at']
-        print(json.dumps(ok(result=result), ensure_ascii=True))
+        print(json.dumps(todo_ok(result=result), ensure_ascii=True))
         return 0
     if argv[:3] == ['chat', 'message', 'send']:
         print(json.dumps(ok(result={'openTaskId': 'SYNTHETIC-chat'}),

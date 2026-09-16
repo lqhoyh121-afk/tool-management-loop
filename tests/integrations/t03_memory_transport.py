@@ -26,6 +26,27 @@ def error_envelope(code, message='SYNTHETIC-denied'):
     }
 
 
+def todo_ok_envelope(**extra):
+    payload = {
+        'success': True,
+        'errorCode': None,
+        'errorMsg': None,
+        'arguments': [],
+    }
+    payload.update(extra)
+    return payload
+
+
+def todo_error_envelope(code, message='SYNTHETIC-denied'):
+    return {
+        'success': False,
+        'errorCode': code,
+        'errorMsg': message,
+        'arguments': [],
+        'result': None,
+    }
+
+
 def _synthetic_option_write(cells):
     for value in cells.values():
         if not isinstance(value, dict):
@@ -77,7 +98,10 @@ class MemoryTransport(Transport):
                 self.drop_once.remove(command)
             return None
         if command in self.fail_codes:
-            return error_envelope(self.fail_codes[command])
+            code = self.fail_codes[command]
+            if command in ('todo.create', 'todo.get'):
+                return todo_error_envelope(code)
+            return error_envelope(code)
         handler = {
             'record.query': self._record_query,
             'record.update': self._record_update,
@@ -245,17 +269,17 @@ class MemoryTransport(Transport):
         }
         self.stages[arguments['operation_id']] = meta
         self.by_task[task_id] = meta
-        return ok_envelope(result={'taskId': task_id, 'todoDetailModel': deepcopy(detail)})
+        return todo_ok_envelope(result={'taskId': task_id, 'todoDetailModel': deepcopy(detail)})
 
     def _todo_get(self, arguments):
         task_id = arguments['task_id']
         if task_id not in self.todos:
-            return error_envelope('TASK_NOT_EXIST')
+            return todo_error_envelope('TASK_NOT_EXIST')
         todo = self.todos[task_id]
         result = {'todoDetailModel': deepcopy(todo['detail'])}
         if todo['occurred_at'] is not None:
             result['occurredAt'] = todo['occurred_at']
-        return ok_envelope(result=result)
+        return todo_ok_envelope(result=result)
 
     def _stage_query(self, arguments):
         if 'operation_id' in arguments:
