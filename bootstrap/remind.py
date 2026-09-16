@@ -245,9 +245,10 @@ def main(argv=None):
 
     runtime = runtime_dir(args.runtime)
     document = read_binding_document(runtime)
-    fields, entry_fields = field_maps_from_document(document)
+    fields, entry_fields, apply_fields = field_maps_from_document(document)
     journal = FileJournal(runtime / 'operations')
-    adapter = live_adapter(runtime, journal, None, document, fields, entry_fields)
+    adapter = live_adapter(runtime, journal, None, document, fields, entry_fields,
+                           apply_fields)
 
     refs = [parse_ref(raw) for raw in args.loan]
     if not refs:

@@ -12,7 +12,8 @@ from contracts.model import (Action, Code, ContractError, Event, Identity,
                              IdentityBinding, Outcome, Resource, require, text)
 from contracts.ports import StageReceipt, StageRequest, check_binding, verify_stage
 
-from .cells import read_datetime, read_single_select, read_text
+from .cells import (MissingFieldError, read_datetime, read_single_select,
+                    read_text)
 from .codec import (_identity, _int_count, _text_list, decode_inventory,
                     decode_loan, encode_inventory, encode_loan)
 from .envelope import extract_records, record_cells, record_id
@@ -38,20 +39,33 @@ _FORM_DECISIONS = {
     'apply': Action.APPLY,
     'agree': Action.APPROVE,
     'reject': Action.REJECT,
+    '拒绝': Action.REJECT,
     'cancel': Action.CANCEL,
     'return': Action.REQUEST_RETURN,
+    'request_return': Action.REQUEST_RETURN,
+    '归还': Action.REQUEST_RETURN,
 }
+
+
+def _form_action(name):
+    try:
+        return _FORM_DECISIONS[name]
+    except KeyError as exc:
+        raise ContractError(Code.EVIDENCE) from exc
 
 
 class DingTalkAdapter:
     """Implements ReadPort, WritePort and StagePort against `transport`."""
 
-    def __init__(self, transport, journal, leases, fields, entry_fields):
+    def __init__(self, transport, journal, leases, fields, entry_fields,
+                 apply_fields=None, application_container=None):
         self.transport = transport
         self.journal = journal
         self.leases = leases
         self.fields = fields
         self.entry_fields = entry_fields
+        self.apply_fields = apply_fields
+        self.application_container = application_container or ''
 
     def read_loan(self, ref):
         return decode_loan(ref, self._record_cells(ref), self.fields)
@@ -260,6 +274,39 @@ class DingTalkAdapter:
 
     def _read_form_event(self, loan, source):
         cells = self._record_cells(source)
+        if (self.apply_fields is not None
+                and source.container_id == self.application_container):
+            return self._read_application_event(loan, source, cells)
+        return self._read_entry_form_event(loan, source, cells)
+
+    def _read_application_event(self, loan, source, cells):
+        fields = self.apply_fields
+        try:
+            action = Action.APPLY
+            actor = _identity(cells, fields.borrower, loan.ref.tenant_id)
+            occurred = read_datetime(cells, fields.occurred_at)
+            quantity = _int_count(cells, fields.quantity, zero=False)
+            if fields.physical_ids in cells and cells[fields.physical_ids] is not None:
+                physical_ids = _text_list(cells, fields.physical_ids)
+            else:
+                physical_ids = ()
+        except ContractError:
+            raise
+        except DingTalkShapeError as exc:
+            _closed(exc)
+        return Event(action, f'{source.resource_id}:{action.value}', loan.ref, source,
+                     actor, occurred, loan.config_version, 'form', True,
+                     quantity=quantity, physical_ids=physical_ids,
+                     evidence_ref=f'form:{source.resource_id}')
+
+    def _entry_form_action(self, cells, fields):
+        if fields.decision in cells and cells[fields.decision] is not None:
+            return _form_action(read_single_select(cells, fields.decision).name)
+        if fields.action in cells and cells[fields.action] is not None:
+            return _form_action(read_text(cells, fields.action))
+        raise MissingFieldError('阶段入口缺少 decision 或 action')
+
+    def _read_entry_form_event(self, loan, source, cells):
         fields = self.entry_fields
         try:
             require(read_text(cells, fields.loan_container) == loan.ref.container_id,
@@ -268,7 +315,7 @@ class DingTalkAdapter:
                     Code.WRONG_LOAN)
             require(read_text(cells, fields.config_version) == loan.config_version,
                     Code.CONFIG)
-            action = _FORM_DECISIONS[read_single_select(cells, fields.decision).name]
+            action = self._entry_form_action(cells, fields)
             if action in (Action.APPLY, Action.REQUEST_RETURN):
                 actor = _identity(cells, fields.borrower, loan.ref.tenant_id)
             elif action == Action.CANCEL:

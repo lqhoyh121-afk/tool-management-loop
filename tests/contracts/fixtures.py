@@ -11,6 +11,7 @@ MANAGER = Identity("contact", "synthetic-org", "synthetic-manager")
 LOAN = Resource("record", "synthetic-org", "synthetic-loans", "synthetic-loan")
 ITEM = Resource("record", "synthetic-org", "synthetic-stock", "synthetic-item")
 FORM = Resource("form", "synthetic-org", "synthetic-forms", "synthetic-form")
+APPLY_FORM = Resource("form", "synthetic-org", "synthetic-apply-forms", "synthetic-apply-row")
 
 
 def loan():

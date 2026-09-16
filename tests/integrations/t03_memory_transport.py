@@ -65,10 +65,11 @@ class MemoryTransport(Transport):
     """
 
     def __init__(self, fields, entry_fields, form_container='synthetic-forms',
-                 todo_container='synthetic-todos'):
+                 todo_container='synthetic-todos', apply_container='synthetic-apply-forms'):
         self.fields = fields
         self.entry_fields = entry_fields
         self.form_container = form_container
+        self.apply_container = apply_container
         self.todo_container = todo_container
         self.records = {}
         self.stages = {}
