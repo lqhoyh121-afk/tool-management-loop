@@ -359,6 +359,27 @@ class DwsTransportTests(unittest.TestCase):
         payload = self._borrowed_query(borrower)
         self.assertEqual(payload['result']['loan_ids'], [])
 
+    def test_stage_todo_title_is_human_readable(self):
+        from integrations.dingtalk.adapter import stage_title
+
+        current = replace(loan(), state=State.BORROWED)
+        title = stage_title(current, Action.REQUEST_RETURN)
+        self.assertIn('待归还', title)
+        self.assertIn(current.ref.resource_id, title)
+        self.assertNotIn('request_return:', title)
+
+    def test_todo_create_uses_given_title_and_falls_back(self):
+        given = self.transport._argv('todo.create', {
+            'action': 'confirm_return', 'operation_id': 'op-1', 'actor': 'someone',
+            'title': '【待归还确认】请确认已归还',
+        })
+        self.assertEqual(given[given.index('--title') + 1], '【待归还确认】请确认已归还')
+
+        legacy = self.transport._argv('todo.create', {
+            'action': 'confirm_return', 'operation_id': 'op-1', 'actor': 'someone',
+        })
+        self.assertEqual(legacy[legacy.index('--title') + 1], 'confirm_return:op-1')
+
     def test_loan_query_borrowed_returns_only_this_borrower(self):
         mine = self._seed_row(LOAN, state=State.BORROWED)
         borrower = encode_loan(mine, self.fields)[self.fields.borrower][0]['userId']

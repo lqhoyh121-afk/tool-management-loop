@@ -171,7 +171,7 @@ class DwsTransport:
                     '--yes'] + common
         if command == 'todo.create':
             return ['todo', 'task', 'create',
-                    '--title', f"{arguments['action']}:{arguments['operation_id']}",
+                    '--title', arguments.get('title') or f"{arguments['action']}:{arguments['operation_id']}",
                     '--executors', arguments['actor'],
                     '--yes'] + common
         if command == 'todo.get':

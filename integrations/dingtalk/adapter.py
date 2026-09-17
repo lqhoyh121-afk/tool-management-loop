@@ -54,6 +54,30 @@ def _form_action(name):
         raise ContractError(Code.EVIDENCE) from exc
 
 
+
+_STAGE_TITLES = {
+    Action.APPROVE: '【待审批】请审批借出 ×{quantity} ｜ 单号 {loan_id} ｜ 填：决定 + 发生时间',
+    Action.ISSUE: '【待领用确认】请确认已领用 ×{quantity} ｜ 单号 {loan_id}',
+    Action.REQUEST_RETURN: '【待归还】到期 {due} ｜ 单号 {loan_id} ｜ 归还后请填归还表',
+    Action.RETURN: '【待归还确认】请确认已归还 ｜ 单号 {loan_id} ｜ 填：决定 + 发生时间',
+}
+
+
+def stage_title(loan, action):
+    """Human-readable stage todo title.
+
+    The executor reads this in a todo list: keep the business单号 and what to do,
+    and leave the internal operation id out of the title (it stays in the local
+    stage index). Unknown actions fall back to the business单号 only.
+    """
+    template = _STAGE_TITLES.get(action)
+    if template is None:
+        return f'{action.value} ｜ 单号 {loan.ref.resource_id}'
+    return template.format(quantity=loan.quantity,
+                           loan_id=loan.ref.resource_id,
+                           due=loan.due_at.strftime('%Y-%m-%d %H:%M'))
+
+
 class DingTalkAdapter:
     """Implements ReadPort, WritePort and StagePort against `transport`."""
 
@@ -157,6 +181,7 @@ class DingTalkAdapter:
                 'item_container': request.loan.item.container_id,
                 'item_id': request.loan.item.resource_id,
                 'action': request.action.value,
+                'title': stage_title(request.loan, request.action),
                 'actor': request.actor.user_id,
                 'borrower': request.loan.borrower.user_id,
                 'approver': request.loan.approver.user_id,
