@@ -299,14 +299,90 @@ class DriveTests(unittest.TestCase):
                 recovered = DriveLoop(
                     restarted.engine, StaticSources(()), restarted.journal, restarted.locks).run()
                 self.assertEqual(recovered.recovered, (op_id,))
+                # 重启后除了回查未决意图，还把这笔「审批已写、预留未写」的单补完：
+                # 预留随之上账，状态推进到待领用确认（旧行为是永远停在 reservation_pending）。
                 self.assertEqual(restarted.reader.read_loan(fixtures.LOAN).state,
-                                 State.RESERVATION_PENDING)
-                self.assertEqual(restarted.writer.writes, 1)
+                                 State.AWAITING_ISSUE)
+                # 第一次写入是审批意图，第二次是补齐被中断的预留 —— 都是真实步骤，不是盲目重发。
+                self.assertEqual(restarted.writer.writes, 2)
             finally:
                 restarted.stop()
         finally:
             if harness.engine.lease is not None:
                 harness.stop()
+
+    def approval_written(self, harness):
+        """Stop between the two external writes: 审批已写、预留未写."""
+        harness.engine.ensure_stage(harness.reader.read_loan(fixtures.LOAN), Action.APPROVE)
+        approve = harness.event(Action.APPROVE)
+        harness.reader.set_event(fixtures.LOAN, fixtures.FORM, approve)
+        execution = harness.engine.execute(fixtures.LOAN, fixtures.FORM)
+        self.assertEqual(execution.outcome, Outcome.VERIFIED)
+        self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state,
+                         State.RESERVATION_PENDING)
+        return approve
+
+    def test_pending_reservation_finishes_reserve_on_next_pass(self):
+        """审批已写、预留未写: the drive finishes the reservation, once."""
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            self.approval_written(harness)
+            first = DriveLoop(harness.engine, StaticSources(()), harness.journal,
+                              harness.locks).run()
+            self.assertEqual(first.skipped, ())
+            self.assertEqual(len(first.processed), 1)
+            self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state, State.AWAITING_ISSUE)
+            self.assertEqual(
+                (harness.writer.ledger_stock.available, harness.writer.ledger_stock.reserved,
+                 harness.writer.ledger_stock.borrowed),
+                (3, 2, 0),
+            )
+            self.assertEqual(harness.writer.writes, 2)
+
+            issue = harness.todo_event(Action.ISSUE, ISSUE_TASK)
+            harness.reader.set_event(fixtures.LOAN, ISSUE_TASK, issue)
+            second = DriveLoop(harness.engine, StaticSources(()), harness.journal,
+                               harness.locks).run()
+            self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state, State.BORROWED)
+            self.assertEqual(
+                (harness.writer.ledger_stock.available, harness.writer.ledger_stock.reserved,
+                 harness.writer.ledger_stock.borrowed),
+                (3, 0, 2),
+            )
+            self.assertEqual(harness.writer.writes, 3)
+            self.assertEqual([outcome.code for outcome in second.skipped],
+                             [Code.DUPLICATE.value])
+        finally:
+            harness.stop()
+
+    def test_unprovable_pending_reservation_is_a_visible_blocked_item(self):
+        """No readable approval write on this machine: report it, never guess."""
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            approve = harness.event(Action.APPROVE)
+            loan, stock = fixtures.settled(fixtures.loan(), approve, fixtures.stock())
+            harness.reader.set_loan(loan)
+            harness.writer.ledger_stock = stock
+            harness.reader.set_event(fixtures.LOAN, fixtures.FORM, approve)
+            report = DriveLoop(
+                harness.engine,
+                StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),)),
+                harness.journal, harness.locks).run()
+            self.assertEqual(report.processed, ())
+            self.assertEqual(report.skipped, ())
+            self.assertEqual(len(report.blocked), 1)
+            self.assertEqual(report.blocked[0].code, Code.STATE.value)
+            self.assertIn(
+                '挂起 event loan=synthetic-loan form=synthetic-form INVALID_STATE',
+                '\n'.join(format_drive_lines(report)),
+            )
+            self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state,
+                             State.RESERVATION_PENDING)
+            self.assertEqual(harness.writer.ledger_stock.available, 5)
+            self.assertEqual(harness.writer.ledger_stock.reserved, 0)
+            self.assertEqual(harness.writer.writes, 0)
+        finally:
+            harness.stop()
 
     def test_skip_reports_error_code(self):
         harness = DriveHarness(self.runtime, self.locks)
