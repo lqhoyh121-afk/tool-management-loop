@@ -230,6 +230,47 @@ class DriveTests(unittest.TestCase):
         finally:
             harness.stop()
 
+    def test_reconcile_skips_unbindable_loan_without_aborting_pass(self):
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            stale = replace(fixtures.loan(), config_version='stale-config')
+            harness.reader.set_loan(stale)
+            harness.writer.register(stale)
+            sources = StaticSources((WorkItem('event', stale.ref, fixtures.FORM),))
+
+            report = DriveLoop(harness.engine, sources, harness.journal, harness.locks).run()
+
+            stage_skips = [o for o in report.skipped if o.kind == 'stage']
+            self.assertEqual(len(stage_skips), 1)
+            self.assertEqual(stage_skips[0].code, Code.CONFIG.value)
+            self.assertEqual(harness.stages.created, {})
+        finally:
+            harness.stop()
+
+    def test_reconcile_creates_missing_return_stage_without_driving_event(self):
+        from contracts.ports import stage_operation_id
+
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            borrowed = replace(fixtures.loan(), state=State.BORROWED)
+            harness.reader.set_loan(borrowed)
+            harness.writer.register(borrowed)
+            # 借出已完成，但这一轮没有该单的有效事件：入口只能靠对账补齐。
+            # （真实现象：借出发生在驱动之外或多轮之前，归还入口行不存在。）
+            harness.reader.set_event(borrowed.ref, fixtures.FORM,
+                                     harness.todo_event(Action.ISSUE, ISSUE_TASK))
+            sources = StaticSources((WorkItem('event', borrowed.ref, fixtures.FORM),))
+            expected = stage_operation_id(borrowed, Action.REQUEST_RETURN)
+
+            DriveLoop(harness.engine, sources, harness.journal, harness.locks).run()
+            self.assertIn(expected, harness.stages.created)
+
+            before = set(harness.stages.created)
+            DriveLoop(harness.engine, sources, harness.journal, harness.locks).run()
+            self.assertEqual(set(harness.stages.created) - before, set())
+        finally:
+            harness.stop()
+
     def test_unknown_result_queries_original_intent_on_restart(self):
         harness = DriveHarness(self.runtime, self.locks)
         try:
