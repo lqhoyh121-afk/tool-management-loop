@@ -68,11 +68,19 @@ class FixedClock:
 
 class ParseRefTests(unittest.TestCase):
     def test_reads_three_part_target(self):
-        ref = remind.parse_ref('org/base/table_x')
-        self.assertEqual(ref, Resource('record', 'org', 'base', 'table_x'))
+        ref = remind.parse_ref('org/synthetic-loans/loan_x')
+        self.assertEqual(ref, Resource('record', 'org', 'synthetic-loans', 'loan_x'))
+
+    def test_reads_four_part_aitable_container(self):
+        ref = remind.parse_ref('org/base/table/loan_x')
+        self.assertEqual(ref, Resource('record', 'org', 'base/table', 'loan_x'))
+
+    def test_rejects_three_part_when_container_must_be_two_segments(self):
+        with self.assertRaises(ContractError):
+            remind.parse_ref('org/base/loan_x', expected_container='base/table')
 
     def test_rejects_other_shapes(self):
-        for raw in ('', 'org/base', 'org/base/x/y', 'org//x'):
+        for raw in ('', 'org/base', 'org/base/x/y/z', 'org//x'):
             with self.assertRaises(ContractError):
                 remind.parse_ref(raw)
 

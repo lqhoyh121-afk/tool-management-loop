@@ -5,8 +5,8 @@ Snapshots are recovery copies of the original intent, not a second inventory.
 from datetime import datetime
 
 from contracts.flow import Receipt, WriteIntent
-from contracts.model import (Action, Event, Identity, IdentityBinding, Inventory,
-                             Loan, Outcome, Resource, State)
+from contracts.model import (Action, Code, ContractError, Event, Identity, IdentityBinding,
+                             Inventory, Loan, Outcome, Resource, State, require)
 from contracts.ports import StageReceipt, StageRequest
 
 
@@ -47,6 +47,28 @@ def encode_resource(resource):
 
 def decode_resource(data):
     return Resource(data['kind'], data['tenant_id'], data['container_id'], data['resource_id'])
+
+
+def parse_loan_ref(raw, *, expected_container=None):
+    """Parse a CLI loan target into a record ``Resource``.
+
+    - ``tenant/container/record`` when ``container`` has no internal ``/``
+    - ``tenant/base/table/record`` when the aitable container is ``base/table``
+
+    When ``expected_container`` contains ``/`` but the parsed container does not,
+    fail closed so a three-segment target cannot silently point at the wrong table.
+    """
+    parts = (raw or '').split('/')
+    require(len(parts) in (3, 4) and all(part.strip() for part in parts), Code.CONFIG)
+    if len(parts) == 3:
+        ref = Resource('record', parts[0], parts[1], parts[2])
+    else:
+        ref = Resource('record', parts[0], f'{parts[1]}/{parts[2]}', parts[3])
+    if (expected_container is not None
+            and '/' in expected_container
+            and ref.container_id != expected_container):
+        raise ContractError(Code.CONFIG)
+    return ref
 
 
 def _intent_kind(intent):
