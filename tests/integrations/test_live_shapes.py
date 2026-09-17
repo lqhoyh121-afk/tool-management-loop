@@ -15,6 +15,7 @@ from contracts.model import Action, Code, ContractError, Outcome
 from contracts.ports import LedgerScope, RuntimeBinding, StageRequest, stage_operation_id
 from integrations.dingtalk.adapter import DingTalkAdapter
 from integrations.dingtalk.codec import decode_loan, encode_inventory, encode_loan
+from integrations.dingtalk.envelope import extract_records, record_cells
 from integrations.dingtalk.layout import SYNTHETIC_ENTRY_FIELDS, SYNTHETIC_FIELDS
 
 
@@ -36,6 +37,13 @@ SyntheticJournal, SyntheticLease = _synthetic.SyntheticJournal, _synthetic.Synth
 
 def _live_select(name):
     return {'id': f'SYNTHETIC-rand-{name}', 'name': name}
+
+
+class StoredShapeTransport(MemoryTransport):
+    """Hands stored cells over unchanged: the read side #33 removed from both doubles."""
+
+    def _live_cells(self, cells):
+        return dict(cells)
 
 
 class LiveShapeTests(unittest.TestCase):
@@ -75,6 +83,54 @@ class LiveShapeTests(unittest.TestCase):
         cells.pop(self.fields.return_id, None)
         cells.pop(self.fields.return_container, None)
         self.assertEqual(decode_loan(current.ref, cells, self.fields).return_ref, None)
+
+    def _stored_shape_adapter(self):
+        transport = StoredShapeTransport(self.fields, self.entry_fields)
+        adapter = DingTalkAdapter(transport, self.journal, self.leases,
+                                  self.fields, self.entry_fields)
+        return transport, adapter
+
+    def test_double_refuses_to_decode_option_id_equal_to_name(self):
+        """自造 id（与 name 相同）不是已观察形态：替身不像真机时也不能被迁就。"""
+        transport, adapter = self._stored_shape_adapter()
+        cells = encode_loan(loan(), self.fields)
+        cells[self.fields.state] = {
+            'id': loan().state.value, 'name': loan().state.value,
+        }
+        cells[self.fields.tracked] = _live_select('false')
+        transport.seed_record(LOAN, cells)
+        self.blocked(Code.EVIDENCE, lambda: adapter.read_loan(LOAN))
+
+    def test_double_refuses_to_decode_present_empty_string_cell(self):
+        """钉钉不传未填单元格；出现的 `''` 是替身形态，按缺字段 fail closed。"""
+        transport, adapter = self._stored_shape_adapter()
+        cells = encode_loan(loan(), self.fields)
+        cells[self.fields.state] = _live_select(loan().state.value)
+        cells[self.fields.tracked] = _live_select('false')
+        cells[self.fields.return_id] = ''
+        transport.seed_record(LOAN, cells)
+        self.blocked(Code.EVIDENCE, lambda: adapter.read_loan(LOAN))
+
+    def test_memory_double_materializes_every_declared_kind(self):
+        """读回形态：select -> {id, name}、person -> [{corpId, userId}]、数字 -> 字符串。"""
+        cells = encode_loan(loan(), self.fields)
+        cells[self.fields.quantity] = 2
+        cells[self.fields.borrower] = [
+            {'corpId': loan().ref.tenant_id, 'userId': 'SYNTHETIC-contact-x'},
+        ]
+        self.transport.seed_record(LOAN, cells)
+        payload = self.transport.exchange('record.query', {
+            'tenant_id': LOAN.tenant_id,
+            'container_id': LOAN.container_id,
+            'resource_id': LOAN.resource_id,
+        })
+        live = record_cells(extract_records(payload)[0])
+        self.assertEqual(live[self.fields.quantity], '2')
+        self.assertEqual(live[self.fields.borrower], [
+            {'corpId': loan().ref.tenant_id, 'userId': 'SYNTHETIC-contact-x'},
+        ])
+        self.assertIsInstance(live[self.fields.state], dict)
+        self.assertNotEqual(live[self.fields.state]['id'], live[self.fields.state]['name'])
 
     def test_agree_decision_uses_select_name(self):
         request = StageRequest(stage_operation_id(loan(), Action.APPROVE),

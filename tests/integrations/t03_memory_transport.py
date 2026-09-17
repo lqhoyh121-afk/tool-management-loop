@@ -6,6 +6,8 @@ helpers. Commands are adapter-internal names, not a claim of real dws verbs.
 from copy import deepcopy
 import json
 
+from t03_live_cells import declared_kinds, live_cells
+
 from contracts.model import Identity, Resource, State
 
 from integrations.dingtalk.codec import _put_identity, decode_loan
@@ -68,6 +70,7 @@ class MemoryTransport(Transport):
                  todo_container='synthetic-todos', apply_container='synthetic-apply-forms'):
         self.fields = fields
         self.entry_fields = entry_fields
+        self.kinds = declared_kinds(fields, entry_fields)
         self.form_container = form_container
         self.apply_container = apply_container
         self.todo_container = todo_container
@@ -84,7 +87,6 @@ class MemoryTransport(Transport):
         self._forms = 0
         self._todos = 0
         self._activities = 0
-        self._selects = 0
         self._next_internal = 9000000100
         self.contact_to_internal = {}
 
@@ -171,26 +173,8 @@ class MemoryTransport(Transport):
         return ok_envelope(data={'records': [record], 'hasMore': False})
 
     def _live_cells(self, cells):
-        visible = {}
-        select_ids = {self.fields.state, self.fields.tracked}
-        for field_id, value in cells.items():
-            if value == '':
-                continue
-            if isinstance(value, dict) and 'id' in value and 'name' in value:
-                self._selects += 1
-                visible[field_id] = {
-                    'id': f'SYNTHETIC-rand-{self._selects:04d}',
-                    'name': value['name'],
-                }
-            elif field_id in select_ids and isinstance(value, str):
-                self._selects += 1
-                visible[field_id] = {
-                    'id': f'SYNTHETIC-rand-{self._selects:04d}',
-                    'name': value,
-                }
-            else:
-                visible[field_id] = deepcopy(value)
-        return visible
+        """Read side: stored write payload re-shaped as a live read (shared policy)."""
+        return live_cells(cells, self.kinds)
 
     def _record_update(self, arguments):
         if self.drop_after_updates is not None and self.update_count >= self.drop_after_updates:

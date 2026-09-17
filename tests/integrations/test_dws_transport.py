@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from t031_fake_dws import load_state, save_state
 from t03_layout import entry_fields_from
+from t03_live_cells import declared_kinds
+from t03_memory_transport import MemoryTransport
 
 from contracts.flow import plan, verify
 from contracts.model import (Action, Code, ContractError, Identity, Outcome,
@@ -24,6 +28,7 @@ from integrations.dingtalk.codec import encode_inventory, encode_loan
 from integrations.dingtalk.dws_transport import (DwsTransport, split_container,
                                                  todo_internal_id,
                                                  windows_native_path)
+from integrations.dingtalk.envelope import extract_records, record_cells
 from integrations.dingtalk.errors import UnsupportedShapeError
 from integrations.dingtalk.layout import SYNTHETIC_FIELDS
 
@@ -66,9 +71,11 @@ class DwsTransportTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.work = Path(self.temp.name)
         self.state_path = self.work / 'fake-state.json'
-        save_state(self.state_path, load_state(self.state_path))
         self.fields = SYNTHETIC_FIELDS
         self.entry_fields = entry_fields_from(self.fields)
+        state = load_state(self.state_path)
+        state['kinds'] = declared_kinds(self.fields, self.entry_fields)
+        save_state(self.state_path, state)
         self.journal = SyntheticJournal()
         self.leases = SyntheticLease()
         self.lease = self.leases.acquire(LedgerScope.from_record(ITEM), MANAGER)
@@ -206,7 +213,90 @@ class DwsTransportTests(unittest.TestCase):
         self.assertIsInstance(cells[self.fields.state], dict)
         self.assertIn('id', cells[self.fields.state])
         self.assertEqual(cells[self.fields.state]['name'], stored[self.fields.state])
+        self.assertNotEqual(cells[self.fields.state]['id'], cells[self.fields.state]['name'])
         self.assertEqual(self.adapter.read_loan(LOAN).state, loan().state)
+
+    def _live(self, ref):
+        payload = self.transport.exchange('record.query', {
+            'tenant_id': ref.tenant_id,
+            'container_id': ref.container_id,
+            'resource_id': ref.resource_id,
+        })
+        return record_cells(extract_records(payload)[0])
+
+    def _store(self, ref, cells):
+        state = load_state(self.state_path)
+        state['records'][f'{ref.container_id}/{ref.resource_id}'] = cells
+        save_state(self.state_path, state)
+
+    def test_fake_dws_materializes_person_and_number_cells(self):
+        """The read shape is not the write payload for persons and numbers either."""
+        state = load_state(self.state_path)
+        slot = f'{LOAN.container_id}/{LOAN.resource_id}'
+        cells = dict(state['records'][slot])
+        cells[self.fields.quantity] = 2
+        cells[self.fields.borrower] = [
+            {'corpId': 'synthetic-org', 'userId': 'synthetic-user', 'name': '合成姓名'},
+        ]
+        self._store(LOAN, cells)
+        live = self._live(LOAN)
+        self.assertEqual(live[self.fields.quantity], '2')
+        self.assertEqual(live[self.fields.borrower],
+                         [{'corpId': 'synthetic-org', 'userId': 'synthetic-user'}])
+
+    def test_fake_dws_materializes_a_declared_select_outside_the_old_pair(self):
+        """`fldSYN-decision` was never whitelisted; kinds now come from the schema."""
+        row = dict(encode_loan(loan(), self.fields))
+        row[self.entry_fields.loan_container] = LOAN.container_id
+        row[self.entry_fields.loan_id] = LOAN.resource_id
+        row[self.entry_fields.decision] = 'agree'
+        row[self.entry_fields.occurred_at] = _fixtures.NOW.isoformat()
+        form = Resource('form', LOAN.tenant_id, FORM_CONTAINER, 'recForm')
+        self._store(form, row)
+        live = self._live(form)
+        self.assertEqual(live[self.entry_fields.decision]['name'], 'agree')
+        self.assertNotEqual(live[self.entry_fields.decision]['id'], 'agree')
+        event = self.adapter.read_event(loan(), form)
+        self.assertEqual(event.action, Action.APPROVE)
+        self.assertEqual(event.actor, loan().approver)
+
+    def test_fake_dws_option_id_is_stable_per_option_not_per_read(self):
+        other = Resource('record', LOAN.tenant_id, LOAN.container_id, 'recOther')
+        self._seed_row(other, state=loan().state)
+        first = self._live(LOAN)[self.fields.state]['id']
+        self.assertEqual(self._live(LOAN)[self.fields.state]['id'], first)
+        self.assertEqual(self._live(other)[self.fields.state]['id'], first)
+        self.assertNotEqual(self._live(LOAN)[self.fields.tracked]['id'], first)
+
+    def test_fake_dws_filters_empty_result_is_null_not_an_empty_list(self):
+        """Live `--all` answers an empty filter with `records: null`, not `[]`."""
+        borrower = encode_loan(loan(), self.fields)[self.fields.borrower][0]['userId']
+        argv = [sys.executable, str(FAKE_DWS), 'aitable', 'record', 'query',
+                '--base-id', 'baseLoan', '--table-id', 'tblLoan',
+                '--filters', json.dumps({'operator': 'and', 'operands': [
+                    {'operator': 'eq', 'operands': [self.fields.state, 'borrowed']}]}),
+                '--field-ids', f'{self.fields.state},{self.fields.borrower}',
+                '--all', '--format', 'json']
+        env = dict(os.environ, FAKE_DWS_STATE=str(self.state_path))
+        out = subprocess.run(argv, capture_output=True, text=True, env=env)
+        payload = json.loads(out.stdout)
+        self.assertIn('records', payload)
+        self.assertIsNone(payload['records'])
+        self.assertFalse(payload['hasMore'])
+        self.assertEqual(self._borrowed_query(borrower)['result']['loan_ids'], [])
+
+    def test_both_doubles_return_the_same_live_cells(self):
+        """The file double and MemoryTransport must not drift on read shapes (#33)."""
+        state = load_state(self.state_path)
+        memory = MemoryTransport(self.fields, self.entry_fields)
+        for ref in (LOAN, ITEM):
+            memory.seed_record(ref, state['records'][f'{ref.container_id}/{ref.resource_id}'])
+            payload = memory.exchange('record.query', {
+                'tenant_id': ref.tenant_id,
+                'container_id': ref.container_id,
+                'resource_id': ref.resource_id,
+            })
+            self.assertEqual(record_cells(extract_records(payload)[0]), self._live(ref))
 
     def test_read_submit_query_roundtrip(self):
         self.assertEqual(self.adapter.read_loan(LOAN).ref, LOAN)
