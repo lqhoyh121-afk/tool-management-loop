@@ -81,7 +81,21 @@ def format_outcome_summary(outcomes):
     return f'{len(outcomes)}（{"，".join(parts)}）'
 
 
+def _waiting_on_human(outcomes):
+    """Skips that really mean "the human has not acted yet".
+
+    An open stage todo reads as ``STATE`` from the todo channel (no completion
+    event yet) — the reader marks that case separately on purpose, because a
+    *completed* todo whose evidence is unreadable still comes back as
+    ``EVIDENCE``. Only the former is "等人工"; calling a broken completion
+    "证据不足" would be wrong the other way round.
+    """
+    return tuple(o for o in outcomes
+                 if o.code == Code.STATE.value and o.source_kind == 'todo')
+
+
 def format_drive_lines(report):
+    waiting = _waiting_on_human(report.skipped)
     lines = [
         '驱动完成。回查 {recovered}（含阶段对账新建），处理 {processed}，跳过 {skipped}，'
         '挂起 {blocked}。未盲重发。'.format(
@@ -91,6 +105,9 @@ def format_drive_lines(report):
             blocked=format_outcome_summary(report.blocked),
         ),
     ]
+    if waiting:
+        ids = '，'.join(o.source_id for o in waiting)
+        lines.append(f'  其中待人工 {len(waiting)} 条（阶段待办尚未完成，不是证据不足）：{ids}')
     for label, outcomes in (('跳过', report.skipped), ('挂起', report.blocked)):
         for outcome in outcomes:
             lines.append(

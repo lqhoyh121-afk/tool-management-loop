@@ -38,6 +38,7 @@ def _business_code(exc):
 _FORM_DECISIONS = {
     'apply': Action.APPLY,
     'agree': Action.APPROVE,
+    '同意': Action.APPROVE,
     'reject': Action.REJECT,
     '拒绝': Action.REJECT,
     'cancel': Action.CANCEL,
@@ -407,6 +408,9 @@ class DingTalkAdapter:
                 actor = _identity(cells, fields.manager, loan.ref.tenant_id)
             else:
                 actor = _identity(cells, fields.approver, loan.ref.tenant_id)
+            if not self._cell_has_text(cells, fields.occurred_at):
+                raise MissingFieldError(
+                    '阶段入口缺少「发生时间」：决定与发生时间都要真人填，引擎不预填')
             occurred = read_datetime(cells, fields.occurred_at)
             return_ref = None
             quantity = None
@@ -444,7 +448,9 @@ class DingTalkAdapter:
         except DingTalkShapeError as exc:
             _closed(exc, Code.UNKNOWN)
         events = completion_events(detail)
-        require(bool(events), Code.EVIDENCE)
+        # 待办还没被点完成：这是「等人工」，不是「证据不足」。驱动按本码区分，
+        # 不要把未完成和「已完成但证据读不出来」混成一句提示。
+        require(bool(events), Code.STATE)
         actors = {item.actor.value for item in events}
         require(len(actors) == 1, Code.EVIDENCE)
         actor_ref = events[0].actor
