@@ -77,8 +77,8 @@ BOOLEAN = {'--all', '--yes'}
 
 SPECS = {
     'aitable record query': {
-        'required': {'--base-id', '--table-id', '--record-ids', '--format'},
-        'optional': {'--all'},
+        'required': {'--base-id', '--table-id', '--format'},
+        'optional': {'--all', '--record-ids', '--filters', '--field-ids', '--page-limit'},
     },
     'aitable record update': {
         'required': {'--base-id', '--table-id', '--records-file', '--yes', '--format'},
@@ -173,6 +173,37 @@ def _live_cells(cells):
     return visible
 
 
+def _eq_filter(cells, field_id, expected):
+    value = cells.get(field_id)
+    if field_id in _SYNTHETIC_SELECT_FIELDS:
+        if isinstance(value, str):
+            return value == expected
+        if isinstance(value, dict):
+            return value.get('name') == expected
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict):
+        user_id = value[0].get('userId')
+        if user_id is not None:
+            return user_id == expected
+    return value == expected
+
+
+def _matches_filters(cells, filters):
+    if not isinstance(filters, dict) or filters.get('operator') != 'and':
+        return False
+    operands = filters.get('operands')
+    if not isinstance(operands, list):
+        return False
+    for clause in operands:
+        if not isinstance(clause, dict) or clause.get('operator') != 'eq':
+            return False
+        parts = clause.get('operands')
+        if not isinstance(parts, list) or len(parts) != 2:
+            return False
+        if not _eq_filter(cells, parts[0], parts[1]):
+            return False
+    return True
+
+
 def synthetic_option_write(cells):
     for value in cells.values():
         if not isinstance(value, dict):
@@ -200,12 +231,30 @@ def main(argv):
     if argv[:3] == ['aitable', 'record', 'query']:
         base_id = flag(argv, '--base-id')
         table_id = flag(argv, '--table-id')
-        record_id = flag(argv, '--record-ids')
-        item = state['records'].get(key(base_id, table_id, record_id))
-        records = [] if item is None else [{
-            'recordId': record_id,
-            'cells': _live_cells(item),
-        }]
+        if has(argv, '--filters'):
+            filters = json.loads(flag(argv, '--filters'))
+            prefix = f'{base_id}/{table_id}/'
+            records = []
+            for slot, item in state['records'].items():
+                if not slot.startswith(prefix):
+                    continue
+                record_id = slot[len(prefix):]
+                if _matches_filters(item, filters):
+                    records.append({
+                        'recordId': record_id,
+                        'cells': _live_cells(item),
+                    })
+        else:
+            record_id = flag(argv, '--record-ids')
+            if record_id is None:
+                print(json.dumps(err('MISSING_FLAG', '--record-ids or --filters'),
+                                 ensure_ascii=True))
+                return 0
+            item = state['records'].get(key(base_id, table_id, record_id))
+            records = [] if item is None else [{
+                'recordId': record_id,
+                'cells': _live_cells(item),
+            }]
         if has(argv, '--all'):
             print(json.dumps(ok(records=records, hasMore=False), ensure_ascii=True))
         else:

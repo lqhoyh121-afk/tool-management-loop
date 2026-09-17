@@ -17,6 +17,7 @@ from t03_layout import entry_fields_from
 
 from contracts.flow import plan, verify
 from contracts.model import Action, Code, ContractError, Outcome, Resource, State
+from integrations.dingtalk.codec import _put_identity
 from contracts.ports import LedgerScope, RuntimeBinding, StageRequest, stage_operation_id
 from integrations.dingtalk.adapter import DingTalkAdapter
 from integrations.dingtalk.codec import encode_inventory, encode_loan
@@ -38,6 +39,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 _fixtures = _load('t031_port_fixtures', _ROOT / 'tests' / 'contracts' / 'fixtures.py')
 _synthetic = _load('t031_port_synthetic', _ROOT / 'tests' / 'contracts' / 'synthetic.py')
 MANAGER = _fixtures.MANAGER
+BORROWER = _fixtures.BORROWER
 SyntheticJournal, SyntheticLease = _synthetic.SyntheticJournal, _synthetic.SyntheticLease
 
 LOAN = Resource('record', 'synthetic-org', 'baseLoan/tblLoan', 'recLoan')
@@ -316,6 +318,33 @@ class DwsTransportTests(unittest.TestCase):
             self.assertEqual(queried['result'], {})
         finally:
             self.transport._todo_detail_for_stage = original
+
+    def test_loan_query_borrowed_returns_borrowed_loan_for_borrower(self):
+        current = replace(loan(), state=State.BORROWED)
+        cells = encode_loan(current, self.fields)
+        cells[self.fields.state] = State.BORROWED.value
+        cells[self.fields.borrower] = _put_identity(BORROWER)
+        state = load_state(self.state_path)
+        state['records'][f'{LOAN.container_id}/{LOAN.resource_id}'] = cells
+        save_state(self.state_path, state)
+        payload = self.transport.exchange('loan.query_borrowed', {
+            'tenant_id': LOAN.tenant_id,
+            'loan_container': LOAN.container_id,
+            'borrower': BORROWER.user_id,
+        })
+        self.assertEqual(payload['result']['loan_ids'], [LOAN.resource_id])
+
+    def test_loan_query_borrowed_ignores_other_borrowers(self):
+        payload = self.transport.exchange('loan.query_borrowed', {
+            'tenant_id': LOAN.tenant_id,
+            'loan_container': LOAN.container_id,
+            'borrower': 'synthetic-nobody',
+        })
+        self.assertEqual(payload['result']['loan_ids'], [])
+
+    def test_loan_query_borrowed_bad_container_maps_to_evidence(self):
+        self.blocked(Code.EVIDENCE, lambda: self.adapter._borrowed_loan_ids(
+            LOAN.tenant_id, 'synthetic-loans', BORROWER.user_id))
 
     def test_stage_query_by_task_id(self):
         current = loan()

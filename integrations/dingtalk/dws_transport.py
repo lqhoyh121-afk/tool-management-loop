@@ -13,9 +13,12 @@ import subprocess
 import uuid
 from pathlib import Path
 
+from contracts.model import Identity, State, text
+
+from .cells import read_creator, read_single_select
 from .codec import _put_identity
-from .errors import UnsupportedShapeError, UnknownResultError
-from contracts.model import Identity, text
+from .envelope import extract_records, record_cells, record_id
+from .errors import DingTalkShapeError, UnsupportedShapeError, UnknownResultError
 
 
 def split_container(container_id):
@@ -96,7 +99,7 @@ class DwsTransport:
         arguments = dict(arguments)
         try:
             if command == 'loan.query_borrowed':
-                raise UnsupportedShapeError('loan.query_borrowed 尚未在 dws 连接层实现')
+                return self._loan_query_borrowed(arguments)
             if command == 'stage.query':
                 return self._stage_query(arguments)
             argv = self._argv(command, arguments)
@@ -110,6 +113,46 @@ class DwsTransport:
         if command in ('form.create', 'todo.create') and payload is not None:
             self._remember_stage(command, arguments, payload)
         return payload
+
+    def _loan_query_borrowed(self, arguments):
+        """Filter loan ledger rows: state=borrowed, then match borrower userId."""
+        text(str(arguments.get('tenant_id', '')))
+        loan_container = str(arguments.get('loan_container', ''))
+        borrower = str(arguments.get('borrower', ''))
+        text(borrower)
+        base_id, table_id = split_container(loan_container)
+        filters = json.dumps({
+            'operator': 'and',
+            'operands': [{
+                'operator': 'eq',
+                'operands': [self.fields.state, State.BORROWED.value],
+            }],
+        }, ensure_ascii=True)
+        argv = [
+            'aitable', 'record', 'query',
+            '--base-id', base_id,
+            '--table-id', table_id,
+            '--filters', filters,
+            '--field-ids', f'{self.fields.state},{self.fields.borrower}',
+            '--all',
+            '--format', 'json',
+        ]
+        payload = self._run(argv)
+        records = extract_records(payload)
+        loan_ids = []
+        for record in records:
+            try:
+                cells = record_cells(record)
+                person = read_creator(cells, self.fields.borrower)
+                if person.value != borrower:
+                    continue
+                state_name = read_single_select(cells, self.fields.state).name
+                if state_name != State.BORROWED.value:
+                    continue
+                loan_ids.append(record_id(record))
+            except DingTalkShapeError:
+                continue
+        return ok_envelope(result={'loan_ids': sorted(loan_ids)})
 
     def _argv(self, command, arguments):
         common = ['--format', 'json']

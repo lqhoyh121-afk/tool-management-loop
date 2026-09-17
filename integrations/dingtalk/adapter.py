@@ -314,11 +314,16 @@ class DingTalkAdapter:
                 and fields.occurred_at in cells and cells[fields.occurred_at] is not None)
 
     def _borrowed_loan_ids(self, tenant_id, loan_container, borrower_user_id):
-        payload = self.transport.exchange('loan.query_borrowed', {
-            'tenant_id': tenant_id,
-            'loan_container': loan_container,
-            'borrower': borrower_user_id,
-        })
+        try:
+            payload = self.transport.exchange('loan.query_borrowed', {
+                'tenant_id': tenant_id,
+                'loan_container': loan_container,
+                'borrower': borrower_user_id,
+            })
+        except UnknownResultError as exc:
+            _closed(exc, Code.UNKNOWN)
+        except DingTalkShapeError as exc:
+            _closed(exc)
         result = require_envelope(payload).get('result')
         require(isinstance(result, dict), Code.EVIDENCE)
         loan_ids = result.get('loan_ids')
