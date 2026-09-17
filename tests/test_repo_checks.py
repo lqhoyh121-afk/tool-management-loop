@@ -125,8 +125,15 @@ def secret_source():
     return 'API' + '_KEY = ' + q + 'z' * 24 + q + '\n'
 
 
+_GIT_ENV_KEYS = ('GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE')
+
+
 def run_cmd(args, cwd, timeout=180):
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+    for key in _GIT_ENV_KEYS:
+        env.pop(key, None)
+    if args and args[0] == 'git':
+        args = ['git', '-C', str(cwd), *args[1:]]
     return subprocess.run(args, cwd=str(cwd), capture_output=True, text=True,
                           encoding='utf-8', errors='replace', timeout=timeout, env=env)
 
@@ -445,6 +452,32 @@ class HookAndInstallTests(unittest.TestCase):
                         '--staged'], notes)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn('PASS', proc.stdout)
+
+
+@unittest.skipUnless(GIT, 'git not available')
+class RealRepoConfigGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.real_config = REPO_ROOT / '.git' / 'config'
+        if not self.real_config.is_file():
+            self.skipTest('not a git checkout')
+        self.before = self.real_config.read_bytes()
+
+    def tearDown(self):
+        after = self.real_config.read_bytes()
+        self.assertEqual(after, self.before, 'real repo .git/config was modified')
+
+    def test_local_git_config_stays_in_temp_repo_when_git_dir_leaks(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+        run_cmd(['git', 'init', '-q', '-b', 'main'], repo)
+        run_cmd(['git', 'config', '--local', 'core.hooksPath', 'other-hooks'], repo)
+        proc = run_cmd(['git', 'config', '--local', '--get', 'core.hooksPath'], repo)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), 'other-hooks')
+        real_hooks = run_cmd(['git', 'config', '--local', '--get', 'core.hooksPath'], REPO_ROOT)
+        if real_hooks.returncode == 0:
+            self.assertNotEqual(real_hooks.stdout.strip(), 'other-hooks')
 
 
 if __name__ == '__main__':
