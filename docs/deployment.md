@@ -171,7 +171,9 @@ python -m bootstrap --drive --runtime 运行目录 --lock-root 锁目录
 
 缺上述映射、键不完整、或把台账整表拷进 `entry_fields`/`apply_fields`/`return_form_fields`，都是 `CONFIG`。读申请行用 `apply_fields`；读归还表单行（无 loan_id）用 `return_form_fields` 并按借用人唯一匹配；读引擎预建阶段入口行仍用 `entry_fields`。真实字段 ID 只放本机绑定，不进仓库。
 
-工作队列是运行目录下的 `sources.json`（Git 忽略），只存单据/来源引用，不是第二本库存账。`kind` 为 `apply` 或 `event`。`apply` 走 `admit_application` 后建立审批入口；`event` 走 `execute`，同意后系统预留，再按状态建借出/归还入口。回执落 `runtime/operations/<operation_id>.json`。阶段入口行由引擎创建，但**决定与发生时间两格必须由真人填**（引擎不预填时间，否则时间就不代表真人的实际动作时刻）：只填一格驱动会判 `EVIDENCE_REQUIRED` 并指明缺哪一格。每轮驱动先做一次**阶段对账**：凡是队列或日志里出现过的单据，若其当前状态本该有人工入口（待审批 / 待领用确认 / 待归还请求 / 待归还确认）而入口不存在，驱动按 `stage_operation_id` 幂等补齐 —— 已建过的（含 `UNKNOWN` 回执）不重建。`kind` 为 `apply` 或 `event`。`apply` 走 `admit_application` 后建立审批入口；`event` 走 `execute`，同意后系统预留，再按状态建借出/归还入口。回执落 `runtime/operations/<operation_id>.json`。
+工作队列是运行目录下的 `sources.json`（Git 忽略），只存单据/来源引用，不是第二本库存账。`kind` 为 `apply` 或 `event`。`apply` 走 `admit_application` 后建立审批入口；`event` 走 `execute`，同意后系统预留，再按状态建借出/归还入口。回执落 `runtime/operations/<operation_id>.json`。阶段入口行由引擎创建，但**决定与发生时间两格必须由真人填**（引擎不预填时间，否则时间就不代表真人的实际动作时刻）：只填一格驱动会判 `EVIDENCE_REQUIRED` 并指明缺哪一格。每轮驱动先做一次**阶段对账**：凡是队列或日志里出现过的单据，若其当前状态本该有人工入口（待审批 / 待领用确认 / 待归还请求 / 待归还确认）而入口不存在，驱动按 `stage_operation_id` 幂等补齐 —— 已建过的（含 `UNKNOWN` 回执）不重建。
+
+对账的记分单独成行，不与「回查」混算：`回查` 只数未决流水（`unresolved_ids`），新建入口是这一轮真实的外写，按 `阶段对账：检查 N，新建 M，跳过 K` 单独报，明细沿用跳过行的形状（`跳过 stage loan=… stage=… 原因码`）。已有入口（含 `UNKNOWN` 回执）算「检查」不算「跳过」；读不到的单、当前状态没有下一人工入口（已关闭 / 已拒绝 / 已取消 / 预留未完成）、绑定不通过，都逐单列出原因码，不静默略过。已知单 = 队列条目 ∪ 日志条目，阶段回执与**写入意图**都算：本机索引丢了记录时，只要日志里还有那次写入意图，该单仍会被对账覆盖。对账只补人工入口，不重发台账写入。
 
 隔离测试注入假读写端口，不连真实钉钉。协作者不得索要凭据或代跑真实组织。
 

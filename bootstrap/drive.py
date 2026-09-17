@@ -51,10 +51,21 @@ class DriveOutcome:
 
 @dataclass(frozen=True)
 class DriveReport:
+    """One pass, with stage reconciliation kept in its own account.
+
+    ``recovered`` is only the unresolved-journal recovery; the entry points the
+    reconcile created are writes, so they are reported by ``stage_created``
+    (operation ids) and never mixed into the recovery count. ``stage_checked``
+    holds the known loan refs the reconcile examined. Reconcile skips travel in
+    ``skipped`` like every other skip, tagged ``kind='stage'``.
+    """
+
     recovered: tuple
     processed: tuple
     skipped: tuple
     blocked: tuple
+    stage_checked: tuple = ()
+    stage_created: tuple = ()
 
 
 def _drive_outcome(item, code):
@@ -65,6 +76,16 @@ def _drive_outcome(item, code):
         source_id=item.source.resource_id,
         code=code,
     )
+
+
+def _stage_outcome(loan_ref, operation_id, code):
+    """One reconcile result in the same shape every other skip uses.
+
+    The source column carries the stage operation id when the pass got far
+    enough to derive one, otherwise the loan id.
+    """
+    return DriveOutcome('stage', loan_ref.resource_id, 'stage',
+                        operation_id or loan_ref.resource_id, code.value)
 
 
 def _code_counts(outcomes):
@@ -94,15 +115,25 @@ def _waiting_on_human(outcomes):
                  if o.code == Code.STATE.value and o.source_kind == 'todo')
 
 
+def _stage_skips(outcomes):
+    """Reconcile skips share the skip tuple with queue skips, tagged by kind."""
+    return tuple(o for o in outcomes if o.kind == 'stage')
+
+
 def format_drive_lines(report):
     waiting = _waiting_on_human(report.skipped)
     lines = [
-        '驱动完成。回查 {recovered}（含阶段对账新建），处理 {processed}，跳过 {skipped}，'
+        '驱动完成。回查 {recovered}，处理 {processed}，跳过 {skipped}，'
         '挂起 {blocked}。未盲重发。'.format(
             recovered=len(report.recovered),
             processed=len(report.processed),
             skipped=format_outcome_summary(report.skipped),
             blocked=format_outcome_summary(report.blocked),
+        ),
+        '阶段对账：检查 {checked}，新建 {created}，跳过 {skipped}'.format(
+            checked=len(report.stage_checked),
+            created=len(report.stage_created),
+            skipped=len(_stage_skips(report.skipped)),
         ),
     ]
     if waiting:
@@ -159,7 +190,7 @@ class DriveLoop:
         skipped = []
         blocked = []
         recovered = self._recover()
-        stages_created, stage_skips = self._reconcile_stages()
+        stage_checked, stages_created, stage_skips = self._reconcile_stages()
         skipped.extend(stage_skips)
         blocked_loans = set(self._unresolved_loans())
         for item in self._work():
@@ -178,8 +209,8 @@ class DriveLoop:
                 skipped.append(_drive_outcome(item, exc.code.value))
                 continue
             processed.append(item)
-        recovered.extend(stages_created)
-        return DriveReport(tuple(recovered), tuple(processed), tuple(skipped), tuple(blocked))
+        return DriveReport(tuple(recovered), tuple(processed), tuple(skipped), tuple(blocked),
+                           tuple(stage_checked), tuple(stages_created))
 
     def _recover(self):
         recovered = []
@@ -257,13 +288,38 @@ class DriveLoop:
         self._ensure_current_stage(current)
 
     def _known_loans(self):
-        """Loan refs the queue or the journal already mentions, first-seen order."""
+        """Loan refs the queue or the journal already mentions, first-seen order.
+
+        Both journal entry kinds count: a verified stage receipt names the loan
+        whose entry was already built, and a write intent names the loan a
+        ledger write addressed, whatever its receipt says. Reading only verified
+        stage receipts missed every loan whose sole trace is a write intent —
+        the local index dropping that one record is enough — and such a loan
+        never got its entry point rebuilt.
+        """
         refs = []
         seen = set()
         for item in self._work():
             if item.loan_ref not in seen:
                 seen.add(item.loan_ref)
                 refs.append(item.loan_ref)
+        for ref in self._journal_loan_refs():
+            if ref not in seen:
+                seen.add(ref)
+                refs.append(ref)
+        return tuple(refs)
+
+    def _journal_loan_refs(self):
+        """Loan refs carried by journal write intents, in operation-id order."""
+        refs = []
+        for operation_id in self.store.ids():
+            try:
+                intent, _ = self.store.load(operation_id)
+            except KeyError:
+                continue
+            if isinstance(intent, StageRequest):
+                continue
+            refs.append(intent.before.ref)
         return tuple(refs)
 
     def _reconcile_stages(self):
@@ -275,18 +331,29 @@ class DriveLoop:
         the loan stalls, so reconcile by ``stage_operation_id`` — an existing
         receipt (verified or unknown) is left alone, never recreated.
 
+        Accounting is split into three answers, because an operator must be able
+        to tell a write from a recovery: ``checked`` are the known loans this
+        pass looked at, ``created`` are the entry points it actually created
+        now (never counted as a recovery), and ``skipped`` is one reported
+        outcome per loan this pass found and could not act on — unreadable loan,
+        a state with no next human stage, or a failing binding check. An entry
+        that already exists is the steady state and is not a skip.
+
         Failures stay per-loan: a loan this pass cannot act on becomes one
         reported skip, exactly like a bad queue item, and never aborts the pass
         (an abort here would also stop the queue work that follows).
         """
+        checked = []
         created = []
         skipped = []
         for ref in self._known_loans():
+            checked.append(ref)
             operation_id = None
             try:
                 loan = self.engine.reader.read_loan(ref)
                 action = _NEXT_STAGE.get(loan.state)
                 if action is None:
+                    skipped.append(_stage_outcome(ref, None, Code.STATE))
                     continue
                 operation_id = stage_operation_id(loan, action)
                 try:
@@ -301,12 +368,10 @@ class DriveLoop:
             except ContractError as exc:
                 if exc.code == Code.INSTANCE:
                     raise
-                skipped.append(DriveOutcome('stage', ref.resource_id, 'stage',
-                                            operation_id or ref.resource_id,
-                                            exc.code.value))
+                skipped.append(_stage_outcome(ref, operation_id, exc.code))
                 continue
             created.append(operation_id)
-        return created, tuple(skipped)
+        return tuple(checked), tuple(created), tuple(skipped)
 
     def _ensure_current_stage(self, loan):
         action = _NEXT_STAGE.get(loan.state)
