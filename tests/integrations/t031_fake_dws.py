@@ -73,12 +73,31 @@ def has(argv, name):
     return name in argv
 
 
+def filter_pairs(raw):
+    """Flatten an ``and``/``eq`` aitable filter JSON into ``(field, value)`` pairs."""
+    pairs = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            operator = node.get('operator')
+            operands = node.get('operands') or []
+            if operator == 'eq' and len(operands) == 2:
+                pairs.append((operands[0], operands[1]))
+                return
+            for item in operands:
+                walk(item)
+
+    walk(json.loads(raw))
+    return pairs
+
+
 BOOLEAN = {'--all', '--yes'}
 
 SPECS = {
     'aitable record query': {
-        'required': {'--base-id', '--table-id', '--record-ids', '--format'},
-        'optional': {'--all'},
+        'required': {'--base-id', '--table-id', '--format'},
+        'optional': {'--all', '--record-ids', '--filters', '--field-ids'},
+        'one_of': ({'--record-ids', '--filters'},),
     },
     'aitable record update': {
         'required': {'--base-id', '--table-id', '--records-file', '--yes', '--format'},
@@ -206,6 +225,25 @@ def main(argv):
             'recordId': record_id,
             'cells': _live_cells(item),
         }]
+        raw_filters = flag(argv, '--filters')
+        if raw_filters:
+            wanted = filter_pairs(raw_filters)
+            field_ids = [f for f in (flag(argv, '--field-ids') or '').split(',') if f]
+            prefix = f'{base_id}/{table_id}/'
+            filtered = []
+            for slot, cells in sorted(state['records'].items()):
+                if not slot.startswith(prefix):
+                    continue
+                if not all(cells.get(field) == value for field, value in wanted):
+                    continue
+                live = _live_cells(cells)
+                kept = {f: live[f] for f in field_ids if f in live} if field_ids else live
+                filtered.append({'recordId': slot[len(prefix):], 'cells': kept})
+            print(json.dumps({'hasMore': bool(state.get('query_truncated')),
+                              'pages': 1,
+                              'records': filtered or None},
+                             ensure_ascii=True))
+            return 0
         if has(argv, '--all'):
             print(json.dumps(ok(records=records, hasMore=False), ensure_ascii=True))
         else:

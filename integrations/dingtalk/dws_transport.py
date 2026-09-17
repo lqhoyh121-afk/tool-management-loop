@@ -13,9 +13,10 @@ import subprocess
 import uuid
 from pathlib import Path
 
+from .cells import read_creator, read_single_select
 from .codec import _put_identity
-from .errors import UnsupportedShapeError, UnknownResultError
-from contracts.model import Identity, text
+from .errors import DingTalkShapeError, UnsupportedShapeError, UnknownResultError
+from contracts.model import Code, ContractError, Identity, require, text
 
 
 def split_container(container_id):
@@ -26,6 +27,38 @@ def split_container(container_id):
     if not base_id or not table_id:
         raise UnsupportedShapeError('container_id 须为 baseId/tableId')
     return base_id, table_id
+
+
+def _query_records(payload):
+    """Rows from ``record query --all``; odd shapes and truncation fail closed.
+
+    Live observation: an empty result set comes back as ``records: null``
+    (present key, null value), not ``[]``. A *missing* key stays an error —
+    that is a shape change, not an empty set.
+    """
+    if not isinstance(payload, dict):
+        raise UnsupportedShapeError('record query 未返回对象报文')
+    if payload.get('hasMore'):
+        raise UnsupportedShapeError('record query 分页未拉完，拒绝按不完整结果匹配')
+    if 'records' not in payload:
+        raise UnsupportedShapeError('record query 报文缺少 records 键')
+    records = payload['records']
+    if records is None:
+        records = []
+    elif not isinstance(records, list):
+        raise UnsupportedShapeError('record query 的 records 不是数组')
+    rows = []
+    for item in records:
+        if not isinstance(item, dict):
+            raise UnsupportedShapeError('record query 的记录不是对象')
+        record_id = item.get('recordId')
+        cells = item.get('cells')
+        if not isinstance(record_id, str) or not record_id.strip():
+            raise UnsupportedShapeError('record query 的记录缺少 recordId')
+        if not isinstance(cells, dict):
+            raise UnsupportedShapeError('record query 的记录缺少 cells')
+        rows.append({'recordId': record_id, 'cells': cells})
+    return rows
 
 
 def windows_native_path(path):
@@ -96,7 +129,7 @@ class DwsTransport:
         arguments = dict(arguments)
         try:
             if command == 'loan.query_borrowed':
-                raise UnsupportedShapeError('loan.query_borrowed 尚未在 dws 连接层实现')
+                return self._loan_query_borrowed(arguments)
             if command == 'stage.query':
                 return self._stage_query(arguments)
             argv = self._argv(command, arguments)
@@ -293,3 +326,38 @@ class DwsTransport:
         if meta is None:
             return ok_envelope(result={})
         return ok_envelope(result=dict(meta))
+
+    def _loan_query_borrowed(self, arguments):
+        """Borrowed loans of one borrower, via ``aitable record query --all``.
+
+        The live ``--all`` shape is ``{hasMore, pages, records}``; it is **not**
+        the ``record list`` envelope. Anything we cannot read (missing cells,
+        truncated pages) fails closed with ``EVIDENCE``: under-counting would
+        turn "more than one open loan" into a confident single match.
+        """
+        base_id, table_id = split_container(arguments.get('loan_container'))
+        tenant_id = str(arguments.get('tenant_id', ''))
+        borrower = str(arguments.get('borrower', ''))
+        require(bool(tenant_id.strip()) and bool(borrower.strip()), Code.EVIDENCE)
+        state_field = self.fields.state
+        borrower_field = self.fields.borrower
+        filters = {'operator': 'and',
+                   'operands': [{'operator': 'eq', 'operands': [state_field, 'borrowed']}]}
+        argv = ['aitable', 'record', 'query',
+                '--base-id', base_id, '--table-id', table_id,
+                '--filters', json.dumps(filters, ensure_ascii=True),
+                '--field-ids', f'{state_field},{borrower_field}',
+                '--all', '--format', 'json']
+        payload = self._run(argv)
+        try:
+            rows = _query_records(payload)
+            loan_ids = []
+            for row in rows:
+                cells = row['cells']
+                state = read_single_select(cells, state_field).name
+                who = read_creator(cells, borrower_field)
+                if state == 'borrowed' and who.value == borrower:
+                    loan_ids.append(row['recordId'])
+        except (DingTalkShapeError, KeyError, TypeError) as exc:
+            raise ContractError(Code.EVIDENCE) from exc
+        return ok_envelope(result={'loan_ids': sorted(loan_ids)})
