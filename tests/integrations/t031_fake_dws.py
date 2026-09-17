@@ -2,6 +2,14 @@
 
 Module name is unique so T09 file-based discovery does not collide. State is a
 JSON file in FAKE_DWS_STATE. SYNTHETIC identifiers only.
+
+The state file also carries the table schema (``kinds``: field id -> live cell
+kind, built with ``t03_live_cells.declared_kinds``). It is what makes reads look
+like the platform: this double stores the **write** payload, while a live read
+returns materialized cells (singleSelect option names as ``{id, name}``, person
+cells as ``[{corpId, userId}]``, numbers as strings). A field whose kind is not
+declared passes through unchanged, so the production readers fail closed instead
+of being handed a double-only shape.
 """
 from __future__ import annotations
 
@@ -10,6 +18,8 @@ import os
 import sys
 import time
 from pathlib import Path
+
+from t03_live_cells import filter_value, live_cells
 
 
 def ok(**extra):
@@ -54,6 +64,7 @@ def load_state(path):
             'todos': {},
             'fail': {},
             'timeout': [],
+            'late_write': [],
             'seq': {'form': 0, 'todo': 0, 'internal': 9000000100},
         }
     return json.loads(path.read_text(encoding='utf-8'))
@@ -111,6 +122,10 @@ SPECS = {
         'required': {'--title', '--executors', '--yes', '--format'},
         'optional': set(),
     },
+    'todo task list': {
+        'required': {'--size', '--format'},
+        'optional': set(),
+    },
     'todo task get': {
         'required': {'--task-id', '--format'},
         'optional': set(),
@@ -166,32 +181,6 @@ def key(base_id, table_id, record_id):
     return f'{base_id}/{table_id}/{record_id}'
 
 
-_SYNTHETIC_SELECT_FIELDS = frozenset({'fldSYN-state', 'fldSYN-tracked'})
-
-
-def _live_cells(cells):
-    visible = {}
-    seq = 0
-    for field_id, value in cells.items():
-        if value == '':
-            continue
-        if isinstance(value, dict) and 'id' in value and 'name' in value:
-            seq += 1
-            visible[field_id] = {
-                'id': f'SYNTHETIC-rand-{seq:04d}',
-                'name': value['name'],
-            }
-        elif field_id in _SYNTHETIC_SELECT_FIELDS and isinstance(value, str):
-            seq += 1
-            visible[field_id] = {
-                'id': f'SYNTHETIC-rand-{seq:04d}',
-                'name': value,
-            }
-        else:
-            visible[field_id] = value
-    return visible
-
-
 def synthetic_option_write(cells):
     for value in cells.values():
         if not isinstance(value, dict):
@@ -217,13 +206,14 @@ def main(argv):
         print(json.dumps(err(fail), ensure_ascii=True))
         return 0
     if argv[:3] == ['aitable', 'record', 'query']:
+        kinds = state.get('kinds') or {}
         base_id = flag(argv, '--base-id')
         table_id = flag(argv, '--table-id')
         record_id = flag(argv, '--record-ids')
         item = state['records'].get(key(base_id, table_id, record_id))
         records = [] if item is None else [{
             'recordId': record_id,
-            'cells': _live_cells(item),
+            'cells': live_cells(item, kinds),
         }]
         raw_filters = flag(argv, '--filters')
         if raw_filters:
@@ -234,9 +224,10 @@ def main(argv):
             for slot, cells in sorted(state['records'].items()):
                 if not slot.startswith(prefix):
                     continue
-                if not all(cells.get(field) == value for field, value in wanted):
+                live = live_cells(cells, kinds)
+                if not all(filter_value(kinds, field, live.get(field)) == value
+                           for field, value in wanted):
                     continue
-                live = _live_cells(cells)
                 kept = {f: live[f] for f in field_ids if f in live} if field_ids else live
                 filtered.append({'recordId': slot[len(prefix):], 'cells': kept})
             print(json.dumps({'hasMore': bool(state.get('query_truncated')),
@@ -294,10 +285,31 @@ def main(argv):
             'executorIds': [internal],
             'activities': [],
         }
-        state['todos'][task_id] = {'detail': detail}
+        state['todos'][task_id] = {'detail': detail,
+                                   'subject': flag(argv, '--title')}
         save_state(state_path, state)
+        if 'todo task create' in state.get('late_write', ()):
+            # The live write can land while the envelope never comes back.
+            time.sleep(120)
         print(json.dumps(todo_ok(result={'taskId': task_id, 'todoDetailModel': detail}),
                          ensure_ascii=True))
+        return 0
+    if argv[:3] == ['todo', 'task', 'list']:
+        size = int(flag(argv, '--size'))
+        cards = []
+        for task_id, todo in state['todos'].items():
+            cards.append({
+                'subject': todo.get('subject'),
+                'taskId': task_id,
+                'createdTime': 0,
+                'dueTime': 0,
+                'finalStatusStage': 0,
+                'priority': 0,
+            })
+        result = {'todoCards': cards[:size]}
+        if state.get('list_more'):
+            result['hasMore'] = True
+        print(json.dumps(todo_ok(result=result), ensure_ascii=True))
         return 0
     if argv[:3] == ['todo', 'task', 'get']:
         task_id = flag(argv, '--task-id')
