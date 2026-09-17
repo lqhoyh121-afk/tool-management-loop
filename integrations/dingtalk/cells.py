@@ -5,6 +5,14 @@
 ISO 字符串；singleSelect **读回**是 ``{id, name}``（``.name`` 为业务值，``.id`` 为服务端随机串）。
 写入侧（``codec.encode_loan``）只发选项 **name 字符串**；读侧不接受裸字符串冒充 singleSelect。
 
+读侧只解码已观察形态，其余一律 fail closed（不猜、不补默认值）：
+
+- singleSelect 必须是 ``{id, name}``，且 ``id`` 与 ``name`` 不同——服务端选项 id 是
+  随机串，两者相同说明是替身自造形态。
+- 未填单元格钉钉**不回传**，因此出现的空字符串不是已观察形态，按缺字段拒绝；
+  只有字段缺失或为 ``null`` 才算「可选且为空」。
+- number 只接受数字字符串，bool / int / float 一律拒绝；空串不能当 0。
+
 本模块只做取值和形态校验，不判定业务含义，也不给字段起公共业务名。
 """
 from datetime import datetime
@@ -35,11 +43,19 @@ def read_text(cells, field_id):
     value = _raw(cells, field_id)
     if not isinstance(value, str):
         raise UnsupportedShapeError(f'字段 {field_id} 应为字符串，收到 {type(value).__name__}')
+    if not value:
+        raise MissingFieldError(
+            f'字段 {field_id} 是空字符串；钉钉不传未填单元格，空串不是已观察形态'
+        )
     return value
 
 
 def read_text_or_empty(cells, field_id):
-    """Optional text: missing or null is empty. Present non-strings still fail."""
+    """Optional text: absent or null is empty.
+
+    A present empty string is not an observed live value (an unset cell is omitted,
+    see :func:`read_text`) and still fails.
+    """
     if field_id not in cells or cells[field_id] is None:
         return ''
     return read_text(cells, field_id)
@@ -89,6 +105,12 @@ def read_datetime(cells, field_id):
 
 
 def read_single_select(cells, field_id):
+    """返回 :class:`SelectOption`。只接受 ``{id, name}``。
+
+    ``id`` 是服务端为**选项**生成的随机串：它既不等于业务值 ``name``，也不随行或
+    随次读取变化。把自造 id（与 name 相同）当合法形态会重新打开「替身不像真机」的
+    口子，因此这里 fail closed。
+    """
     value = _raw(cells, field_id)
     if not isinstance(value, dict):
         raise UnsupportedShapeError(f'字段 {field_id} 应为 {{id, name}} 对象，收到 {type(value).__name__}')
@@ -98,6 +120,10 @@ def read_single_select(cells, field_id):
         raise MissingFieldError(f'字段 {field_id} 缺少选项 id')
     if not isinstance(option_name, str) or not option_name:
         raise MissingFieldError(f'字段 {field_id} 缺少选项 name')
+    if option_id == option_name:
+        raise UnsupportedShapeError(
+            f'字段 {field_id} 的选项 id 与 name 相同；服务端选项 id 是随机串，不接受自造形态'
+        )
     return SelectOption(option_id, option_name)
 
 

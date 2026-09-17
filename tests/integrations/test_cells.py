@@ -78,6 +78,19 @@ class MissingFieldTests(unittest.TestCase):
         with self.assertRaises(MissingFieldError):
             read_number(cells, NUMBER)
 
+    def test_present_empty_string_is_not_an_observed_text_cell(self):
+        """An unset live cell is omitted; `''` is a self-made double shape."""
+        cells = synthetic_cells()
+        cells[TEXT] = ''
+        with self.assertRaises(MissingFieldError):
+            read_text(cells, TEXT)
+
+    def test_optional_text_present_empty_string_still_fails(self):
+        cells = synthetic_cells()
+        cells['fldSYN9999'] = ''
+        with self.assertRaises(MissingFieldError):
+            read_text_or_empty(cells, 'fldSYN9999')
+
     def test_select_without_option_id_is_reported(self):
         cells = synthetic_cells()
         cells[SELECT] = {'name': '合成选项甲'}
@@ -150,6 +163,13 @@ class TypeAnomalyTests(unittest.TestCase):
         cells = synthetic_cells()
         with self.assertRaises(UnsupportedShapeError):
             read_text(cells, SELECT)
+
+    def test_select_option_id_equal_to_name_is_refused(self):
+        """Live option ids are server-side random strings, never the business name."""
+        cells = synthetic_cells()
+        cells[SELECT] = {'id': '合成选项甲', 'name': '合成选项甲'}
+        with self.assertRaises(UnsupportedShapeError):
+            read_single_select(cells, SELECT)
 
 
 class CreatorNamespaceTests(unittest.TestCase):

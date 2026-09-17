@@ -66,6 +66,29 @@ class CodecTests(unittest.TestCase):
             decode_loan(loan().ref, cells, fields)
         self.assertEqual(caught.exception.code, Code.EVIDENCE)
 
+    def test_decode_loan_rejects_option_id_equal_to_name(self):
+        """Decoding a self-made id/name pair would re-open the fake-shape hole (#33)."""
+        fields = SYNTHETIC_FIELDS
+        current = loan()
+        cells = encode_loan(current, fields)
+        cells[fields.state] = {'id': current.state.value, 'name': current.state.value}
+        cells[fields.tracked] = {'id': 'SYN-rand-tracked', 'name': 'false'}
+        with self.assertRaises(ContractError) as caught:
+            decode_loan(current.ref, cells, fields)
+        self.assertEqual(caught.exception.code, Code.EVIDENCE)
+
+    def test_decode_loan_rejects_present_empty_text_cell(self):
+        """Live omits unset cells; a present `''` is not an observed shape."""
+        fields = SYNTHETIC_FIELDS
+        current = loan()
+        cells = encode_loan(current, fields)
+        cells[fields.state] = {'id': 'SYN-rand-state', 'name': current.state.value}
+        cells[fields.tracked] = {'id': 'SYN-rand-tracked', 'name': 'false'}
+        cells[fields.config_version] = ''
+        with self.assertRaises(ContractError) as caught:
+            decode_loan(current.ref, cells, fields)
+        self.assertEqual(caught.exception.code, Code.EVIDENCE)
+
     def test_select_name_not_id_and_omitted_empty_return(self):
         fields = SYNTHETIC_FIELDS
         current = loan()
