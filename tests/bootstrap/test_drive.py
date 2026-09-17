@@ -20,7 +20,7 @@ from bootstrap.instance import MachineLock
 from bootstrap.journal import FileJournal
 from bootstrap.wizard import main
 from contracts.model import Action, Code, ContractError, Identity, IdentityBinding, Inventory, Resource, State
-from contracts.ports import LedgerScope, RuntimeBinding, StageReceipt
+from contracts.ports import LedgerScope, RuntimeBinding, StageReceipt, stage_operation_id
 from contracts.flow import Outcome
 from workflow.engine import LendingEngine
 
@@ -271,6 +271,120 @@ class DriveTests(unittest.TestCase):
         finally:
             harness.stop()
 
+    def test_stage_reconcile_is_reported_apart_from_recovery(self):
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            borrowed = replace(fixtures.loan(), state=State.BORROWED)
+            harness.reader.set_loan(borrowed)
+            harness.writer.register(borrowed)
+            harness.reader.set_event(borrowed.ref, fixtures.FORM,
+                                     harness.todo_event(Action.ISSUE, ISSUE_TASK))
+            sources = StaticSources((WorkItem('event', borrowed.ref, fixtures.FORM),))
+
+            report = DriveLoop(harness.engine, sources, harness.journal, harness.locks).run()
+            expected = stage_operation_id(borrowed, Action.REQUEST_RETURN)
+
+            # 新建入口是这一轮真实的外写，不是回查：回查数里不能出现它。
+            self.assertEqual(report.recovered, ())
+            self.assertNotIn(expected, report.recovered)
+            self.assertEqual(report.stage_checked, (borrowed.ref,))
+            self.assertEqual(report.stage_created, (expected,))
+            self.assertIn(expected, harness.stages.created)
+
+            lines = format_drive_lines(report)
+            self.assertIn('回查 0，', lines[0])
+            self.assertNotIn('含阶段对账新建', '\n'.join(lines))
+            self.assertEqual(lines[1], '阶段对账：检查 1，新建 1，跳过 0')
+        finally:
+            harness.stop()
+
+    def test_reconcile_reports_unreadable_loan_as_a_visible_skip(self):
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            loan = fixtures.loan()
+            harness.reader.set_loan(loan)
+            harness.writer.register(loan)
+            harness.reader.set_event(loan.ref, fixtures.FORM, harness.event(Action.APPROVE))
+
+            def unreadable(_ref):
+                raise ContractError(Code.EVIDENCE)
+
+            harness.reader.read_loan = unreadable
+            report = DriveLoop(
+                harness.engine, StaticSources((WorkItem('event', loan.ref, fixtures.FORM),)),
+                harness.journal, harness.locks).run()
+
+            stage_skips = [o for o in report.skipped if o.kind == 'stage']
+            self.assertEqual(len(stage_skips), 1)
+            self.assertEqual(stage_skips[0].code, Code.EVIDENCE.value)
+            self.assertEqual(stage_skips[0].loan_id, loan.ref.resource_id)
+            lines = '\n'.join(format_drive_lines(report))
+            self.assertIn(f'跳过 stage loan={loan.ref.resource_id} '
+                          f'stage={loan.ref.resource_id} EVIDENCE_REQUIRED', lines)
+            self.assertIn('阶段对账：检查 1，新建 0，跳过 1', lines)
+            self.assertEqual(harness.stages.created, {})
+        finally:
+            harness.stop()
+
+    def test_reconcile_reports_a_state_without_a_next_human_stage(self):
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            closed = replace(fixtures.loan(), state=State.CLOSED)
+            harness.reader.set_loan(closed)
+            harness.writer.register(closed)
+            harness.reader.set_event(closed.ref, fixtures.FORM, harness.event(Action.APPROVE))
+
+            report = DriveLoop(
+                harness.engine, StaticSources((WorkItem('event', closed.ref, fixtures.FORM),)),
+                harness.journal, harness.locks).run()
+
+            stage_skips = [o for o in report.skipped if o.kind == 'stage']
+            self.assertEqual(len(stage_skips), 1)
+            self.assertEqual(stage_skips[0].code, Code.STATE.value)
+            lines = '\n'.join(format_drive_lines(report))
+            self.assertIn(f'跳过 stage loan={closed.ref.resource_id} '
+                          f'stage={closed.ref.resource_id} INVALID_STATE', lines)
+            self.assertIn('阶段对账：检查 1，新建 0，跳过 1', lines)
+            self.assertEqual(harness.stages.created, {})
+        finally:
+            harness.stop()
+
+    def test_reconcile_covers_a_loan_known_only_from_a_journal_intent(self):
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            issued = replace(fixtures.loan(), state=State.AWAITING_ISSUE)
+            harness.reader.set_loan(issued)
+            harness.writer.register(issued)
+            harness.writer.ledger_stock = Inventory(fixtures.ITEM, 3, 2, 0, (), (), (),
+                                                    'synthetic-rev-1')
+            harness.reader.set_event(issued.ref, ISSUE_TASK,
+                                     harness.todo_event(Action.ISSUE, ISSUE_TASK))
+            # 对账新建的入口会被本轮当作一个来源行再读一次；这里放一条读不出下一步的
+            # 历史待办完成（旧借出确认），让该行只报跳过、不再写台账。
+            harness.reader.set_event(issued.ref, fixtures.FORM,
+                                     harness.todo_event(Action.ISSUE, ISSUE_TASK))
+            empty = StaticSources(())
+
+            # 队列里没有该单、日志里也没有写入意图：对账无从知晓它，什么都不建。
+            before = DriveLoop(harness.engine, empty, harness.journal, harness.locks).run()
+            self.assertEqual(before.stage_checked, ())
+            self.assertEqual(harness.stages.created, {})
+
+            # 本机索引里没有它的记录，只剩日志里先前那次写入意图。
+            harness.engine.execute(issued.ref, ISSUE_TASK)
+
+            report = DriveLoop(harness.engine, empty, harness.journal, harness.locks).run()
+            expected = stage_operation_id(harness.reader.read_loan(issued.ref),
+                                          Action.REQUEST_RETURN)
+            self.assertEqual(report.recovered, ())
+            self.assertEqual(report.stage_checked, (issued.ref,))
+            self.assertEqual(report.stage_created, (expected,))
+            self.assertIn(expected, harness.stages.created)
+            # 对账只补人工入口，不重发台账写入。
+            self.assertEqual(harness.writer.writes, 1)
+        finally:
+            harness.stop()
+
     def test_unknown_result_queries_original_intent_on_restart(self):
         harness = DriveHarness(self.runtime, self.locks)
         try:
@@ -329,7 +443,9 @@ class DriveTests(unittest.TestCase):
             self.approval_written(harness)
             first = DriveLoop(harness.engine, StaticSources(()), harness.journal,
                               harness.locks).run()
-            self.assertEqual(first.skipped, ())
+            # 无下一阶段现在作为可见跳过出现（PR #70），不影响自愈。
+            self.assertEqual([(o.kind, o.code) for o in first.skipped],
+                             [('stage', Code.STATE.value)])
             self.assertEqual(len(first.processed), 1)
             self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state, State.AWAITING_ISSUE)
             self.assertEqual(
@@ -369,7 +485,9 @@ class DriveTests(unittest.TestCase):
                 StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),)),
                 harness.journal, harness.locks).run()
             self.assertEqual(report.processed, ())
-            self.assertEqual(report.skipped, ())
+            # 无下一阶段现在作为可见跳过出现（PR #70），不影响自愈。
+            self.assertEqual([(o.kind, o.code) for o in report.skipped],
+                             [('stage', Code.STATE.value)])
             self.assertEqual(len(report.blocked), 1)
             self.assertEqual(report.blocked[0].code, Code.STATE.value)
             self.assertIn(
