@@ -11,7 +11,7 @@ from pathlib import Path
 
 from contracts.flow import Outcome
 from contracts.model import Action, Code, ContractError, State, require
-from contracts.ports import StageRequest, check_binding
+from contracts.ports import StageRequest, check_binding, stage_operation_id
 from workflow.engine import LendingEngine
 
 from .binding import (binding_from_document, field_maps_from_document,
@@ -139,6 +139,7 @@ class DriveLoop:
     def run(self):
         assert_business_allowed(self.engine.binding, self.engine.lease, self.locks)
         recovered = self._recover()
+        recovered.extend(self._reconcile_stages())
         processed = []
         skipped = []
         blocked = []
@@ -235,6 +236,47 @@ class DriveLoop:
                 return
             current = reserved.loan
         self._ensure_current_stage(current)
+
+    def _known_loans(self):
+        """Loan refs the queue or the journal already mentions, first-seen order."""
+        refs = []
+        seen = set()
+        for item in self._work():
+            if item.loan_ref not in seen:
+                seen.add(item.loan_ref)
+                refs.append(item.loan_ref)
+        return tuple(refs)
+
+    def _reconcile_stages(self):
+        """Create the current stage for known loans that no item drives here.
+
+        A loan can reach a stage-bearing state without this pass witnessing the
+        transition: its queue entries were already consumed, or it was lent out
+        outside the drive. Without the entry the human has nothing to act on and
+        the loan stalls, so reconcile by ``stage_operation_id`` — an existing
+        receipt (verified or unknown) is left alone, never recreated.
+        """
+        created = []
+        for ref in self._known_loans():
+            try:
+                loan = self.engine.reader.read_loan(ref)
+            except ContractError:
+                continue
+            action = _NEXT_STAGE.get(loan.state)
+            if action is None:
+                continue
+            operation_id = stage_operation_id(loan, action)
+            try:
+                _, receipt = self.store.load(operation_id)
+            except Exception:
+                receipt = None
+            if receipt is not None:
+                continue
+            self.locks.assert_held(self.engine.lease)
+            check_binding(self.engine.binding, loan)
+            self.engine.ensure_stage(loan, action)
+            created.append(operation_id)
+        return created
 
     def _ensure_current_stage(self, loan):
         action = _NEXT_STAGE.get(loan.state)
