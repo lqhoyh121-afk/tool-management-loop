@@ -14,7 +14,8 @@ from bootstrap.binding import binding_from_document, load_binding, save_binding
 from contracts.model import Code, ContractError
 from contracts.ports import check_binding
 from integrations.dingtalk.layout import (
-    SYNTHETIC_APPLY_FIELDS, SYNTHETIC_ENTRY_FIELDS, SYNTHETIC_FIELDS)
+    SYNTHETIC_APPLY_FIELDS, SYNTHETIC_ENTRY_FIELDS, SYNTHETIC_FIELDS,
+    SYNTHETIC_RETURN_FORM_FIELDS)
 
 
 def _fixtures():
@@ -46,11 +47,12 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(entry.kind, 'form')
 
     def test_binding_from_document_returns_all_maps(self):
-        binding, entry, fields, entry_fields, apply_fields = binding_from_document(
-            binding_document())
+        binding, entry, fields, entry_fields, apply_fields, return_form_fields = (
+            binding_from_document(binding_document()))
         self.assertEqual(fields, SYNTHETIC_FIELDS)
         self.assertEqual(entry_fields, SYNTHETIC_ENTRY_FIELDS)
         self.assertEqual(apply_fields, SYNTHETIC_APPLY_FIELDS)
+        self.assertEqual(return_form_fields, SYNTHETIC_RETURN_FORM_FIELDS)
         self.assertEqual(entry.kind, 'form')
         self.assertIsNotNone(binding)
 
@@ -84,6 +86,12 @@ class BindingTests(unittest.TestCase):
     def test_missing_apply_fields_is_config_not_fallback(self):
         data = binding_document()
         del data['apply_fields']
+        self.blocked(Code.CONFIG, lambda: save_binding(self.root, data))
+        self.assertFalse((self.root / 'binding.json').exists())
+
+    def test_missing_return_form_fields_is_config_not_fallback(self):
+        data = binding_document()
+        del data['return_form_fields']
         self.blocked(Code.CONFIG, lambda: save_binding(self.root, data))
         self.assertFalse((self.root / 'binding.json').exists())
 
