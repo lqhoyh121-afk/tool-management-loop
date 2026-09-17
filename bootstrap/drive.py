@@ -4,6 +4,11 @@ Does not modify workflow/ or contracts/. The engine and ports are injected.
 Live DingTalk wiring belongs to T07 (dws_cmd must be supplied; this module
 never guesses an install path). Ledger and stage-entry field maps both come
 from binding.json; neither falls back to synthetic IDs.
+
+A crash between the approval write and the system reservation leaves the loan
+in `reservation_pending` with the approval event already consumed, so every
+later pass used to report nothing but DUPLICATE_EVENT. See
+`_finish_pending_reservation`.
 """
 import json
 from dataclasses import dataclass
@@ -27,6 +32,16 @@ _NEXT_STAGE = {
     State.BORROWED: Action.REQUEST_RETURN,
     State.AWAITING_RETURN: Action.RETURN,
 }
+
+
+class _Pending(ContractError):
+    """Half-finished transition the driver must neither retry nor hide.
+
+    Raised only where the ledger is between two external writes and the driver
+    cannot prove enough to finish the step. run() reports it in `blocked`, so
+    the loan stays visible to a human instead of looking like a plain
+    duplicate event on every pass.
+    """
 
 
 @dataclass(frozen=True)
@@ -168,6 +183,10 @@ class DriveLoop:
                 continue
             try:
                 self._handle(item)
+            except _Pending as exc:
+                blocked_loans.add(item.loan_ref)
+                blocked.append(_drive_outcome(item, exc.code.value))
+                continue
             except ContractError as exc:
                 if exc.code == Code.INSTANCE:
                     raise
@@ -240,7 +259,13 @@ class DriveLoop:
             current = self.engine.reader.read_loan(loan_ref)
             self._ensure_current_stage(current)
             return
-        execution = self.engine.execute(loan_ref, item.source)
+        try:
+            execution = self.engine.execute(loan_ref, item.source)
+        except ContractError as exc:
+            if exc.code != Code.DUPLICATE or loan.state != State.RESERVATION_PENDING:
+                raise
+            self._finish_pending_reservation(item, loan)
+            return
         if execution.outcome == Outcome.UNKNOWN:
             raise ContractError(Code.UNKNOWN)
         if execution.outcome != Outcome.VERIFIED:
@@ -248,13 +273,66 @@ class DriveLoop:
         current = execution.loan
         if current.state == State.RESERVATION_PENDING:
             event = self.engine.reader.read_event(current, item.source)
-            reserved = self.engine.reserve(current.ref, event)
-            if reserved.outcome == Outcome.UNKNOWN:
-                raise ContractError(Code.UNKNOWN)
-            if reserved.outcome != Outcome.VERIFIED:
-                return
-            current = reserved.loan
+            self._reserve(current, event)
+            return
         self._ensure_current_stage(current)
+
+    def _reserve(self, loan, event):
+        """Run the system reservation, then expose the next human stage."""
+        reserved = self.engine.reserve(loan.ref, event)
+        if reserved.outcome == Outcome.UNKNOWN:
+            raise ContractError(Code.UNKNOWN)
+        if reserved.outcome != Outcome.VERIFIED:
+            return
+        self._ensure_current_stage(reserved.loan)
+
+    def _finish_pending_reservation(self, item, loan):
+        """审批已写、预留未写：finish the reservation instead of only reporting
+        DUPLICATE_EVENT on every pass.
+
+        The approval event is already in the loan's `consumed_events`, so the
+        engine refuses to re-plan it and the loan would sit in
+        `reservation_pending` with no entry point for a human. The approval write
+        itself is durable in the journal, so the reservation is re-derived from
+        that recorded event (never from a mutable decision row):
+
+        * the reserve event id derives from the approval event id
+          (`LendingEngine.reserve`), so the retry addresses the same
+          operation_id as the original attempt; the store rejects a
+          same-id/different-payload intent and unresolved writes are queried
+          instead of replayed, so nothing is submitted twice;
+        * plan() refuses RESERVE unless the fresh loan read still says
+          `reservation_pending` and the reserve event was never consumed, so an
+          already-applied reservation cannot move stock again;
+        * the stock move is compare-before-write on a fresh inventory read with
+          quantity and physical-id preconditions, not a blind increment.
+
+        Unprovable evidence is reported as a blocked item, never retried.
+        """
+        event = self._recorded_approval(loan, item.source)
+        if event is None:
+            raise _Pending(Code.STATE)
+        self._reserve(loan, event)
+
+    def _recorded_approval(self, loan, source):
+        """The applied approval event for this loan, or None when unprovable.
+
+        Only a readback-verified approval write whose event the ledger already
+        consumed qualifies; zero or several candidates fail closed.
+        """
+        found = []
+        for operation_id in self.store.ids():
+            intent, receipt = self.store.load(operation_id)
+            if isinstance(intent, StageRequest) or intent.event.action != Action.APPROVE:
+                continue
+            if intent.before.ref != loan.ref or intent.event.source != source:
+                continue
+            if receipt is None or receipt.outcome != Outcome.VERIFIED:
+                continue
+            if intent.event.event_id not in loan.consumed_events:
+                continue
+            found.append(intent.event)
+        return found[0] if len(found) == 1 else None
 
     def _known_loans(self):
         """Loan refs the queue or the journal already mentions, first-seen order."""
