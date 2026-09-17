@@ -11,7 +11,7 @@ from pathlib import Path
 
 from contracts.flow import Outcome
 from contracts.model import Action, Code, ContractError, State, require
-from contracts.ports import StageRequest, check_binding
+from contracts.ports import StageRequest, check_binding, stage_operation_id
 from workflow.engine import LendingEngine
 
 from .binding import (binding_from_document, field_maps_from_document,
@@ -81,9 +81,23 @@ def format_outcome_summary(outcomes):
     return f'{len(outcomes)}（{"，".join(parts)}）'
 
 
+def _waiting_on_human(outcomes):
+    """Skips that really mean "the human has not acted yet".
+
+    An open stage todo reads as ``STATE`` from the todo channel (no completion
+    event yet) — the reader marks that case separately on purpose, because a
+    *completed* todo whose evidence is unreadable still comes back as
+    ``EVIDENCE``. Only the former is "等人工"; calling a broken completion
+    "证据不足" would be wrong the other way round.
+    """
+    return tuple(o for o in outcomes
+                 if o.code == Code.STATE.value and o.source_kind == 'todo')
+
+
 def format_drive_lines(report):
+    waiting = _waiting_on_human(report.skipped)
     lines = [
-        '驱动完成。回查 {recovered}，处理 {processed}，跳过 {skipped}，'
+        '驱动完成。回查 {recovered}（含阶段对账新建），处理 {processed}，跳过 {skipped}，'
         '挂起 {blocked}。未盲重发。'.format(
             recovered=len(report.recovered),
             processed=len(report.processed),
@@ -91,6 +105,9 @@ def format_drive_lines(report):
             blocked=format_outcome_summary(report.blocked),
         ),
     ]
+    if waiting:
+        ids = '，'.join(o.source_id for o in waiting)
+        lines.append(f'  其中待人工 {len(waiting)} 条（阶段待办尚未完成，不是证据不足）：{ids}')
     for label, outcomes in (('跳过', report.skipped), ('挂起', report.blocked)):
         for outcome in outcomes:
             lines.append(
@@ -138,10 +155,12 @@ class DriveLoop:
 
     def run(self):
         assert_business_allowed(self.engine.binding, self.engine.lease, self.locks)
-        recovered = self._recover()
         processed = []
         skipped = []
         blocked = []
+        recovered = self._recover()
+        stages_created, stage_skips = self._reconcile_stages()
+        skipped.extend(stage_skips)
         blocked_loans = set(self._unresolved_loans())
         for item in self._work():
             if item.loan_ref in blocked_loans:
@@ -159,6 +178,7 @@ class DriveLoop:
                 skipped.append(_drive_outcome(item, exc.code.value))
                 continue
             processed.append(item)
+        recovered.extend(stages_created)
         return DriveReport(tuple(recovered), tuple(processed), tuple(skipped), tuple(blocked))
 
     def _recover(self):
@@ -235,6 +255,58 @@ class DriveLoop:
                 return
             current = reserved.loan
         self._ensure_current_stage(current)
+
+    def _known_loans(self):
+        """Loan refs the queue or the journal already mentions, first-seen order."""
+        refs = []
+        seen = set()
+        for item in self._work():
+            if item.loan_ref not in seen:
+                seen.add(item.loan_ref)
+                refs.append(item.loan_ref)
+        return tuple(refs)
+
+    def _reconcile_stages(self):
+        """Create the current stage for known loans that no item drives here.
+
+        A loan can reach a stage-bearing state without this pass witnessing the
+        transition: its queue entries were already consumed, or it was lent out
+        outside the drive. Without the entry the human has nothing to act on and
+        the loan stalls, so reconcile by ``stage_operation_id`` — an existing
+        receipt (verified or unknown) is left alone, never recreated.
+
+        Failures stay per-loan: a loan this pass cannot act on becomes one
+        reported skip, exactly like a bad queue item, and never aborts the pass
+        (an abort here would also stop the queue work that follows).
+        """
+        created = []
+        skipped = []
+        for ref in self._known_loans():
+            operation_id = None
+            try:
+                loan = self.engine.reader.read_loan(ref)
+                action = _NEXT_STAGE.get(loan.state)
+                if action is None:
+                    continue
+                operation_id = stage_operation_id(loan, action)
+                try:
+                    _, receipt = self.store.load(operation_id)
+                except KeyError:
+                    receipt = None
+                if receipt is not None:
+                    continue
+                self.locks.assert_held(self.engine.lease)
+                check_binding(self.engine.binding, loan)
+                self.engine.ensure_stage(loan, action)
+            except ContractError as exc:
+                if exc.code == Code.INSTANCE:
+                    raise
+                skipped.append(DriveOutcome('stage', ref.resource_id, 'stage',
+                                            operation_id or ref.resource_id,
+                                            exc.code.value))
+                continue
+            created.append(operation_id)
+        return created, tuple(skipped)
 
     def _ensure_current_stage(self, loan):
         action = _NEXT_STAGE.get(loan.state)

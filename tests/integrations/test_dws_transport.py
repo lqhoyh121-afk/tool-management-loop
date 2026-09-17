@@ -354,6 +354,13 @@ class DwsTransportTests(unittest.TestCase):
             'borrower': borrower,
         })
 
+    def test_form_decision_accepts_chinese_agreement(self):
+        from integrations.dingtalk.adapter import _form_action
+
+        self.assertEqual(_form_action('同意'), Action.APPROVE)
+        self.assertEqual(_form_action('拒绝'), Action.REJECT)
+        self.assertEqual(_form_action('agree'), Action.APPROVE)
+
     def test_loan_query_borrowed_empty_result_is_empty_list(self):
         borrower = encode_loan(loan(), self.fields)[self.fields.borrower][0]['userId']
         payload = self._borrowed_query(borrower)
