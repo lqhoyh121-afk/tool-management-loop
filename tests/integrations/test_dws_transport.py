@@ -250,6 +250,27 @@ class DwsTransportTests(unittest.TestCase):
         self.assertEqual(todo.outcome, Outcome.VERIFIED)
         self.assertEqual(todo.source.container_id, TODO_CONTAINER)
 
+    def test_approve_stage_nudges_the_approver_and_keeps_the_entry_row(self):
+        # 真源 = 入口行：催办待办另用一个操作号，不能顶掉阶段索引里的入口行。
+        request = StageRequest(stage_operation_id(loan(), Action.APPROVE),
+                               loan(), Action.APPROVE, MANAGER)
+        receipt = self.adapter.create_stage(request, self.binding, self.lease)
+        self.assertEqual(receipt.outcome, Outcome.VERIFIED)
+        self.assertEqual(receipt.source.container_id, FORM_CONTAINER)
+        queried = self.transport.exchange('stage.query', {
+            'operation_id': request.operation_id,
+        })
+        self.assertEqual(queried['result']['kind'], 'form')
+        self.assertEqual(queried['result']['resource_id'], receipt.source.resource_id)
+
+        state = load_state(self.state_path)
+        self.assertEqual(len(state['todos']), 1)
+        task_id = next(iter(state['todos']))
+        nudge = self.transport.exchange('stage.query', {'task_id': task_id})
+        self.assertEqual(nudge['result']['kind'], 'todo')
+        self.assertEqual(nudge['result']['action'], Action.APPROVE.value)
+        self.assertEqual(nudge['result']['contact'], MANAGER.user_id)
+
     def test_chat_send_is_mapped(self):
         payload = self.transport.exchange('chat.send', {
             'user': 'synthetic-manager',

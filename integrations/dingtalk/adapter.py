@@ -4,6 +4,10 @@ No credentials, no real platform calls. Tests inject a fake transport.
 Unknown write results stay unknown until an exact query. A query that
 finds both loan and stock still at the pre-write snapshot is NOT_SENT and
 may be retried. Partial writes stay unknown and are not replayed.
+
+Approval truth has exactly one place: the stage entry row's decision column
+(``_read_entry_form_event``). The approver's todo only carries the stage to
+the person — a completed todo is never an approval conclusion.
 """
 from dataclasses import replace
 
@@ -64,6 +68,11 @@ _STAGE_TITLES = {
     Action.REQUEST_RETURN: '【待归还】到期 {due} ｜ 单号 {loan_id} ｜ 归还后请填归还表',
     Action.RETURN: '【待归还确认】请确认已归还 ｜ 单号 {loan_id} ｜ 填：决定 + 发生时间',
 }
+
+# 审批阶段另发一条催办待办给审批人。它的成败不进回执：审批结论的唯一真源是入口行的
+# 「决定」列，待办点没点完成都不能把结论读出来或改掉（只有 ISSUE/RETURN 以待办完成
+# 作为阶段证据，见 `_read_todo_event`）。
+_APPROVER_TODO_ACTIONS = (Action.APPROVE,)
 
 
 def stage_title(loan, action):
@@ -177,23 +186,8 @@ class DingTalkAdapter:
         self.journal.save_receipt(StageReceipt(request.operation_id, Outcome.UNKNOWN))
         command = 'todo.create' if request.action in (Action.ISSUE, Action.RETURN) else 'form.create'
         try:
-            payload = self.transport.exchange(command, {
-                'operation_id': request.operation_id,
-                'tenant_id': request.loan.ref.tenant_id,
-                'loan_container': request.loan.ref.container_id,
-                'loan_id': request.loan.ref.resource_id,
-                'item_container': request.loan.item.container_id,
-                'item_id': request.loan.item.resource_id,
-                'action': request.action.value,
-                'title': stage_title(request.loan, request.action),
-                'actor': request.actor.user_id,
-                'borrower': request.loan.borrower.user_id,
-                'approver': request.loan.approver.user_id,
-                'manager': request.loan.manager.user_id,
-                'config_version': request.loan.config_version,
-                'quantity': request.loan.quantity,
-                'physical_ids': list(request.loan.physical_ids),
-            })
+            payload = self.transport.exchange(command, self._stage_arguments(
+                request, request.operation_id, request.actor.user_id))
             if command == 'todo.create':
                 require_todo_envelope(payload)
             else:
@@ -212,7 +206,51 @@ class DingTalkAdapter:
             receipt = StageReceipt(request.operation_id, Outcome.UNKNOWN)
             self.journal.save_receipt(receipt)
             return receipt
+        if request.action in _APPROVER_TODO_ACTIONS:
+            self._nudge_approver(request)
         return self.query_stage(request)
+
+    def _stage_arguments(self, request: StageRequest, operation_id, actor):
+        """One stage payload; operation id and recipient stay the caller's choice.
+
+        The approver nudge reuses this shape under its own operation id, so it can
+        never take over the stage-index entry the entry row owns.
+        """
+        return {
+            'operation_id': operation_id,
+            'tenant_id': request.loan.ref.tenant_id,
+            'loan_container': request.loan.ref.container_id,
+            'loan_id': request.loan.ref.resource_id,
+            'item_container': request.loan.item.container_id,
+            'item_id': request.loan.item.resource_id,
+            'action': request.action.value,
+            'title': stage_title(request.loan, request.action),
+            'actor': actor,
+            'borrower': request.loan.borrower.user_id,
+            'approver': request.loan.approver.user_id,
+            'manager': request.loan.manager.user_id,
+            'config_version': request.loan.config_version,
+            'quantity': request.loan.quantity,
+            'physical_ids': list(request.loan.physical_ids),
+        }
+
+    def _nudge_approver(self, request: StageRequest):
+        """Send the approver a todo for this stage; the entry row stays the truth.
+
+        Recipient is the loan's approver. This todo carries no authoritative
+        state — the conclusion is read from the entry row's decision column — so
+        its failure is swallowed on purpose: a lost nudge must not report a
+        created entry row as an unverified stage, and it is sent after the entry
+        row exists so nobody is called to a stage that is not there.
+        """
+        try:
+            payload = self.transport.exchange('todo.create', self._stage_arguments(
+                request, f'{request.operation_id}:approver-todo',
+                request.loan.approver.user_id))
+            require_todo_envelope(payload)
+        except DingTalkShapeError:  # 超时、业务拒绝、形态异常：只是催办没发出去
+            return None
+        return payload
 
     def query_stage(self, request: StageRequest) -> StageReceipt:
         try:
