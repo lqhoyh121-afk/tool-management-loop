@@ -38,6 +38,7 @@ def _business_code(exc):
 _FORM_DECISIONS = {
     'apply': Action.APPLY,
     'agree': Action.APPROVE,
+    '同意': Action.APPROVE,
     'reject': Action.REJECT,
     '拒绝': Action.REJECT,
     'cancel': Action.CANCEL,
@@ -407,6 +408,9 @@ class DingTalkAdapter:
                 actor = _identity(cells, fields.manager, loan.ref.tenant_id)
             else:
                 actor = _identity(cells, fields.approver, loan.ref.tenant_id)
+            if not self._cell_has_text(cells, fields.occurred_at):
+                raise MissingFieldError(
+                    '阶段入口缺少「发生时间」：决定与发生时间都要真人填，引擎不预填')
             occurred = read_datetime(cells, fields.occurred_at)
             return_ref = None
             quantity = None

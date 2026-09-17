@@ -81,7 +81,19 @@ def format_outcome_summary(outcomes):
     return f'{len(outcomes)}（{"，".join(parts)}）'
 
 
+def _waiting_on_human(outcomes):
+    """Skips that really mean "the human has not acted yet".
+
+    An open stage todo reads as ``EVIDENCE`` from the todo channel (no completion
+    event yet). Calling that "证据不足" misleads排障, so keep the raw code in the
+    detail lines and count these separately in the summary.
+    """
+    return tuple(o for o in outcomes
+                 if o.code == Code.EVIDENCE.value and o.source_kind == 'todo')
+
+
 def format_drive_lines(report):
+    waiting = _waiting_on_human(report.skipped)
     lines = [
         '驱动完成。回查 {recovered}，处理 {processed}，跳过 {skipped}，'
         '挂起 {blocked}。未盲重发。'.format(
@@ -91,6 +103,9 @@ def format_drive_lines(report):
             blocked=format_outcome_summary(report.blocked),
         ),
     ]
+    if waiting:
+        ids = '，'.join(o.source_id for o in waiting)
+        lines.append(f'  其中待人工 {len(waiting)} 条（阶段待办尚未完成，不是证据不足）：{ids}')
     for label, outcomes in (('跳过', report.skipped), ('挂起', report.blocked)):
         for outcome in outcomes:
             lines.append(
