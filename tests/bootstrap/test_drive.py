@@ -443,7 +443,9 @@ class DriveTests(unittest.TestCase):
             self.approval_written(harness)
             first = DriveLoop(harness.engine, StaticSources(()), harness.journal,
                               harness.locks).run()
-            self.assertEqual(first.skipped, ())
+            # 无下一阶段现在作为可见跳过出现（PR #70），不影响自愈。
+            self.assertEqual([(o.kind, o.code) for o in first.skipped],
+                             [('stage', Code.STATE.value)])
             self.assertEqual(len(first.processed), 1)
             self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state, State.AWAITING_ISSUE)
             self.assertEqual(
@@ -483,7 +485,9 @@ class DriveTests(unittest.TestCase):
                 StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),)),
                 harness.journal, harness.locks).run()
             self.assertEqual(report.processed, ())
-            self.assertEqual(report.skipped, ())
+            # 无下一阶段现在作为可见跳过出现（PR #70），不影响自愈。
+            self.assertEqual([(o.kind, o.code) for o in report.skipped],
+                             [('stage', Code.STATE.value)])
             self.assertEqual(len(report.blocked), 1)
             self.assertEqual(report.blocked[0].code, Code.STATE.value)
             self.assertIn(
