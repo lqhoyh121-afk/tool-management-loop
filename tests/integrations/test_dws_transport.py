@@ -411,7 +411,7 @@ class DwsTransportTests(unittest.TestCase):
         internal = queried['result']['internal_id']
         self.assertNotIn('-', str(internal))
 
-    def test_todo_stage_skips_index_when_post_create_get_unavailable(self):
+    def test_todo_stage_keeps_claimed_task_id_when_post_create_get_unavailable(self):
         original = self.transport._todo_detail_for_stage
         self.transport._todo_detail_for_stage = lambda task_id: None
         try:
@@ -426,9 +426,39 @@ class DwsTransportTests(unittest.TestCase):
             })
             task_id = payload['result']['taskId']
             queried = self.transport.exchange('stage.query', {'task_id': task_id})
-            self.assertEqual(queried['result'], {})
+            self.assertTrue(queried['result']['pending'])
+            self.assertEqual(queried['result']['claimed_task_id'], task_id)
+            self.assertEqual(queried['result']['executor_contact'], MANAGER.user_id)
         finally:
             self.transport._todo_detail_for_stage = original
+
+    def test_claimed_task_id_recovers_via_get_when_list_is_executor_scoped(self):
+        request = self._issue_request()
+        original = self.transport._todo_detail_for_stage
+        self.transport._todo_detail_for_stage = lambda task_id: None
+        try:
+            payload = self.transport.exchange('todo.create', {
+                'tenant_id': LOAN.tenant_id,
+                'actor': MANAGER.user_id,
+                'action': request.action.value,
+                'operation_id': request.operation_id,
+                'loan_container': LOAN.container_id,
+                'loan_id': LOAN.resource_id,
+                'config_version': 'synthetic-config-v1',
+            })
+            task_id = payload['result']['taskId']
+        finally:
+            self.transport._todo_detail_for_stage = original
+        state = load_state(self.state_path)
+        state['login_user'] = 'synthetic-other-login'
+        save_state(self.state_path, state)
+        title = stage_title(request.loan, request.action)
+        self.assertIsNone(self.transport._todo_task_id_by_title(title))
+        queried = self.transport.exchange('stage.query', {'operation_id': request.operation_id})
+        self.assertFalse(queried['result'].get('pending'))
+        self.assertEqual(queried['result']['resource_id'], task_id)
+        self.assertIn('internal_id', queried['result'])
+        self.assertEqual(queried['result']['creation_evidence'], f'todo.task.create:{task_id}')
 
     def test_stage_query_by_task_id(self):
         current = loan()

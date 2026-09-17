@@ -228,8 +228,12 @@ class DwsTransport:
                     '--executors', arguments['actor'],
                     '--yes'] + common
         if command == 'todo.list':
-            return ['todo', 'task', 'list',
-                    '--size', str(arguments['size'])] + common
+            argv = ['todo', 'task', 'list',
+                    '--size', str(arguments['size'])]
+            status = arguments.get('status')
+            if status is not None:
+                argv.extend(['--status', 'true' if status else 'false'])
+            return argv + common
         if command == 'todo.get':
             return ['todo', 'task', 'get',
                     '--task-id', arguments['task_id']] + common
@@ -310,7 +314,9 @@ class DwsTransport:
             return None
         store = self._load_stages()
         store['by_operation'][arguments['operation_id']] = meta
-        store['by_task'][meta['resource_id']] = meta
+        task_key = meta.get('resource_id') or meta.get('claimed_task_id')
+        if isinstance(task_key, str) and task_key:
+            store['by_task'][task_key] = meta
         self._save_stages(store)
         return meta
 
@@ -331,7 +337,8 @@ class DwsTransport:
             meta = {'kind': 'todo',
                     'pending': True,
                     'title': todo_title(arguments),
-                    'container': self.todo_container}
+                    'container': self.todo_container,
+                    'executor_contact': arguments['actor']}
         else:
             meta = {'kind': 'form',
                     'pending': True,
@@ -370,25 +377,30 @@ class DwsTransport:
         if not isinstance(resource_id, str) or not resource_id:
             return None
         detail = self._todo_detail_for_stage(resource_id)
-        if detail is None:
-            return None
-        internal_id = self._todo_internal_id_from_detail(detail)
-        if internal_id is None:
-            return None
-        return {
+        internal_id = (self._todo_internal_id_from_detail(detail)
+                       if detail is not None else None)
+        shared = {
             'kind': 'todo',
-            'resource_id': resource_id,
             'container': self.todo_container,
-            'creation_evidence': f'todo.task.create:{resource_id}',
-            'readback_evidence': f'todo.task.get:{resource_id}',
             'action': arguments['action'],
             'operation_id': arguments['operation_id'],
             'loan_container': arguments['loan_container'],
             'loan_id': arguments['loan_id'],
             'config_version': arguments['config_version'],
             'contact': arguments['actor'],
-            'internal_id': internal_id,
+            'executor_contact': arguments['actor'],
+            'title': todo_title(arguments),
         }
+        if internal_id is not None:
+            return {
+                **shared,
+                'resource_id': resource_id,
+                'creation_evidence': f'todo.task.create:{resource_id}',
+                'readback_evidence': f'todo.task.get:{resource_id}',
+                'internal_id': internal_id,
+            }
+        # Create succeeded but readback is incomplete — keep the known task id.
+        return {**shared, 'pending': True, 'claimed_task_id': resource_id}
 
     def _todo_internal_id_from_detail(self, detail):
         """Executor ID from a ``todo task get`` detail; unreadable is ``None``."""
@@ -418,12 +430,11 @@ class DwsTransport:
         else:
             meta = store['by_task'].get(arguments.get('task_id'))
         if isinstance(meta, dict) and meta.get('pending'):
-            # The create was attempted but never recorded. Adopt the artifact it
-            # may have left behind, by unique title match only.
+            # Adopt the artifact when readback is complete; otherwise surface the
+            # pending record (including any claimed_task_id) for a later retry.
             recovered = self._recover_pending(meta)
-            if recovered is None:
-                return ok_envelope(result={})
-            meta = recovered
+            if recovered is not None:
+                meta = recovered
         if meta is None:
             return ok_envelope(result={})
         return ok_envelope(result=dict(meta))
@@ -431,23 +442,31 @@ class DwsTransport:
     def _recover_pending(self, meta):
         """Adopt an already-created todo for a pending stage, else ``None``.
 
-        Exactly one todo may carry the stage title: zero means nothing landed (or
-        the list is unreadable), two or more means we cannot tell which one is
-        ours. Both stay UNKNOWN — guessing here would either strand the operator
-        or bind the wrong artifact, and creating a second todo is never an option.
+        When ``claimed_task_id`` is known, ``todo task get`` is tried first — the
+        login-scoped list may not show todos whose executor differs from the CLI
+        account. Title matching is only used when no task id was ever recorded.
         """
+        if meta.get('kind') != 'todo':
+            return None
+        claimed = meta.get('claimed_task_id')
+        if isinstance(claimed, str) and claimed:
+            return self._finalize_todo_recovery(meta, claimed)
         title = meta.get('title')
-        if meta.get('kind') != 'todo' or not isinstance(title, str) or not title:
+        if not isinstance(title, str) or not title:
             return None
         task_id = self._todo_task_id_by_title(title)
         if task_id is None:
             return None
+        return self._finalize_todo_recovery(meta, task_id)
+
+    def _finalize_todo_recovery(self, meta, task_id):
         detail = self._todo_detail_for_stage(task_id)
         internal_id = self._todo_internal_id_from_detail(detail)
         if internal_id is None:
             return None
         recovered = dict(meta)
         recovered.pop('pending', None)
+        recovered.pop('claimed_task_id', None)
         recovered['resource_id'] = task_id
         recovered['creation_evidence'] = f'todo.task.create:{task_id}'
         recovered['readback_evidence'] = f'todo.task.get:{task_id}'
@@ -458,11 +477,20 @@ class DwsTransport:
         self._save_stages(store)
         return recovered
 
+    def _todo_list_pairs(self):
+        """Merge incomplete and complete todos; default list status is ambiguous."""
+        merged = {}
+        for done in (False, True):
+            payload = self._run(self._argv(
+                'todo.list', {'size': TODO_LIST_PAGE_SIZE, 'status': done}))
+            for subject, task_id in _todo_cards(payload):
+                merged.setdefault(task_id, subject)
+        return [(subject, task_id) for task_id, subject in merged.items()]
+
     def _todo_task_id_by_title(self, title):
         """Task id of the *only* todo titled ``title``, else ``None``."""
         try:
-            payload = self._run(self._argv('todo.list', {'size': TODO_LIST_PAGE_SIZE}))
-            cards = _todo_cards(payload)
+            cards = self._todo_list_pairs()
         except (UnknownResultError, UnsupportedShapeError,
                 subprocess.TimeoutExpired, OSError):
             return None
