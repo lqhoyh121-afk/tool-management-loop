@@ -83,7 +83,7 @@ def format_outcome_summary(outcomes):
 
 def format_drive_lines(report):
     lines = [
-        '驱动完成。回查 {recovered}，处理 {processed}，跳过 {skipped}，'
+        '驱动完成。回查 {recovered}（含阶段对账新建），处理 {processed}，跳过 {skipped}，'
         '挂起 {blocked}。未盲重发。'.format(
             recovered=len(report.recovered),
             processed=len(report.processed),
@@ -138,11 +138,12 @@ class DriveLoop:
 
     def run(self):
         assert_business_allowed(self.engine.binding, self.engine.lease, self.locks)
-        recovered = self._recover()
-        recovered.extend(self._reconcile_stages())
         processed = []
         skipped = []
         blocked = []
+        recovered = self._recover()
+        stages_created, stage_skips = self._reconcile_stages()
+        skipped.extend(stage_skips)
         blocked_loans = set(self._unresolved_loans())
         for item in self._work():
             if item.loan_ref in blocked_loans:
@@ -160,6 +161,7 @@ class DriveLoop:
                 skipped.append(_drive_outcome(item, exc.code.value))
                 continue
             processed.append(item)
+        recovered.extend(stages_created)
         return DriveReport(tuple(recovered), tuple(processed), tuple(skipped), tuple(blocked))
 
     def _recover(self):
@@ -255,28 +257,39 @@ class DriveLoop:
         outside the drive. Without the entry the human has nothing to act on and
         the loan stalls, so reconcile by ``stage_operation_id`` — an existing
         receipt (verified or unknown) is left alone, never recreated.
+
+        Failures stay per-loan: a loan this pass cannot act on becomes one
+        reported skip, exactly like a bad queue item, and never aborts the pass
+        (an abort here would also stop the queue work that follows).
         """
         created = []
+        skipped = []
         for ref in self._known_loans():
+            operation_id = None
             try:
                 loan = self.engine.reader.read_loan(ref)
-            except ContractError:
+                action = _NEXT_STAGE.get(loan.state)
+                if action is None:
+                    continue
+                operation_id = stage_operation_id(loan, action)
+                try:
+                    _, receipt = self.store.load(operation_id)
+                except KeyError:
+                    receipt = None
+                if receipt is not None:
+                    continue
+                self.locks.assert_held(self.engine.lease)
+                check_binding(self.engine.binding, loan)
+                self.engine.ensure_stage(loan, action)
+            except ContractError as exc:
+                if exc.code == Code.INSTANCE:
+                    raise
+                skipped.append(DriveOutcome('stage', ref.resource_id, 'stage',
+                                            operation_id or ref.resource_id,
+                                            exc.code.value))
                 continue
-            action = _NEXT_STAGE.get(loan.state)
-            if action is None:
-                continue
-            operation_id = stage_operation_id(loan, action)
-            try:
-                _, receipt = self.store.load(operation_id)
-            except Exception:
-                receipt = None
-            if receipt is not None:
-                continue
-            self.locks.assert_held(self.engine.lease)
-            check_binding(self.engine.binding, loan)
-            self.engine.ensure_stage(loan, action)
             created.append(operation_id)
-        return created
+        return created, tuple(skipped)
 
     def _ensure_current_stage(self, loan):
         action = _NEXT_STAGE.get(loan.state)

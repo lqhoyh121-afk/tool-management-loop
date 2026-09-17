@@ -230,6 +230,23 @@ class DriveTests(unittest.TestCase):
         finally:
             harness.stop()
 
+    def test_reconcile_skips_unbindable_loan_without_aborting_pass(self):
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            stale = replace(fixtures.loan(), config_version='stale-config')
+            harness.reader.set_loan(stale)
+            harness.writer.register(stale)
+            sources = StaticSources((WorkItem('event', stale.ref, fixtures.FORM),))
+
+            report = DriveLoop(harness.engine, sources, harness.journal, harness.locks).run()
+
+            stage_skips = [o for o in report.skipped if o.kind == 'stage']
+            self.assertEqual(len(stage_skips), 1)
+            self.assertEqual(stage_skips[0].code, Code.CONFIG.value)
+            self.assertEqual(harness.stages.created, {})
+        finally:
+            harness.stop()
+
     def test_reconcile_creates_missing_return_stage_without_driving_event(self):
         from contracts.ports import stage_operation_id
 
