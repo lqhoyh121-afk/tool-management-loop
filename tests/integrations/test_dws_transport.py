@@ -22,8 +22,9 @@ from t03_memory_transport import MemoryTransport
 from contracts.flow import plan, verify
 from contracts.model import (Action, Code, ContractError, Identity, Outcome,
                              Resource, State)
-from contracts.ports import LedgerScope, RuntimeBinding, StageRequest, stage_operation_id
-from integrations.dingtalk.adapter import DingTalkAdapter
+from contracts.ports import (LedgerScope, RuntimeBinding, StageRequest,
+                             stage_operation_id, verify_stage)
+from integrations.dingtalk.adapter import DingTalkAdapter, stage_title
 from integrations.dingtalk.codec import encode_inventory, encode_loan
 from integrations.dingtalk.dws_transport import (DwsTransport, split_container,
                                                  todo_internal_id,
@@ -427,6 +428,121 @@ class DwsTransportTests(unittest.TestCase):
         self.assertEqual(queried['result']['resource_id'], todo.source.resource_id)
         self.assertEqual(queried['result']['container'], TODO_CONTAINER)
         self.assertEqual(queried['result']['kind'], 'todo')
+
+
+    def _issue_request(self):
+        """Loan driven to the point where ISSUE needs its own todo."""
+        current = loan()
+        inventory = stock()
+        intent = plan(current, event(Action.APPROVE), inventory)
+        receipt = self.adapter.submit(intent, self.binding, self.lease)
+        current, inventory = verify(intent, receipt).loan, receipt.inventory
+        reserve = replace(event(Action.RESERVE), actor=None, evidence_kind='system')
+        intent = plan(current, reserve, inventory)
+        receipt = self.adapter.submit(intent, self.binding, self.lease)
+        current = verify(intent, receipt).loan
+        return StageRequest(stage_operation_id(current, Action.ISSUE),
+                            current, Action.ISSUE, MANAGER)
+
+    def _seed_todo(self, state, task_id, subject):
+        state['todos'][task_id] = {
+            'subject': subject,
+            'detail': {'taskId': task_id, 'isDone': False, 'finishTime': 0,
+                       'executorIds': [9000000199], 'activities': []},
+        }
+
+    def _indexed(self, operation_id):
+        path = self.work / 'runtime' / 'dws-stage-index.json'
+        store = json.loads(path.read_text(encoding='utf-8'))
+        return store['by_operation'].get(operation_id)
+
+    def _landed_without_receipt(self, request):
+        """First attempt whose write lands live while the envelope never returns."""
+        state = load_state(self.state_path)
+        state['late_write'] = ['todo task create']
+        save_state(self.state_path, state)
+        self.transport.timeout = 0.3
+        try:
+            return self.adapter.create_stage(request, self.binding, self.lease)
+        finally:
+            self.transport.timeout = 30
+            state = load_state(self.state_path)
+            state['late_write'] = []
+            save_state(self.state_path, state)
+
+    def _unreachable_attempt(self, request, seeded=()):
+        """First attempt that never reaches the todo space at all."""
+        state = load_state(self.state_path)
+        for task_id, subject in seeded:
+            self._seed_todo(state, task_id, subject)
+        state['timeout'] = ['todo task create']
+        save_state(self.state_path, state)
+        self.transport.timeout = 0.3
+        try:
+            return self.adapter.create_stage(request, self.binding, self.lease)
+        finally:
+            self.transport.timeout = 30
+            state = load_state(self.state_path)
+            state['timeout'] = []
+            save_state(self.state_path, state)
+
+    def test_unknown_todo_receipt_is_recovered_by_unique_title(self):
+        request = self._issue_request()
+        first = self._landed_without_receipt(request)
+        self.assertEqual(first.outcome, Outcome.UNKNOWN)
+        self.assertEqual(first.creation_evidence, '')
+        landed = load_state(self.state_path)['todos']
+        self.assertEqual(len(landed), 1)
+        task_id, todo = next(iter(landed.items()))
+        self.assertEqual(todo['subject'], stage_title(request.loan, request.action))
+        indexed = self._indexed(request.operation_id)
+        self.assertTrue(indexed['pending'])
+        self.assertEqual(indexed['title'], todo['subject'])
+        again = self.adapter.create_stage(request, self.binding, self.lease)
+        self.assertEqual(again.outcome, Outcome.VERIFIED)
+        self.assertEqual(verify_stage(request, again), Outcome.VERIFIED)
+        self.assertEqual(again.source.resource_id, task_id)
+        self.assertEqual(again.creation_evidence, f'todo.task.create:{task_id}')
+        self.assertEqual(again.readback_evidence, f'todo.task.get:{task_id}')
+        self.assertEqual(len(load_state(self.state_path)['todos']), 1)
+
+    def test_unknown_todo_receipt_without_a_title_match_stays_unknown(self):
+        request = self._issue_request()
+        first = self._unreachable_attempt(
+            request, seeded=[('SYNTHETIC-todo-9001', 'other-stage:subject')])
+        self.assertEqual(first.outcome, Outcome.UNKNOWN)
+        self.assertTrue(self._indexed(request.operation_id)['pending'])
+        retried = self.adapter.create_stage(request, self.binding, self.lease)
+        self.assertEqual(retried.outcome, Outcome.UNKNOWN)
+        self.assertIsNone(retried.source)
+        self.assertEqual(retried.creation_evidence, '')
+        todos = load_state(self.state_path)['todos']
+        self.assertEqual(sorted(todos), ['SYNTHETIC-todo-9001'])
+
+    def test_two_todos_sharing_the_stage_title_stay_unknown(self):
+        request = self._issue_request()
+        title = stage_title(request.loan, request.action)
+        first = self._unreachable_attempt(
+            request, seeded=[('SYNTHETIC-todo-9001', title),
+                             ('SYNTHETIC-todo-9002', title)])
+        self.assertEqual(first.outcome, Outcome.UNKNOWN)
+        self.assertTrue(self._indexed(request.operation_id)['pending'])
+        retried = self.adapter.create_stage(request, self.binding, self.lease)
+        self.assertEqual(retried.outcome, Outcome.UNKNOWN)
+        self.assertEqual(sorted(load_state(self.state_path)['todos']),
+                         ['SYNTHETIC-todo-9001', 'SYNTHETIC-todo-9002'])
+
+    def test_todo_list_that_admits_more_pages_is_not_a_match(self):
+        request = self._issue_request()
+        first = self._landed_without_receipt(request)
+        self.assertEqual(first.outcome, Outcome.UNKNOWN)
+        self.assertTrue(self._indexed(request.operation_id)['pending'])
+        state = load_state(self.state_path)
+        state['list_more'] = True
+        save_state(self.state_path, state)
+        retried = self.adapter.create_stage(request, self.binding, self.lease)
+        self.assertEqual(retried.outcome, Outcome.UNKNOWN)
+        self.assertEqual(len(load_state(self.state_path)['todos']), 1)
 
 
     def _seed_row(self, ref, **changes):

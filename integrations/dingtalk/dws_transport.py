@@ -19,6 +19,11 @@ from .errors import DingTalkShapeError, UnsupportedShapeError, UnknownResultErro
 from contracts.model import Code, ContractError, Identity, require, text
 
 
+# One page is enough to prove a stage title is absent; a reply that admits more
+# pages is rejected instead of being read as "no match".
+TODO_LIST_PAGE_SIZE = 100
+
+
 def split_container(container_id):
     """Ledger container_id is baseId/tableId. Other shapes are unobserved."""
     if not isinstance(container_id, str) or container_id.count('/') != 1:
@@ -101,6 +106,51 @@ def todo_internal_id(raw):
     return None
 
 
+def todo_title(arguments):
+    """Title sent to ``todo task create``; doubles as the recovery key.
+
+    The CLI falls back to ``action:operation_id`` when no title is supplied.
+    Either way the value identifies exactly one stage, so a later readback may
+    search the todo space for it.
+    """
+    title = arguments.get('title')
+    if isinstance(title, str) and title:
+        return title
+    return f"{arguments['action']}:{arguments['operation_id']}"
+
+
+def _todo_cards(payload):
+    """``(subject, taskId)`` pairs from ``todo task list``; odd shapes fail closed.
+
+    An unreadable list is **not** an empty list: the caller has to keep the
+    stage unknown instead of concluding the artifact does not exist.
+    """
+    if not isinstance(payload, dict):
+        raise UnsupportedShapeError('todo task list 未返回对象报文')
+    result = payload.get('result')
+    if not isinstance(result, dict):
+        raise UnsupportedShapeError('todo task list 报文缺少 result')
+    if result.get('hasMore') or result.get('nextToken'):
+        raise UnsupportedShapeError('todo task list 分页未拉完，拒绝按不完整结果匹配')
+    cards = result.get('todoCards')
+    if cards is None:
+        cards = []
+    elif not isinstance(cards, list):
+        raise UnsupportedShapeError('todo task list 的 todoCards 不是数组')
+    pairs = []
+    for card in cards:
+        if not isinstance(card, dict):
+            raise UnsupportedShapeError('todo task list 的卡片不是对象')
+        subject = card.get('subject')
+        task_id = card.get('taskId')
+        if not isinstance(subject, str) or not subject:
+            raise UnsupportedShapeError('todo task list 的卡片缺少 subject')
+        if not isinstance(task_id, str) or not task_id:
+            raise UnsupportedShapeError('todo task list 的卡片缺少 taskId')
+        pairs.append((subject, task_id))
+    return pairs
+
+
 class DwsTransport:
     """Transport.exchange adapter for node-invoked dws.js (or a test double)."""
 
@@ -134,14 +184,17 @@ class DwsTransport:
                 return self._stage_query(arguments)
             argv = self._argv(command, arguments)
             payload = self._run(argv)
-        except subprocess.TimeoutExpired:
-            return None
-        except OSError:
-            return None
-        except UnknownResultError:
-            return None
-        if command in ('form.create', 'todo.create') and payload is not None:
-            self._remember_stage(command, arguments, payload)
+        except (subprocess.TimeoutExpired, OSError, UnknownResultError):
+            payload = None
+        if command in ('form.create', 'todo.create'):
+            # No envelope, or an envelope we cannot turn into a durable stage
+            # record: the create may still have landed. Remember the attempt so
+            # stage.query can adopt the existing artifact instead of building a
+            # second one. Never a blind retry.
+            meta = None if payload is None else self._remember_stage(
+                command, arguments, payload)
+            if meta is None:
+                self._remember_attempt(command, arguments)
         return payload
 
     def _argv(self, command, arguments):
@@ -171,9 +224,12 @@ class DwsTransport:
                     '--yes'] + common
         if command == 'todo.create':
             return ['todo', 'task', 'create',
-                    '--title', arguments.get('title') or f"{arguments['action']}:{arguments['operation_id']}",
+                    '--title', todo_title(arguments),
                     '--executors', arguments['actor'],
                     '--yes'] + common
+        if command == 'todo.list':
+            return ['todo', 'task', 'list',
+                    '--size', str(arguments['size'])] + common
         if command == 'todo.get':
             return ['todo', 'task', 'get',
                     '--task-id', arguments['task_id']] + common
@@ -251,10 +307,42 @@ class DwsTransport:
         else:
             meta = self._todo_stage_meta(arguments, payload)
         if meta is None:
-            return
+            return None
         store = self._load_stages()
         store['by_operation'][arguments['operation_id']] = meta
         store['by_task'][meta['resource_id']] = meta
+        self._save_stages(store)
+        return meta
+
+    def _remember_attempt(self, command, arguments):
+        """Record a create that produced no usable receipt, keyed by its target.
+
+        The write may have landed before the envelope was lost. Keeping the
+        attempt (todo title included) is what lets ``stage.query`` adopt that
+        already-created artifact by a unique title match later. Nothing here
+        creates anything, and an indexed stage is never downgraded.
+        """
+        store = self._load_stages()
+        operation_id = arguments.get('operation_id')
+        known = store['by_operation'].get(operation_id)
+        if isinstance(known, dict) and known.get('resource_id'):
+            return
+        if command == 'todo.create':
+            meta = {'kind': 'todo',
+                    'pending': True,
+                    'title': todo_title(arguments),
+                    'container': self.todo_container}
+        else:
+            meta = {'kind': 'form',
+                    'pending': True,
+                    'container': self.form_container}
+        meta.update({'action': arguments['action'],
+                     'operation_id': operation_id,
+                     'loan_container': arguments['loan_container'],
+                     'loan_id': arguments['loan_id'],
+                     'config_version': arguments['config_version'],
+                     'contact': arguments['actor']})
+        store['by_operation'][operation_id] = meta
         self._save_stages(store)
 
     def _form_stage_meta(self, arguments, payload):
@@ -284,10 +372,7 @@ class DwsTransport:
         detail = self._todo_detail_for_stage(resource_id)
         if detail is None:
             return None
-        executors = detail.get('executorIds') or []
-        if not executors:
-            return None
-        internal_id = todo_internal_id(executors[0])
+        internal_id = self._todo_internal_id_from_detail(detail)
         if internal_id is None:
             return None
         return {
@@ -304,6 +389,15 @@ class DwsTransport:
             'contact': arguments['actor'],
             'internal_id': internal_id,
         }
+
+    def _todo_internal_id_from_detail(self, detail):
+        """Executor ID from a ``todo task get`` detail; unreadable is ``None``."""
+        if not isinstance(detail, dict):
+            return None
+        executors = detail.get('executorIds') or []
+        if not isinstance(executors, list) or not executors:
+            return None
+        return todo_internal_id(executors[0])
 
     def _todo_detail_for_stage(self, task_id):
         """Re-read todo after create; live create may not return todo internal executorIds."""
@@ -323,9 +417,59 @@ class DwsTransport:
             meta = store['by_operation'].get(arguments['operation_id'])
         else:
             meta = store['by_task'].get(arguments.get('task_id'))
+        if isinstance(meta, dict) and meta.get('pending'):
+            # The create was attempted but never recorded. Adopt the artifact it
+            # may have left behind, by unique title match only.
+            recovered = self._recover_pending(meta)
+            if recovered is None:
+                return ok_envelope(result={})
+            meta = recovered
         if meta is None:
             return ok_envelope(result={})
         return ok_envelope(result=dict(meta))
+
+    def _recover_pending(self, meta):
+        """Adopt an already-created todo for a pending stage, else ``None``.
+
+        Exactly one todo may carry the stage title: zero means nothing landed (or
+        the list is unreadable), two or more means we cannot tell which one is
+        ours. Both stay UNKNOWN — guessing here would either strand the operator
+        or bind the wrong artifact, and creating a second todo is never an option.
+        """
+        title = meta.get('title')
+        if meta.get('kind') != 'todo' or not isinstance(title, str) or not title:
+            return None
+        task_id = self._todo_task_id_by_title(title)
+        if task_id is None:
+            return None
+        detail = self._todo_detail_for_stage(task_id)
+        internal_id = self._todo_internal_id_from_detail(detail)
+        if internal_id is None:
+            return None
+        recovered = dict(meta)
+        recovered.pop('pending', None)
+        recovered['resource_id'] = task_id
+        recovered['creation_evidence'] = f'todo.task.create:{task_id}'
+        recovered['readback_evidence'] = f'todo.task.get:{task_id}'
+        recovered['internal_id'] = internal_id
+        store = self._load_stages()
+        store['by_operation'][recovered['operation_id']] = recovered
+        store['by_task'][task_id] = recovered
+        self._save_stages(store)
+        return recovered
+
+    def _todo_task_id_by_title(self, title):
+        """Task id of the *only* todo titled ``title``, else ``None``."""
+        try:
+            payload = self._run(self._argv('todo.list', {'size': TODO_LIST_PAGE_SIZE}))
+            cards = _todo_cards(payload)
+        except (UnknownResultError, UnsupportedShapeError,
+                subprocess.TimeoutExpired, OSError):
+            return None
+        matches = [task_id for subject, task_id in cards if subject == title]
+        if len(matches) != 1:
+            return None
+        return matches[0]
 
     def _loan_query_borrowed(self, arguments):
         """Borrowed loans of one borrower, via ``aitable record query --all``.
