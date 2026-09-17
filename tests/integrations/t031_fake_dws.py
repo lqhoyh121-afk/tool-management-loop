@@ -124,7 +124,7 @@ SPECS = {
     },
     'todo task list': {
         'required': {'--size', '--format'},
-        'optional': set(),
+        'optional': {'--status'},
     },
     'todo task get': {
         'required': {'--task-id', '--format'},
@@ -286,7 +286,8 @@ def main(argv):
             'activities': [],
         }
         state['todos'][task_id] = {'detail': detail,
-                                   'subject': flag(argv, '--title')}
+                                   'subject': flag(argv, '--title'),
+                                   'executor_contact': flag(argv, '--executors')}
         save_state(state_path, state)
         if 'todo task create' in state.get('late_write', ()):
             # The live write can land while the envelope never comes back.
@@ -296,8 +297,18 @@ def main(argv):
         return 0
     if argv[:3] == ['todo', 'task', 'list']:
         size = int(flag(argv, '--size'))
+        status_flag = flag(argv, '--status')
+        login_user = state.get('login_user')
         cards = []
         for task_id, todo in state['todos'].items():
+            detail = todo.get('detail') or {}
+            if status_flag is not None:
+                want_done = status_flag.lower() == 'true'
+                if bool(detail.get('isDone')) != want_done:
+                    continue
+            if login_user is not None:
+                if todo.get('executor_contact') != login_user:
+                    continue
             cards.append({
                 'subject': todo.get('subject'),
                 'taskId': task_id,
