@@ -16,7 +16,8 @@ from t031_fake_dws import load_state, save_state
 from t03_layout import entry_fields_from
 
 from contracts.flow import plan, verify
-from contracts.model import Action, Code, ContractError, Outcome, Resource, State
+from contracts.model import (Action, Code, ContractError, Identity, Outcome,
+                             Resource, State)
 from contracts.ports import LedgerScope, RuntimeBinding, StageRequest, stage_operation_id
 from integrations.dingtalk.adapter import DingTalkAdapter
 from integrations.dingtalk.codec import encode_inventory, encode_loan
@@ -336,6 +337,57 @@ class DwsTransportTests(unittest.TestCase):
         self.assertEqual(queried['result']['resource_id'], todo.source.resource_id)
         self.assertEqual(queried['result']['container'], TODO_CONTAINER)
         self.assertEqual(queried['result']['kind'], 'todo')
+
+
+    def _seed_row(self, ref, **changes):
+        state = load_state(self.state_path)
+        current = replace(loan(), ref=ref, **changes)
+        state['records'][f'{ref.container_id}/{ref.resource_id}'] = encode_loan(
+            current, self.fields)
+        save_state(self.state_path, state)
+        return current
+
+    def _borrowed_query(self, borrower):
+        return self.transport.exchange('loan.query_borrowed', {
+            'tenant_id': LOAN.tenant_id,
+            'loan_container': LOAN.container_id,
+            'borrower': borrower,
+        })
+
+    def test_loan_query_borrowed_empty_result_is_empty_list(self):
+        borrower = encode_loan(loan(), self.fields)[self.fields.borrower][0]['userId']
+        payload = self._borrowed_query(borrower)
+        self.assertEqual(payload['result']['loan_ids'], [])
+
+    def test_loan_query_borrowed_returns_only_this_borrower(self):
+        mine = self._seed_row(LOAN, state=State.BORROWED)
+        borrower = encode_loan(mine, self.fields)[self.fields.borrower][0]['userId']
+        other = Resource('record', LOAN.tenant_id, LOAN.container_id, 'recOther')
+        self._seed_row(other, state=State.BORROWED,
+                       borrower=Identity('contact', LOAN.tenant_id, 'other-user'))
+        closed = Resource('record', LOAN.tenant_id, LOAN.container_id, 'recClosed')
+        self._seed_row(closed, state=State.CLOSED)
+        payload = self._borrowed_query(borrower)
+        self.assertEqual(payload['result']['loan_ids'], [LOAN.resource_id])
+
+    def test_loan_query_borrowed_fails_closed_when_truncated(self):
+        mine = self._seed_row(LOAN, state=State.BORROWED)
+        borrower = encode_loan(mine, self.fields)[self.fields.borrower][0]['userId']
+        state = load_state(self.state_path)
+        state['query_truncated'] = True
+        save_state(self.state_path, state)
+        self.blocked(Code.EVIDENCE, lambda: self._borrowed_query(borrower))
+
+    def test_loan_query_borrowed_fails_closed_on_unreadable_row(self):
+        mine = self._seed_row(LOAN, state=State.BORROWED)
+        borrower = encode_loan(mine, self.fields)[self.fields.borrower][0]['userId']
+        state = load_state(self.state_path)
+        slot = f'{LOAN.container_id}/{LOAN.resource_id}'
+        cells = dict(state['records'][slot])
+        cells.pop(self.fields.borrower, None)
+        state['records'][slot] = cells
+        save_state(self.state_path, state)
+        self.blocked(Code.EVIDENCE, lambda: self._borrowed_query(borrower))
 
 
 if __name__ == '__main__':
