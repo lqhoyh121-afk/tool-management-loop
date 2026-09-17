@@ -333,14 +333,15 @@ class DriveTests(unittest.TestCase):
     def test_summary_separates_waiting_on_human_from_missing_evidence(self):
         from bootstrap.drive import DriveOutcome, DriveReport, format_drive_lines
 
-        waiting = DriveOutcome('event', 'recLoan', 'todo', 'task-1', 'EVIDENCE_REQUIRED')
+        waiting = DriveOutcome('event', 'recLoan', 'todo', 'task-1', Code.STATE.value)
         broken = DriveOutcome('event', 'recLoan', 'form', 'row-1', 'EVIDENCE_REQUIRED')
         lines = '\n'.join(format_drive_lines(DriveReport((), (), (waiting, broken), ())))
 
         self.assertIn('待人工 1 条', lines)
         self.assertIn('不是证据不足', lines)
         self.assertIn('task-1', lines)
-        self.assertIn('EVIDENCE_REQUIRED×2', lines)
+        self.assertIn('EVIDENCE_REQUIRED×1', lines)
+        self.assertIn(f'{Code.STATE.value}×1', lines)
 
     def test_missing_binding_fails_closed(self):
         empty = self.root / 'empty-runtime'

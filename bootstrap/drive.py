@@ -84,12 +84,14 @@ def format_outcome_summary(outcomes):
 def _waiting_on_human(outcomes):
     """Skips that really mean "the human has not acted yet".
 
-    An open stage todo reads as ``EVIDENCE`` from the todo channel (no completion
-    event yet). Calling that "证据不足" misleads排障, so keep the raw code in the
-    detail lines and count these separately in the summary.
+    An open stage todo reads as ``STATE`` from the todo channel (no completion
+    event yet) — the reader marks that case separately on purpose, because a
+    *completed* todo whose evidence is unreadable still comes back as
+    ``EVIDENCE``. Only the former is "等人工"; calling a broken completion
+    "证据不足" would be wrong the other way round.
     """
     return tuple(o for o in outcomes
-                 if o.code == Code.EVIDENCE.value and o.source_kind == 'todo')
+                 if o.code == Code.STATE.value and o.source_kind == 'todo')
 
 
 def format_drive_lines(report):

@@ -448,7 +448,9 @@ class DingTalkAdapter:
         except DingTalkShapeError as exc:
             _closed(exc, Code.UNKNOWN)
         events = completion_events(detail)
-        require(bool(events), Code.EVIDENCE)
+        # 待办还没被点完成：这是「等人工」，不是「证据不足」。驱动按本码区分，
+        # 不要把未完成和「已完成但证据读不出来」混成一句提示。
+        require(bool(events), Code.STATE)
         actors = {item.actor.value for item in events}
         require(len(actors) == 1, Code.EVIDENCE)
         actor_ref = events[0].actor
