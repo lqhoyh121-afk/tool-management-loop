@@ -54,6 +54,7 @@ def load_state(path):
             'todos': {},
             'fail': {},
             'timeout': [],
+            'late_write': [],
             'seq': {'form': 0, 'todo': 0, 'internal': 9000000100},
         }
     return json.loads(path.read_text(encoding='utf-8'))
@@ -109,6 +110,10 @@ SPECS = {
     },
     'todo task create': {
         'required': {'--title', '--executors', '--yes', '--format'},
+        'optional': set(),
+    },
+    'todo task list': {
+        'required': {'--size', '--format'},
         'optional': set(),
     },
     'todo task get': {
@@ -294,10 +299,31 @@ def main(argv):
             'executorIds': [internal],
             'activities': [],
         }
-        state['todos'][task_id] = {'detail': detail}
+        state['todos'][task_id] = {'detail': detail,
+                                   'subject': flag(argv, '--title')}
         save_state(state_path, state)
+        if 'todo task create' in state.get('late_write', ()):
+            # The live write can land while the envelope never comes back.
+            time.sleep(120)
         print(json.dumps(todo_ok(result={'taskId': task_id, 'todoDetailModel': detail}),
                          ensure_ascii=True))
+        return 0
+    if argv[:3] == ['todo', 'task', 'list']:
+        size = int(flag(argv, '--size'))
+        cards = []
+        for task_id, todo in state['todos'].items():
+            cards.append({
+                'subject': todo.get('subject'),
+                'taskId': task_id,
+                'createdTime': 0,
+                'dueTime': 0,
+                'finalStatusStage': 0,
+                'priority': 0,
+            })
+        result = {'todoCards': cards[:size]}
+        if state.get('list_more'):
+            result['hasMore'] = True
+        print(json.dumps(todo_ok(result=result), ensure_ascii=True))
         return 0
     if argv[:3] == ['todo', 'task', 'get']:
         task_id = flag(argv, '--task-id')
