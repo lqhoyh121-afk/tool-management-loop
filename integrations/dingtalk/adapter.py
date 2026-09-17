@@ -8,6 +8,8 @@ may be retried. Partial writes stay unknown and are not replayed.
 from dataclasses import replace
 
 from contracts.flow import Receipt, verify
+from datetime import timedelta, timezone
+
 from contracts.model import (Action, Code, ContractError, Event, Identity,
                              IdentityBinding, Outcome, Resource, State, require, text)
 from contracts.ports import StageReceipt, StageRequest, check_binding, verify_stage
@@ -72,11 +74,12 @@ def stage_title(loan, action):
     stage index). Unknown actions fall back to the business单号 only.
     """
     template = _STAGE_TITLES.get(action)
+    shanghai = timezone(timedelta(hours=8))
     if template is None:
         return f'{action.value} ｜ 单号 {loan.ref.resource_id}'
     return template.format(quantity=loan.quantity,
                            loan_id=loan.ref.resource_id,
-                           due=loan.due_at.strftime('%Y-%m-%d %H:%M'))
+                           due=loan.due_at.astimezone(shanghai).strftime('%Y-%m-%d %H:%M'))
 
 
 class DingTalkAdapter:

@@ -367,13 +367,44 @@ class DwsTransportTests(unittest.TestCase):
         self.assertEqual(payload['result']['loan_ids'], [])
 
     def test_stage_todo_title_is_human_readable(self):
+        # 只有 ISSUE / RETURN 阶段会发待办（标题才会被人看到），断这两个真模板。
         from integrations.dingtalk.adapter import stage_title
 
         current = replace(loan(), state=State.BORROWED)
-        title = stage_title(current, Action.REQUEST_RETURN)
-        self.assertIn('待归还', title)
-        self.assertIn(current.ref.resource_id, title)
-        self.assertNotIn('request_return:', title)
+        for action, marker in ((Action.ISSUE, '待领用确认'), (Action.RETURN, '待归还确认')):
+            title = stage_title(current, action)
+            self.assertIn(marker, title)
+            self.assertIn(current.ref.resource_id, title)
+            self.assertNotIn('confirm_issue:', title)
+            self.assertNotIn('confirm_return:', title)
+
+    def test_stage_title_renders_due_in_shanghai(self):
+        from datetime import timedelta, timezone
+
+        from integrations.dingtalk.adapter import stage_title
+
+        current = loan()
+        utc = replace(current, state=State.BORROWED, due_at=current.due_at.astimezone(timezone.utc))
+        title = stage_title(utc, Action.REQUEST_RETURN)
+        expected = utc.due_at.astimezone(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
+        self.assertIn(expected, title)
+
+    def test_only_todo_stages_carry_a_title(self):
+        # 事实：form.create 不带标题（审批/归还请求只有入口行），todo.create 才带。
+        form = self.transport._argv('form.create', {
+            'operation_id': 'op-1', 'action': 'approve', 'actor': 'someone',
+            'tenant_id': LOAN.tenant_id, 'loan_container': LOAN.container_id,
+            'loan_id': LOAN.resource_id, 'item_container': ITEM.container_id,
+            'item_id': ITEM.resource_id, 'borrower': 'x', 'approver': 'x', 'manager': 'x',
+            'config_version': 'c', 'quantity': 1, 'physical_ids': [],
+            'title': '【待审批】…',
+        })
+        self.assertNotIn('--title', form)
+        todo = self.transport._argv('todo.create', {
+            'action': 'confirm_issue', 'operation_id': 'op-1', 'actor': 'someone',
+            'title': '【待领用确认】…',
+        })
+        self.assertIn('--title', todo)
 
     def test_todo_create_uses_given_title_and_falls_back(self):
         given = self.transport._argv('todo.create', {

@@ -227,3 +227,9 @@ python -B -m unittest discover -s tests/bootstrap -p "test_*.py" -v
 4. 导入确认不写钉钉；主账落盘仍走 T03 连接层与 T07 本机回读。
 5. 锁目录被崩溃占用时停止，不要删除不明锁去抢写。
 6. 字段级权限、OA、并发、跨机器未验证。
+
+## 阶段待办的覆盖面与索引
+
+- 阶段待办标题**只覆盖两个阶段**：待领用确认（`ISSUE`）、待归还确认（`RETURN`）。待审批（`APPROVE`）与待归还请求（`REQUEST_RETURN`）走入口行（`form.create`），**没有待办、也没有标题** —— 审批人收不到待办，这里不承诺「提示会送到审批人眼前」。
+- `runtime/dws-stage-index.json` 是阶段索引（操作号 ↔ 钉钉 task id）：`todo task create` 没有描述字段可以放操作号，**该文件不可删**，删了就再也对不回「unknown 但待办已建出」的单。
+- **一单一行一轮**：`stage_operation_id` 对同一条台账行永久唯一，所以同一条行二次借出（人工把状态与 `consumed_events` 清回再走一遍）**不会再建任何入口** —— 需要重跑时请新建台账行，而不是复用旧行。
