@@ -48,8 +48,17 @@ class KindsError(Exception):
 #: the four production field maps appear here exactly once, so a field added to a map
 #: without a declared shape fails ``t03_kinds_guard`` loudly instead of silently
 #: passing through.
+#:
+#: ``item`` is #77's optional「归还物品」cell on the return form. The read side
+#: (``DingTalkAdapter._return_item_value``) takes the ``{id, name}`` object of the
+#: single-select question and matches on ``.name`` (a plain string, which the live
+#: pre-#77 rows and a text field in that slot would produce, is tolerated too), so the
+#: declared read shape is ``singleSelect`` — the shape the double must materialize. The
+#: live type is *not* observed: that question is added by a human on the form view and
+#: the stage-entry table does not carry it yet, which is what the fixture's
+#: 「真机类型未观测」note records.
 _KINDS = (
-    (SINGLE_SELECT, ('state', 'tracked', 'decision')),
+    (SINGLE_SELECT, ('state', 'tracked', 'decision', 'item')),
     (PERSON, ('borrower', 'approver', 'manager')),
     (NUMBER, ('quantity', 'available', 'reserved', 'borrowed')),
     (DATETIME, ('due_at', 'occurred_at')),

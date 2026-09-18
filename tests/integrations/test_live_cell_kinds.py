@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from t031_fake_dws import load_state, save_state
 from t03_kinds_guard import (KindsGuardError, check, live_type_fixture,
-                             observed_live_types, verify)
+                             observed_live_types, unobserved_notes, verify)
 from t03_layout import entry_fields_from
 from t03_live_cells import (DATETIME, KINDS_DECLARATION, KindsError, NUMBER, PERSON,
                             SINGLE_SELECT, TEXT, declared_kinds, validate_state_kinds)
@@ -112,14 +112,20 @@ class KindsDeclarationTests(unittest.TestCase):
         self.assertEqual(sites.sites['occurred_at'], {DATETIME, TEXT})
         self.assertEqual(sites.sites['return_container'], {TEXT})
         self.assertEqual(sites.sites['return_id'], {TEXT})
+        # #77 的可选「归还物品」格：`_return_item_value` 按单选对象读（纯字符串也容忍）。
+        self.assertEqual(sites.sites['item'], {SINGLE_SELECT})
 
     def test_no_production_reader_call_lives_outside_the_scanned_roots(self):
         self.assertEqual(reader_sources_outside(), [])
 
     def test_the_observation_fixture_covers_every_declared_field(self):
+        """Every declared field is observed, or has a written「真机类型未观测」reason."""
         observed = observed_live_types()
-        self.assertEqual(sorted(set(declared()) - set(observed)), [])
+        noted = {attribute for table in unobserved_notes(live_type_fixture()).values()
+                  for attribute in table}
+        self.assertEqual(sorted(set(declared()) - set(observed) - noted), [])
         self.assertNotIn('', observed)
+        self.assertNotIn('', noted)
 
     def test_the_observation_fixture_lists_a_table_for_every_field_map(self):
         fixture = live_type_fixture()
@@ -184,6 +190,42 @@ class KindsDeclarationTests(unittest.TestCase):
         problems = check(fixture=fixture)
         self.assertTrue(
             mentions(problems, 'physical_ids', '既没有观测，也没有'), problems)
+
+    def test_the_optional_return_item_rests_on_its_written_gap_note(self):
+        """#77's「归还物品」cell (#83 sync): a single-select whose live type is not observed.
+
+        The question is added by a human on the return form view and the stage-entry
+        table does not carry it yet, so the declaration rests on the fixture's
+        「真机类型未观测」note — not on a guessed live type, and not on a pass-through.
+        """
+        self.assertEqual(declared()['item'], SINGLE_SELECT)
+        self.assertNotIn('item', observed_live_types())
+        fixture = live_type_fixture()
+        self.assertIn('item', fixture['unobserved']['stage_entry'])
+        self.assertNotIn('item', fixture['tables']['stage_entry'])
+        self.assertEqual(
+            declared_kinds(SYNTHETIC_RETURN_FORM_FIELDS)['fldSYN-return-item'],
+            SINGLE_SELECT)
+
+    def test_dropping_the_gap_note_for_an_unobserved_field_fails_loudly(self):
+        fixture = json.loads(json.dumps(live_type_fixture()))
+        fixture['unobserved']['stage_entry'].pop('item')
+        problems = check(fixture=fixture)
+        self.assertTrue(mentions(problems, 'item', '没有真机字段类型观测'), problems)
+        self.assertTrue(mentions(problems, 'item', '既没有观测，也没有'), problems)
+
+    def test_a_blank_gap_note_does_not_excuse_a_missing_observation(self):
+        """A「未观测」note without a reason is the silent pass-through #73 removes."""
+        fixture = json.loads(json.dumps(live_type_fixture()))
+        fixture['unobserved']['stage_entry']['item'] = '   '
+        problems = check(fixture=fixture)
+        self.assertTrue(mentions(problems, 'item', '没有真机字段类型观测'), problems)
+        self.assertTrue(mentions(problems, 'item', '既没有观测，也没有'), problems)
+
+    def test_a_gap_note_never_excuses_a_shape_the_read_side_does_not_speak(self):
+        """The note buys the missing observation only; the read side still rules."""
+        problems = check(declaration=redeclared(item=TEXT))
+        self.assertTrue(mentions(problems, 'item', '读侧却按 singleSelect 读'), problems)
 
     def test_a_live_type_contradiction_fails_loudly(self):
         """#73 item 3: had the platform answered `singleSelect`, this must go red."""

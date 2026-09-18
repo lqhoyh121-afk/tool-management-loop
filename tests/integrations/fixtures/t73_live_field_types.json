@@ -62,6 +62,9 @@
   "unobserved": {
     "application_form": {
       "physical_ids": "本机 binding 的 apply_fields.physical_ids 是 unset:physical_ids，该表上没有这个字段，真机类型未观测；借用台账与阶段入口两张表已观测为 text。"
+    },
+    "stage_entry": {
+      "item": "#77 的可选「归还物品」格。这一格是人在这张表的表单视图上手工加的单选题（开放接口不提供建题能力，见 docs/deployment.md），本机该表当前只有 14 个字段、没有这一格（本次只读 field get 复核：return_id / 归还时间 / action / 借用人 / return_container / approver / manager / quantity / decision / physical_ids / operation_id / loan_id / loan_container / config_version），所以真机类型未观测，无从观测。读侧 DingTalkAdapter._return_item_value() 取 {id,name} 单选对象的 .name（纯字符串也容忍），声明为 singleSelect；等这一格真的上线，再做一次只读观测把它挪进 tables.stage_entry 并删掉本条注记。"
     }
   }
 }

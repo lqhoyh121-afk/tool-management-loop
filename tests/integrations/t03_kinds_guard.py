@@ -12,6 +12,11 @@ it to the things it can silently disagree with (#73):
    read-only in :file:`fixtures/t73_live_field_types.json`, so a field the platform
    serves as ``singleSelect`` is never declared or read as text.
 
+A declared field with no live observation at all is only accepted when the fixture
+carries a「真机类型未观测」note *with a reason* for it: a field that does not exist on
+the live table yet (a question a human still has to add on the form view, #77) is a
+written gap, not a silent one. A blank or missing reason excuses nothing.
+
 :func:`check` returns the problems it found (tests assert on them); :func:`verify`
 raises :class:`KindsGuardError`.
 
@@ -69,6 +74,30 @@ def observed_live_types(fixture=None):
     return {attribute: frozenset(types) for attribute, types in union.items()}
 
 
+def unobserved_notes(fixture):
+    """``{table: {attribute: reason}}``, keeping only notes that give a real reason.
+
+    The fixture may record a field whose live type could not be observed; that record
+    is what lets such a field be declared at all (``item``, #77 — the「归还物品」
+    question a human still has to add on the form view). It only counts with a
+    non-empty reason: "not observed" without saying why is the silent pass-through
+    this guard exists to stop, so a bare note excuses neither a missing observation
+    nor a hole in the per-map table check.
+    """
+    notes = {}
+    for table, missing in (fixture.get('unobserved') or {}).items():
+        if isinstance(missing, dict):
+            entries = missing.items()
+        elif isinstance(missing, (list, tuple, set)):
+            entries = [(attribute, '') for attribute in missing]
+        else:
+            entries = []
+        for attribute, reason in entries:
+            if isinstance(reason, str) and reason.strip():
+                notes.setdefault(table, {})[attribute] = reason
+    return notes
+
+
 def declared_shapes(declaration):
     """``({attribute: shape}, problems)`` for a declaration, refusing duplicates."""
     declared, problems = {}, []
@@ -97,6 +126,7 @@ def check(declaration=None, map_attrs=None, observed=None, sites=None, fixture=N
     found = []
     declared, declaration_problems = declared_shapes(declaration)
     found.extend(declaration_problems)
+    notes = unobserved_notes(fixture)
 
     for attribute in sorted(map_attrs - set(declared)):
         found.append(
@@ -123,8 +153,11 @@ def check(declaration=None, map_attrs=None, observed=None, sites=None, fixture=N
     for attribute, shape in sorted(declared.items()):
         live = observed.get(attribute)
         if not live:
+            if any(attribute in table_notes for table_notes in notes.values()):
+                continue  # 已写明未观测原因（如 #77 还没上线的可选格），不是静默缺观测
             found.append(
-                f'没有真机字段类型观测就声明了读形态：{attribute}（先做只读 field get 观测）'
+                f'没有真机字段类型观测就声明了读形态：{attribute}'
+                '（先做只读 field get 观测；真机上还没有这一格，就在夹具 unobserved 里写明原因）'
             )
             continue
         unknown = live - SHAPE_ACCEPTS[shape]
@@ -153,7 +186,7 @@ def check(declaration=None, map_attrs=None, observed=None, sites=None, fixture=N
                 found.append(f'{class_name} 指向的表 {table} 没有观测记录')
                 continue
             known.update(tables[table])
-            known.update(gaps.get(table, {}))
+            known.update(notes.get(table, {}))
         for attribute in sorted(by_class[class_name] - known):
             found.append(
                 f'{class_name} 的字段 {attribute} 在 {table_names} 上既没有观测，'
