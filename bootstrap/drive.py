@@ -535,9 +535,34 @@ def start_engine(reader, writer, stages, store, locks, binding):
     return engine
 
 
+def title_display_from_document(document):
+    """绑定里可选的 ``title_display`` 段（issue #76）。没配就返回 None。
+
+    这一段只影响待办标题好不好读，不参与任何结论：字段 ID 与表单链接都是本机值，
+    不进仓库；一个键都没给（或全是空串）时返回 None，标题保持之前的样子。
+    """
+    from integrations.dingtalk.adapter import TitleDisplay
+
+    raw = document.get('title_display')
+    if raw is None:
+        return None
+    require(isinstance(raw, dict), Code.CONFIG)
+    item_name_field = raw.get('item_name_field', '')
+    borrower_names = raw.get('borrower_names', False)
+    approve_entry_url = raw.get('approve_entry_url', '')
+    require(isinstance(item_name_field, str) and isinstance(approve_entry_url, str),
+            Code.CONFIG)
+    require(type(borrower_names) is bool, Code.CONFIG)
+    display = TitleDisplay(item_name_field, borrower_names, approve_entry_url)
+    if not display.names_enabled and not display.approve_entry_url.strip():
+        return None
+    return display
+
+
 def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=None,
                  apply_fields=None, application_container=None,
-                 return_form_fields=None, loan_container=None):
+                 return_form_fields=None, loan_container=None,
+                 title_display=None):
     """Build DingTalkAdapter only from explicit binding fields. Never guess dws."""
     from integrations.dingtalk.adapter import DingTalkAdapter
     from integrations.dingtalk.dws_transport import DwsTransport
@@ -562,6 +587,8 @@ def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=No
     if loan_container is None:
         loan_container = document.get('loan_container')
         require(isinstance(loan_container, str) and loan_container.strip(), Code.CONFIG)
+    if title_display is None:
+        title_display = title_display_from_document(document)
     transport = DwsTransport(
         cmd, fields, form_container=form_container, todo_container=todo_container,
         work_dir=runtime, entry_fields=entry_fields,
@@ -570,7 +597,7 @@ def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=No
         transport, journal, locks, fields, entry_fields,
         apply_fields=apply_fields, application_container=application_container,
         return_form_fields=return_form_fields, entry_container=form_container,
-        loan_container=loan_container,
+        loan_container=loan_container, title_display=title_display,
     )
 
 
