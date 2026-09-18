@@ -1,5 +1,6 @@
 """Persist a confirmed RuntimeBinding. Never overwrite, never treat ready as binding."""
 import json
+from datetime import datetime
 from pathlib import Path
 
 from contracts.model import Code, ContractError, Identity, Resource, require, text
@@ -84,7 +85,12 @@ def require_complete(binding):
 
 
 def field_maps_from_document(data):
-    """Ledger FieldMap and stage-entry EntryFieldMap are both required. No fallback."""
+    """Ledger FieldMap and stage-entry EntryFieldMap are both required. No fallback.
+
+    ``return_form_fields.item`` is the one optional key: it is the「归还物品」
+    question (#77). Leaving it out (or empty) is a config, not a defect — the
+    return form then matches on the borrower alone, as it did before #77.
+    """
     require(isinstance(data, dict), Code.INVALID)
     raw_fields = data.get('fields')
     raw_entry = data.get('entry_fields')
@@ -101,7 +107,39 @@ def field_maps_from_document(data):
         return_form_fields = ReturnFormFieldMap(**raw_return)
     except TypeError as exc:
         raise ContractError(Code.CONFIG) from exc
+    # A key that is bound to something that is not a field id must not read as
+    # "not bound": that would silently drop the item narrowing the operator asked for.
+    require(isinstance(return_form_fields.item, str), Code.CONFIG)
     return fields, entry_fields, apply_fields, return_form_fields
+
+
+def intake_since_from_document(document):
+    """申请自动发现的启用水位（``application_intake.since``），没配时返回 None。
+
+    水位 = 「从这一刻起提交的申请才自动登记」。它必须是带时区的时刻：不带时区的时间
+    会被静默当成另一个时刻，比不配更糟。**配了但读不出来是 CONFIG，不当作没配** ——
+    否则一个拼错的键名会静默退回「没配」这个保守默认，操作员以为已经启用。
+
+    没配水位时发现只出报告、不建行（见 ``bootstrap.inbox``）：首次启用时表里已有的
+    历史行本机无从辨认，误建一次就会推出早已处理完的审批待办。
+    """
+    require(isinstance(document, dict), Code.INVALID)
+    raw = document.get('application_intake')
+    if raw is None:
+        return None
+    require(isinstance(raw, dict), Code.CONFIG)
+    require(set(raw) <= {'since'}, Code.CONFIG)
+    value = raw.get('since')
+    if value is None:
+        return None
+    require(isinstance(value, str) and bool(value.strip()) and value == value.strip(),
+            Code.CONFIG)
+    try:
+        since = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ContractError(Code.CONFIG) from exc
+    require(isinstance(since, datetime) and since.utcoffset() is not None, Code.CONFIG)
+    return since
 
 
 def load_binding(runtime):

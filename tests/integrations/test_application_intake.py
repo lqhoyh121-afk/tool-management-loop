@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from t03_memory_transport import MemoryTransport
 
 from bootstrap.drive import DriveLoop, FileSources
-from bootstrap.inbox import REGISTER_NAME, ApplicationIntake
+from bootstrap.inbox import (REGISTER_NAME, ApplicationIntake, format_intake_lines)
 from bootstrap.instance import MachineLock
 from bootstrap.journal import FileJournal
 from contracts.model import Code, ContractError, Resource, State
@@ -52,6 +52,28 @@ BORROWER, ITEM, NOW = fixtures.BORROWER, fixtures.ITEM, fixtures.NOW
 MANAGER = fixtures.MANAGER
 APPLY_CONTAINER = 'synthetic-apply-forms'
 LOAN_CONTAINER = 'synthetic-loans'
+#: 启用水位（#78 第 2 条）：早于替身申请行的申请时间。
+WATERMARK = NOW - timedelta(days=3)
+#: 水位之前的历史申请：启用当天表里往往已经有这种行。
+HISTORIC = NOW - timedelta(days=5)
+
+
+class ShapeChangingTransport(MemoryTransport):
+    """内存替身 + 能把申请扫描的报文换成一个「读不到」的形态。
+
+    真机上 ``record query --all`` 在表为空时回 ``records: null`` 且 ``hasMore: false``；
+    形态变了（或查询失败回了 null）是另一回事，必须 fail closed，不能被读成空表。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.list_payload = None
+
+    def exchange(self, command, arguments):
+        if command == 'application.list' and self.list_payload is not None:
+            self.calls.append((command, dict(arguments)))
+            return self.list_payload
+        return super().exchange(command, arguments)
 
 
 class IntakeAdapterTests(unittest.TestCase):
@@ -311,7 +333,8 @@ class AutoIntakeDriveTests(unittest.TestCase):
         self.runtime.mkdir(parents=True)
         self.locks = MachineLock(self.root / 'locks')
         self.store = FileJournal(self.runtime / 'operations')
-        self.transport = MemoryTransport(
+        self.since = WATERMARK
+        self.transport = ShapeChangingTransport(
             SYNTHETIC_FIELDS, SYNTHETIC_ENTRY_FIELDS, apply_container=APPLY_CONTAINER,
             apply_fields=SYNTHETIC_APPLY_FIELDS)
         self.adapter = DingTalkAdapter(
@@ -330,18 +353,20 @@ class AutoIntakeDriveTests(unittest.TestCase):
                                self.locks, binding)
         engine.start(binding.ledger, binding.account)
         intake = ApplicationIntake(engine, self.adapter, self.sources, self.store,
-                                   self.locks, self.runtime / REGISTER_NAME)
+                                   self.locks, self.runtime / REGISTER_NAME,
+                                   since=self.since)
         return engine, DriveLoop(engine, self.sources, self.store, self.locks, intake=intake)
 
     def tearDown(self):
         self.temp.cleanup()
 
-    def submit(self, row_id='synthetic-apply-row-1'):
+    def submit(self, row_id='synthetic-apply-row-1', occurred=None):
         cells = {
             SYNTHETIC_APPLY_FIELDS.borrower: _put_identity(BORROWER),
             SYNTHETIC_APPLY_FIELDS.quantity: '2',
             SYNTHETIC_APPLY_FIELDS.physical_ids: '[]',
-            SYNTHETIC_APPLY_FIELDS.occurred_at: (NOW - timedelta(days=1)).isoformat(),
+            SYNTHETIC_APPLY_FIELDS.occurred_at: (
+                NOW - timedelta(days=1) if occurred is None else occurred).isoformat(),
             SYNTHETIC_APPLY_FIELDS.item_container: ITEM.container_id,
             SYNTHETIC_APPLY_FIELDS.item_id: ITEM.resource_id,
             SYNTHETIC_APPLY_FIELDS.due_at: (NOW + timedelta(days=2)).isoformat(),
@@ -396,3 +421,78 @@ class AutoIntakeDriveTests(unittest.TestCase):
              len(self.transport.writes_of('form.create')),
              len(self.transport.writes_of('todo.create'))), first)
         self.assertEqual(len(self.sources.pending()), 1)
+
+    def test_empty_table_is_reported_as_empty_not_unreadable(self):
+        """表真的空：报告要写明查的哪张表、回读到 0 行、确实为空（#78 第 3 条）。"""
+        engine, loop = self.start()
+        try:
+            report = loop.run()
+        finally:
+            engine.stop()
+        self.assertEqual(report.intake.scanned, 0)
+        self.assertEqual(report.intake.scan_code, '')
+        self.assertEqual(report.intake.container, APPLY_CONTAINER)
+        self.assertEqual(self.transport.writes_of('loan.create'), [])
+        text = '\n'.join(format_intake_lines(report.intake))
+        self.assertIn(f'container={APPLY_CONTAINER}', text)
+        self.assertIn('回读 0 行', text)
+        self.assertIn('确实为空', text)
+        self.assertNotIn('未读到申请表', text)
+
+    def test_a_shape_change_is_not_read_as_an_empty_table(self):
+        """``records: null`` 但没有 ``hasMore``：fail closed，绝不读成「今天没人申请」。"""
+        self.submit()
+        engine, loop = self.start()
+        self.transport.list_payload = {'records': None}
+        try:
+            report = loop.run()
+        finally:
+            engine.stop()
+        self.assertEqual(report.intake.scan_code, Code.EVIDENCE.value)
+        self.assertEqual(report.intake.scanned, 0)
+        self.assertEqual(report.intake.findings, ())
+        self.assertEqual(self.transport.writes_of('loan.create'), [])
+        self.assertEqual(self.sources.pending(), ())
+        text = '\n'.join(format_intake_lines(report.intake))
+        self.assertIn('未读到申请表', text)
+        self.assertNotIn('确实为空', text)
+
+    def test_history_before_the_watermark_is_never_built_or_registered(self):
+        """水位之前的历史行：不建台账行、不登记、不推待办（#78 第 2 条）。"""
+        old = self.submit('synthetic-apply-row-old', occurred=HISTORIC)
+        fresh = self.submit('synthetic-apply-row-new')
+        engine, loop = self.start()
+        try:
+            report = loop.run()
+        finally:
+            engine.stop()
+        self.assertEqual(report.intake.scanned, 2)
+        self.assertEqual(report.intake.history, (old.resource_id,))
+        self.assertEqual([finding.source.resource_id for finding in report.intake.findings],
+                         [fresh.resource_id])
+        self.assertEqual(len(self.transport.writes_of('loan.create')), 1)
+        self.assertEqual(len(self.transport.writes_of('form.create')), 1)
+        self.assertEqual(len(self.transport.writes_of('todo.create')), 1)
+        self.assertEqual([item.source.resource_id for item in self.sources.pending()],
+                         [fresh.resource_id])
+
+    def test_no_watermark_builds_nothing_and_says_what_to_configure(self):
+        """不配水位 = 只出报告（dry-run）：表里 3 行也不得建出 3 行。"""
+        self.submit('synthetic-apply-row-1')
+        self.submit('synthetic-apply-row-2', occurred=HISTORIC)
+        self.submit('synthetic-apply-row-3')
+        self.since = None
+        engine, loop = self.start()
+        try:
+            report = loop.run()
+        finally:
+            engine.stop()
+        self.assertEqual(report.intake.scanned, 3)
+        self.assertEqual(report.intake.findings, ())
+        self.assertEqual([skip.code for skip in report.intake.skipped],
+                         [Code.CONFIG.value] * 3)
+        self.assertEqual(self.transport.writes_of('loan.create'), [])
+        self.assertEqual(self.sources.pending(), ())
+        text = '\n'.join(format_intake_lines(report.intake))
+        self.assertIn('水位未配置', text)
+        self.assertIn('application_intake.since', text)

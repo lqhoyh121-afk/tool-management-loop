@@ -6,12 +6,18 @@
 
 * **幂等** —— 一行申请只出一条台账行、一条队列引用。判定依据是本机已有引用
   （工作队列 + 操作日志 + 本机登记册）与台账行自己的「申请证据」格
-  （``form:<申请行 id>``）：重启、重跑、同一行被扫两次都只多一条。
+  （``form:<申请行 id>``）：重启、重跑、同一行被扫两次都只多一条。**建行之前先按
+  链路键查台账侧**：登记册在运行目录里，丢了不代表台账行没建过，所以查不到才允许
+  新建（`_create`）。
+* **有水位** —— 只处理申请时间（`apply_fields.occurred_at`）≥ 启用水位的行。水位是
+  绑定里的 ``application_intake.since``；**没配水位就一行都不建**（只出报告），因为
+  「表里哪些行是启用前就存在的历史行」本机无从判断，而一次误批量建行会推出早已
+  处理完的审批待办。水位之前的行单独记账（``history``），既不是跳过原因也不是失败。
 * **fail closed** —— 读不全、必填缺失、字段映射没配、同一行重复出现、上次写入结果
   不明，一律**不猜**：按跳过记账并给出原因码；结果不明时下一轮只按链路键**认领**
   已建出的行，绝不重发一次新建。
-* **脱敏** —— 报告只出现申请行 id、台账行 id 与原因码；人名、数量等真实值只留在本机
-  运行目录（登记册与队列文件里）。
+* **脱敏** —— 报告只出现申请行 id、台账行 id、结果表容器与原因码；人名、数量等真实
+  值只留在本机运行目录（登记册与队列文件里）。
 
 闸门不变：登记前先过 ``assert_business_allowed``（绑定 + 机器租约），新建/认领的台账行
 必须再回读一次并满足 ``check_binding``；审批人与管理人只来自绑定，不来自申请行。
@@ -23,7 +29,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from contracts.model import Code, ContractError, Resource, State, require
+from contracts.model import Code, ContractError, Resource, State, aware, require
 from contracts.ports import check_binding
 from integrations.dingtalk.application import application_marker
 
@@ -65,10 +71,12 @@ class IntakeSkip:
 
 @dataclass(frozen=True)
 class IntakeReport:
-    """一轮发现的账目：扫描 / 本机已有引用 / 本轮登记 / 跳过。
+    """一轮发现的账目：扫描 / 本机已有引用 / 本轮登记 / 跳过 / 历史行。
 
-    ``scan_code`` 非空表示扫描本身没跑完（读表失败等），此时没有任何登记发生 ——
-    缺表不等于空表。
+    ``scan_code`` 非空表示扫描本身没跑完（读表失败、发现阶段抛异常等），此时没有
+    任何登记发生 —— 缺表不等于空表。``container`` 是本轮查的结果表，``scanned``
+    就是这次回读到的行数：0 行且没有 ``scan_code`` 才是「表真的为空」。``history``
+    是水位之前的历史行 id（不建行、不登记）。``since`` 是本轮用的水位（未配时为空）。
     """
 
     scanned: int = 0
@@ -76,15 +84,36 @@ class IntakeReport:
     findings: tuple = ()
     skipped: tuple = ()
     scan_code: str = ''
+    scan_note: str = ''
+    container: str = ''
+    history: tuple = ()
+    since: str = ''
 
 
 def format_intake_lines(report):
-    """报告文本：只有计数、平台记录 id 与原因码，不含人名/数量/业务值。"""
+    """报告文本：只有计数、平台记录 id、结果表容器与原因码，不含人名/数量/业务值。"""
     lines = ['申请发现：扫描 {scanned}，本机已有 {known}，本轮登记 {new}，跳过 {skipped}'.format(
         scanned=report.scanned, known=report.known,
         new=len(report.findings), skipped=len(report.skipped))]
+    if report.container:
+        # 查的哪张表、回读到几行、是不是真为空：扫描 0 行必须与「读不到」区分开。
+        verdict = ''
+        if not report.scan_code:
+            verdict = ('（读表成功，本次回读 0 行 = 结果表当前确实为空，不是读不到）'
+                       if report.scanned == 0 else '（读表成功）')
+        lines.append('  来源：申请表 container={container}，本次回读 {rows} 行{verdict}'.format(
+            container=report.container, rows=report.scanned, verdict=verdict))
     if report.scan_code:
-        lines.append(f'  跳过 申请 row=- {report.scan_code}（本轮未读到申请表，未登记任何申请）')
+        lines.append('  跳过 申请 row=- {code}（{note}，本轮未登记任何申请）'.format(
+            code=report.scan_code, note=report.scan_note or '本轮未读到申请表'))
+    if report.since:
+        lines.append(f'  水位：只处理申请时间 ≥ {report.since} 的申请行')
+    elif not report.scan_code:
+        lines.append('  水位未配置：本轮只出报告、不建任何台账行（dry-run）；'
+                     '在绑定里配 application_intake.since 之后才会自动登记新申请')
+    if report.history:
+        lines.append('  历史行（申请时间在水位之前，不建行也不登记）：{ids}'.format(
+            ids='，'.join(report.history)))
     for finding in report.findings:
         lines.append(f'  登记 申请 row={finding.source.resource_id}')
     for skip in report.skipped:
@@ -128,31 +157,42 @@ class InboxRegister:
 
 
 class ApplicationIntake:
-    """一轮申请发现。所有写入都在绑定与机器租约之下。"""
+    """一轮申请发现。所有写入都在绑定与机器租约之下。
 
-    def __init__(self, engine, port, sources, store, locks, register_path):
+    ``since`` 是启用水位（``application_intake.since``，带时区）：只处理申请时间在
+    水位之后的申请行；**没配水位就一行都不建**，只出报告。第一次启用时表里已有的行
+    在文件里没有任何记载（本机登记册、队列、日志全都不认识它们），所以「首轮要不要
+    把它们当新申请」本机没有判据 —— 一律不建是刻意的保守默认。
+    """
+
+    def __init__(self, engine, port, sources, store, locks, register_path, since=None):
         self.engine = engine
         self.port = port
         self.sources = sources
         self.store = store
         self.locks = locks
         self.register = InboxRegister(register_path)
+        if since is not None:
+            aware(since)
+        self.since = since
 
     def run(self):
         assert_business_allowed(self.engine.binding, self.engine.lease, self.locks)
         entries = self.register.entries()
         known_ids = self._known_row_ids(entries)
+        container = getattr(self.port, 'application_container', '')
         try:
             rows = self.port.pending_applications(self.engine.binding.account.tenant_id)
         except ContractError as exc:
             if exc.code == Code.INSTANCE:
                 raise
-            return IntakeReport(skipped=(IntakeSkip('-', exc.code.value),),
+            return self._report(container, skipped=(IntakeSkip('-', exc.code.value),),
                                 scan_code=exc.code.value)
         scanned = 0
         known = 0
         findings = []
         skipped = []
+        history = []
         seen = set()
         for row in rows:
             scanned += 1
@@ -187,19 +227,50 @@ class ApplicationIntake:
             if row_id in known_ids:
                 known += 1
                 continue
+            if self.since is None:
+                # 没有水位就不建：首次启用不得把表里的历史行全建成台账行。
+                skipped.append(IntakeSkip(row_id, Code.CONFIG.value))
+                continue
             try:
-                loan_ref = self._create(row_id, row)
+                draft = self.port.read_application(row)
+            except ContractError as exc:
+                if exc.code == Code.INSTANCE:
+                    raise
+                skipped.append(IntakeSkip(row_id, exc.code.value))
+                continue
+            if draft.occurred_at < self.since:
+                # 水位之前的行是申请启用前就存在的历史行：不处理、不建行，单独记账。
+                history.append(row_id)
+                continue
+            try:
+                loan_ref = self._create(row_id, row, draft)
             except ContractError as exc:
                 if exc.code == Code.INSTANCE:
                     raise
                 skipped.append(IntakeSkip(row_id, exc.code.value))
                 continue
             findings.append(RegisteredApply(row, loan_ref))
-        return IntakeReport(scanned=scanned, known=known, findings=tuple(findings),
-                            skipped=tuple(skipped))
+        return self._report(container, scanned=scanned, known=known,
+                            findings=tuple(findings), skipped=tuple(skipped),
+                            history=tuple(history))
 
-    def _create(self, row_id, row):
-        draft = self.port.read_application(row)
+    def _report(self, container, **fields):
+        return IntakeReport(container=container, since=self._since_text(), **fields)
+
+    def _since_text(self):
+        return '' if self.since is None else self.since.isoformat()
+
+    def _create(self, row_id, row, draft):
+        """新行入册：先按链路键查台账侧，命中的直接认领，未命中才发新建。
+
+        登记册是本机文件，删掉/换机之后它不认识任何行，而台账行里的「申请证据」格
+        （``form:<申请行 id>``）仍然认识 —— 那才是幂等判据。所以建行之前必须先精确
+        查一次：查不到任何行才允许新建，查得到就只登记（不重发）。
+        """
+        existing = self.port.find_application_loan(row, self.engine.lease)
+        if existing is not None:
+            self._commit(row_id, row, existing)
+            return existing
         # 先记账再发写：崩溃或结果不明时下一轮按链路键认领，不会第二条。
         self.register.mark_creating(row_id)
         loan_ref = self.port.create_application_loan(

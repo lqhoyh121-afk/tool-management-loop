@@ -14,6 +14,7 @@ class Code(StrEnum):
     STATE = "INVALID_STATE"
     DUPLICATE = "DUPLICATE_EVENT"
     QUANTITY = "QUANTITY_MISMATCH"
+    DUE = "DUE_AT_MISMATCH"
     IDENTIFIERS = "PHYSICAL_IDS_REQUIRED"
     CONFLICT = "RESERVATION_CONFLICT"
     UNKNOWN = "WRITE_UNKNOWN_QUERY_FIRST"
@@ -204,6 +205,9 @@ class Event:
     quantity: int | None = None
     physical_ids: tuple[str, ...] = ()
     evidence_ref: str = ""
+    #: 申请行上的归还时间（申请入口的「归还时间」格）。表单没声明这一格时为 None，
+    #: 受理侧据此不做比对 —— 声明了就必须与台账行一致，申请后改时间不算「同一笔申请」。
+    due_at: datetime | None = None
 
     def __post_init__(self):
         require(isinstance(self.action, Action))
@@ -215,3 +219,5 @@ class Event:
         require(isinstance(self.evidence_ref, str))
         if self.quantity is not None:
             quantity(self.quantity)
+        if self.due_at is not None:
+            aware(self.due_at)

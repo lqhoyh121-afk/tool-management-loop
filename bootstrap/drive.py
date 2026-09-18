@@ -11,7 +11,7 @@ later pass used to report nothing but DUPLICATE_EVENT. See
 `_finish_pending_reservation`.
 """
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from contracts.flow import Outcome
@@ -20,9 +20,10 @@ from contracts.ports import StageRequest, check_binding, stage_operation_id
 from workflow.engine import LendingEngine
 
 from .binding import (binding_from_document, field_maps_from_document,
-                      read_binding_document, require_complete)
+                      intake_since_from_document, read_binding_document, require_complete)
 from .gate import assert_business_allowed
-from .inbox import REGISTER_NAME, ApplicationIntake, format_intake_lines
+from .inbox import (REGISTER_NAME, ApplicationIntake, IntakeReport, IntakeSkip,
+                    format_intake_lines)
 from .instance import MachineLock
 from .journal import FileJournal
 from .snapshot import decode_resource, encode_resource
@@ -75,10 +76,17 @@ class DriveReport:
     holds the known loan refs the reconcile examined. Reconcile skips travel in
     ``skipped`` like every other skip, tagged ``kind='stage'``.
 
+    ``healed`` is not a fourth bucket: every healed loan also appears in
+    ``processed``, because the pass really did write its reservation. The entry
+    carries the read failure the queue row reported (``code``), which is why the
+    heal ran, and never decided whether it ran.
+
     ``intake`` is the application discovery account for this pass (issue #78) or
     None when discovery is not wired. Discovered applications enter the queue
     like any other work item; the account only says what was scanned,
-    registered and skipped.
+    registered and skipped. A discovery that blew up is reported inside that
+    account (``scan_code``), never as a failed pass: the recovery and the stage
+    reconcile below still run on the work the queue already holds.
     """
 
     recovered: tuple
@@ -87,7 +95,17 @@ class DriveReport:
     blocked: tuple
     stage_checked: tuple = ()
     stage_created: tuple = ()
+    healed: tuple = ()
     intake: object = None
+
+
+def _failed_intake(code, note='发现扫描抛异常，本轮未登记'):
+    """发现阶段没跑完的账目：本轮不登记任何申请，但这一轮照常继续。
+
+    ``scan_code`` 非空即「查表没结论」，报告里与「扫到 0 行、表真的空」区分开。
+    """
+    return IntakeReport(scan_code=code, scan_note=note,
+                        skipped=(IntakeSkip('-', code),))
 
 
 def _drive_outcome(item, code):
@@ -161,6 +179,11 @@ def format_drive_lines(report):
     if waiting:
         ids = '，'.join(o.source_id for o in waiting)
         lines.append(f'  其中待人工 {len(waiting)} 条（阶段待办尚未完成，不是证据不足）：{ids}')
+    if report.healed:
+        lines.append(
+            '  自愈补齐 {summary}，按已落库审批补写预留'.format(
+                summary=format_outcome_summary(report.healed))
+        )
     if report.intake is not None:
         lines.extend(format_intake_lines(report.intake))
     for label, outcomes in (('跳过', report.skipped), ('挂起', report.blocked)):
@@ -238,15 +261,27 @@ class DriveLoop:
         self.intake = intake
 
     def run(self):
+        """One pass, with ``blocked_loans`` limited to genuinely unresolved writes.
+
+        The set carries the journal's unresolved operation ids plus the loan of
+        an item that just failed with ``UNKNOWN`` — the only case where
+        ``WRITE_UNKNOWN_QUERY_FIRST`` about a sibling entry is true. A loan
+        blocked for any other reason (half-finished transition, unreadable
+        evidence, a stock snapshot that no longer matches the approval) must not
+        spread: the sibling entries of that loan are still evaluated against
+        their own fresh read, otherwise one bad row starves the entry that can
+        finish the transition and reports every sibling under a code that lies.
+        """
         assert_business_allowed(self.engine.binding, self.engine.lease, self.locks)
         processed = []
         skipped = []
         blocked = []
         # 申请发现先于队列消费：真人新提交的行必须在**同一轮**里变成审批入口，
         # 而不是等操作员登记。发现本身也只写本机队列与台账行，闸门照旧。
-        reported = None if self.intake is None else self.intake.run()
+        reported = self._run_intake()
         discovered = tuple(WorkItem(finding.kind, finding.loan_ref, finding.source)
                            for finding in getattr(reported, 'findings', ()))
+        healed = []
         recovered = self._recover()
         stage_checked, stages_created, stage_skips = self._reconcile_stages(discovered)
         skipped.extend(stage_skips)
@@ -256,9 +291,8 @@ class DriveLoop:
                 blocked.append(_drive_outcome(item, Code.UNKNOWN.value))
                 continue
             try:
-                self._handle(item)
+                explanation = self._handle(item)
             except _Pending as exc:
-                blocked_loans.add(item.loan_ref)
                 blocked.append(_drive_outcome(item, exc.code.value))
                 continue
             except ContractError as exc:
@@ -271,8 +305,29 @@ class DriveLoop:
                 skipped.append(_drive_outcome(item, exc.code.value))
                 continue
             processed.append(item)
+            if explanation is not None:
+                healed.append(_drive_outcome(item, explanation.value))
         return DriveReport(tuple(recovered), tuple(processed), tuple(skipped), tuple(blocked),
-                           tuple(stage_checked), tuple(stages_created), reported)
+                           tuple(stage_checked), tuple(stages_created),
+                           tuple(healed), reported)
+
+    def _run_intake(self):
+        """这一轮的申请发现账目；没接发现就是 None。
+
+        发现是**便利**，不是这一轮本身：只有实例闸门（``SECOND_INSTANCE_BLOCKED``）
+        才允许带着整轮一起停，其余任何异常都记进发现账目（``scan_code``）并按「本轮
+        未登记」继续 —— 一趟坏掉的发现不该把日志恢复与阶段对账一起带走。
+        """
+        if self.intake is None:
+            return None
+        try:
+            return self.intake.run()
+        except ContractError as exc:
+            if exc.code == Code.INSTANCE:
+                raise
+            return _failed_intake(exc.code.value, note='发现扫描未完成，本轮未登记')
+        except Exception:
+            return _failed_intake(Code.UNKNOWN.value)
 
     def _recover(self):
         recovered = []
@@ -324,6 +379,14 @@ class DriveLoop:
         return matched
 
     def _handle(self, item):
+        """One queue item; returns the read failure a heal had to work around.
+
+        An item normally drives the transition its own row carries. The
+        exception is a loan whose row still reads ``reservation_pending``: there
+        this row's evidence is not the judge — see
+        `_finish_pending_reservation` — and the original failure travels back to
+        the report as an explanation, never as the decision.
+        """
         loan_ref = self._resolve_loan_ref(item)
         loan = self.engine.reader.read_loan(loan_ref)
         check_binding(self.engine.binding, loan)
@@ -332,37 +395,48 @@ class DriveLoop:
             self.engine.admit_application(loan_ref, item.source)
             current = self.engine.reader.read_loan(loan_ref)
             self._ensure_current_stage(current)
-            return
+            return None
         try:
             execution = self.engine.execute(loan_ref, item.source)
         except ContractError as exc:
-            if exc.code != Code.DUPLICATE or loan.state != State.RESERVATION_PENDING:
+            if exc.code in (Code.INSTANCE, Code.UNKNOWN):
                 raise
-            self._finish_pending_reservation(item, loan)
-            return
+            if loan.state != State.RESERVATION_PENDING:
+                raise
+            return self._finish_pending_reservation(loan, exc.code)
         if execution.outcome == Outcome.UNKNOWN:
             raise ContractError(Code.UNKNOWN)
         if execution.outcome != Outcome.VERIFIED:
-            return
+            # 平台明确回报这次写没有落地（NOT_SENT/NOT_APPLIED）：跳过它，
+            # 不能静默计成「已处理」——单还停在原地，人要看得见。
+            raise ContractError(Code.READBACK)
         current = execution.loan
         if current.state == State.RESERVATION_PENDING:
             event = self.engine.reader.read_event(current, item.source)
-            self._reserve(current, event)
-            return
+            return self._reserve(current, event)
         self._ensure_current_stage(current)
+        return None
 
-    def _reserve(self, loan, event):
-        """Run the system reservation, then expose the next human stage."""
+    def _reserve(self, loan, event, original=None):
+        """Run the system reservation, then expose the next human stage.
+
+        Returns the read failure the caller was working around (``original``),
+        so a heal can be reported as a heal. A reservation the platform reports
+        as never sent or never applied is a skip, not a processed item.
+        """
         reserved = self.engine.reserve(loan.ref, event)
         if reserved.outcome == Outcome.UNKNOWN:
             raise ContractError(Code.UNKNOWN)
+        if reserved.outcome in (Outcome.NOT_SENT, Outcome.NOT_APPLIED):
+            # 预留没落地：跳过并留给下一轮，别报告成功。
+            raise ContractError(Code.READBACK)
         if reserved.outcome != Outcome.VERIFIED:
-            return
+            return original
         self._ensure_current_stage(reserved.loan)
+        return original
 
-    def _finish_pending_reservation(self, item, loan):
-        """审批已写、预留未写：finish the reservation instead of only reporting
-        DUPLICATE_EVENT on every pass.
+    def _finish_pending_reservation(self, loan, original=None):
+        """借出行停在 reservation_pending：从日志补齐这一跳，而不是每轮只报重复事件。
 
         The approval event is already in the loan's `consumed_events`, so the
         engine refuses to re-plan it and the loan would sit in
@@ -376,36 +450,62 @@ class DriveLoop:
           same-id/different-payload intent and unresolved writes are queried
           instead of replayed, so nothing is submitted twice;
         * plan() refuses RESERVE unless the fresh loan read still says
-          `reservation_pending` and the reserve event was never consumed, so an
-          already-applied reservation cannot move stock again;
-        * the stock move is compare-before-write on a fresh inventory read with
-          quantity and physical-id preconditions, not a blind increment.
+          `reservation_pending` and the reserve event was never consumed, and
+          the movement itself only proves what the read it was planned from
+          shows: enough `available` for the quantity, plus the adapter's
+          compare-before-write against that same read — a guard over the
+          window between read and write, not a proof about history;
+        * what history is checked against is the stock snapshot recorded in the
+          approval receipt: the fresh stock read must still match it (adapter
+          revision token aside). A hand-edited table — stock row already
+          `reserved` while the loan row still says `reservation_pending` —
+          fails that comparison, so this pass reports a blocked item and moves
+          nothing instead of reserving the quantity a second time. Any stock
+          movement between the approval write and this pass (a concurrent loan,
+          say) is escalated to a human for the same reason.
 
-        Unprovable evidence is reported as a blocked item, never retried.
+        Unprovable evidence is reported as a blocked item, never retried, and
+        never guessed at.
         """
-        event = self._recorded_approval(loan, item.source)
-        if event is None:
+        current = self.engine.reader.read_loan(loan.ref)
+        if current.state != State.RESERVATION_PENDING:
             raise _Pending(Code.STATE)
-        self._reserve(loan, event)
+        record = self._recorded_approval(current)
+        if record is None:
+            raise _Pending(Code.STATE)
+        event, snapshot = record
+        if snapshot is None:
+            raise _Pending(Code.STATE)
+        fresh = self.engine.reader.read_inventory(current.item)
+        if replace(fresh, revision=snapshot.revision) != snapshot:
+            # 库存行和审批回执记录的快照对不上：已经有人动过这张表，这一份预留
+            # 到没到账无从证明，交给人工，别照着猜再迁一次。
+            raise _Pending(Code.CONFLICT)
+        return self._reserve(current, event, original)
 
-    def _recorded_approval(self, loan, source):
-        """The applied approval event for this loan, or None when unprovable.
+    def _recorded_approval(self, loan):
+        """The applied approval for this loan plus its recorded stock snapshot.
 
         Only a readback-verified approval write whose event the ledger already
-        consumed qualifies; zero or several candidates fail closed.
+        consumed qualifies; zero or several candidates fail closed. The queue
+        row that carried the entry is deliberately *not* part of the key: a
+        hand-edited or re-typed row must not be able to hide the approval write
+        that did land, and the loan ref + ``action == APPROVE`` + consumed +
+        ``VERIFIED`` + exactly-one-candidate conditions already make the match
+        unique. Returns ``(event, snapshot)`` or ``None``.
         """
         found = []
         for operation_id in self.store.ids():
             intent, receipt = self.store.load(operation_id)
             if isinstance(intent, StageRequest) or intent.event.action != Action.APPROVE:
                 continue
-            if intent.before.ref != loan.ref or intent.event.source != source:
+            if intent.before.ref != loan.ref:
                 continue
             if receipt is None or receipt.outcome != Outcome.VERIFIED:
                 continue
             if intent.event.event_id not in loan.consumed_events:
                 continue
-            found.append(intent.event)
+            found.append((intent.event, receipt.inventory))
         return found[0] if len(found) == 1 else None
 
     def _known_loans(self, extra=()):
@@ -513,9 +613,34 @@ def start_engine(reader, writer, stages, store, locks, binding):
     return engine
 
 
+def title_display_from_document(document):
+    """绑定里可选的 ``title_display`` 段（issue #76）。没配就返回 None。
+
+    这一段只影响待办标题好不好读，不参与任何结论：字段 ID 与表单链接都是本机值，
+    不进仓库；一个键都没给（或全是空串）时返回 None，标题保持之前的样子。
+    """
+    from integrations.dingtalk.adapter import TitleDisplay
+
+    raw = document.get('title_display')
+    if raw is None:
+        return None
+    require(isinstance(raw, dict), Code.CONFIG)
+    item_name_field = raw.get('item_name_field', '')
+    borrower_names = raw.get('borrower_names', False)
+    approve_entry_url = raw.get('approve_entry_url', '')
+    require(isinstance(item_name_field, str) and isinstance(approve_entry_url, str),
+            Code.CONFIG)
+    require(type(borrower_names) is bool, Code.CONFIG)
+    display = TitleDisplay(item_name_field, borrower_names, approve_entry_url)
+    if not display.names_enabled and not display.approve_entry_url.strip():
+        return None
+    return display
+
+
 def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=None,
                  apply_fields=None, application_container=None,
-                 return_form_fields=None, loan_container=None):
+                 return_form_fields=None, loan_container=None,
+                 title_display=None):
     """Build DingTalkAdapter only from explicit binding fields. Never guess dws."""
     from integrations.dingtalk.adapter import DingTalkAdapter
     from integrations.dingtalk.dws_transport import DwsTransport
@@ -540,6 +665,8 @@ def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=No
     if loan_container is None:
         loan_container = document.get('loan_container')
         require(isinstance(loan_container, str) and loan_container.strip(), Code.CONFIG)
+    if title_display is None:
+        title_display = title_display_from_document(document)
     transport = DwsTransport(
         cmd, fields, form_container=form_container, todo_container=todo_container,
         work_dir=runtime, entry_fields=entry_fields,
@@ -548,23 +675,26 @@ def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=No
         transport, journal, locks, fields, entry_fields,
         apply_fields=apply_fields, application_container=application_container,
         return_form_fields=return_form_fields, entry_container=form_container,
-        loan_container=loan_container,
+        loan_container=loan_container, title_display=title_display,
     )
 
 
-def application_intake(engine, reader, sources, store, locks, runtime):
+def application_intake(engine, reader, sources, store, locks, runtime, document=None):
     """Discovery port when the injected reader can scan applications, else None.
 
     Feature-detected on purpose: an injected port that has no application read
     side (a query-only double, a mirror reader) keeps the drive exactly as it
-    was, and a live adapter always has both halves.
+    was, and a live adapter always has both halves. The enable water mark comes
+    from the binding document (``application_intake.since``); unset means the
+    discovery only reports and never writes.
     """
     if not (hasattr(reader, 'pending_applications') and hasattr(reader, 'read_application')
             and hasattr(reader, 'create_application_loan')
             and hasattr(reader, 'find_application_loan')):
         return None
     return ApplicationIntake(engine, reader, sources, store, locks,
-                             Path(runtime) / REGISTER_NAME)
+                             Path(runtime) / REGISTER_NAME,
+                             since=intake_since_from_document(document or {}))
 
 
 def run_bound_drive(runtime, lock_root, reader=None, writer=None, stages=None,
@@ -589,7 +719,7 @@ def run_bound_drive(runtime, lock_root, reader=None, writer=None, stages=None,
     try:
         return DriveLoop(engine, sources, store, locks,
                          intake=application_intake(engine, reader, sources, store, locks,
-                                                   runtime)).run()
+                                                   runtime, document)).run()
     finally:
         engine.stop()
 

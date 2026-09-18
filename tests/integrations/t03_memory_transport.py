@@ -91,6 +91,9 @@ class MemoryTransport(Transport):
         self._activities = 0
         self._next_internal = 9000000100
         self.contact_to_internal = {}
+        # 标题显示名（issue #76）：空表示查不到，调用方退回 id；code 非 None 时按错误回。
+        self.title_names = {}
+        self.title_names_code = None
 
     def seed_record(self, ref, cells):
         self.records[(ref.tenant_id, ref.container_id, ref.resource_id)] = dict(cells)
@@ -118,6 +121,7 @@ class MemoryTransport(Transport):
             'application.list': self._application_list,
             'loan.create': self._loan_create,
             'loan.find_application': self._loan_find_application,
+            'title.names': self._title_names,
         }.get(command)
         if handler is None:
             return error_envelope('UNSUPPORTED_COMMAND')
@@ -322,6 +326,12 @@ class MemoryTransport(Transport):
             if current.state == State.BORROWED and current.borrower.user_id == borrower:
                 matches.append(resource_id)
         return ok_envelope(result={'loan_ids': sorted(matches)})
+
+    def _title_names(self, arguments):
+        """标题显示名；测试可预置 ``title_names`` 或让某次查询直接失败。"""
+        if self.title_names_code is not None:
+            return error_envelope(self.title_names_code)
+        return ok_envelope(result=dict(self.title_names))
 
     def _stage_query(self, arguments):
         if 'operation_id' in arguments:

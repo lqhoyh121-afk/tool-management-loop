@@ -67,11 +67,20 @@ def check_event(loan: Loan, event: Event):
 
 
 def accept_application(loan: Loan, event: Event) -> Loan:
-    """Validate trusted, already-read application before it enters the workflow."""
+    """Validate trusted, already-read application before it enters the workflow.
+
+    申请行与台账行必须是**同一笔申请**：数量、实物编号之外，归还时间也要对得上
+    （``event.due_at`` 是申请行那一格的值）。申请提交后有人改了归还时间就是另一笔
+    申请了：不静默按旧时间走，而是可见地跳过（``DUE_AT_MISMATCH``），由人工决定
+    重登记还是让申请人重填。申请入口没声明这一格时 ``due_at`` 为 None，比对不成立，
+    这是绑定侧的启用检查项（见 docs/deployment.md）。
+    """
     require(event.action == Action.APPLY and loan.state == State.AWAITING_APPROVAL, Code.STATE)
     check_event(loan, event)
     require(event.quantity == loan.quantity and event.physical_ids == loan.physical_ids,
             Code.QUANTITY)
+    if event.due_at is not None:
+        require(event.due_at == loan.due_at, Code.DUE)
     require(loan.due_at > event.occurred_at, Code.INVALID)
     return replace(loan, consumed_events=(event.event_id,), application_evidence=event.evidence_ref)
 

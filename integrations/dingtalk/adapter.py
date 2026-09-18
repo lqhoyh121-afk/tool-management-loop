@@ -9,7 +9,7 @@ Approval truth has exactly one place: the stage entry row's decision column
 (``_read_entry_form_event``). The approver's todo only carries the stage to
 the person — a completed todo is never an approval conclusion.
 """
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from contracts.flow import Receipt, verify
 from datetime import timedelta, timezone
@@ -35,6 +35,17 @@ from .transport import require_envelope, require_todo_envelope
 
 def _closed(exc, code=Code.EVIDENCE):
     raise ContractError(code) from exc
+
+
+def _is_declared(field_id):
+    """这一格在这份绑定里声明过没有（不是 ``unset:`` 哨兵、不是空串）。
+
+    ``unset:<key>`` 是绑定表达「本实例没有这个问题」（与申请读侧的逐件编号同约定），
+    它不是字段 ID，绝不能被当字段 ID 去读。可选格（如申请行的归还时间）用它区分
+    「没声明这一格」与「这一格读到了空值」。
+    """
+    return (isinstance(field_id, str) and bool(field_id.strip())
+            and not field_id.startswith('unset:'))
 
 
 def _business_code(exc):
@@ -64,11 +75,18 @@ def _form_action(name):
 
 
 
+# 标题是执行人在待办列表里唯一的信息来源：除了单号，还要能看出**谁借的、借的什么、
+# 什么时候到期**（issue #76 真机体验缺口）。`{item}` / `{borrower}` 优先用显示名，查不到
+# 就退回资源 id / userId（见 `stage_title` 与 `DisplayNames`）；`{entry}` 是审批入口链接，
+# 只有绑定显式给了才有内容（见 `_entry_suffix`）。
 _STAGE_TITLES = {
-    Action.APPROVE: '【待审批】请审批借出 ×{quantity} ｜ 单号 {loan_id} ｜ 填：决定 + 发生时间',
-    Action.ISSUE: '【待领用确认】请确认已领用 ×{quantity} ｜ 单号 {loan_id}',
+    Action.APPROVE: ('【待审批】请审批借出 {item} ×{quantity} ｜ 借用人 {borrower}'
+                     ' ｜ 到期 {due} ｜ 单号 {loan_id} ｜ 填：决定 + 发生时间{entry}'),
+    Action.ISSUE: ('【待领用确认】请确认已领用 {item} ×{quantity} ｜ 借用人 {borrower}'
+                   ' ｜ 到期 {due} ｜ 单号 {loan_id}'),
     Action.REQUEST_RETURN: '【待归还】到期 {due} ｜ 单号 {loan_id} ｜ 归还后请填归还表',
-    Action.RETURN: '【待归还确认】请确认已归还 ｜ 单号 {loan_id} ｜ 填：决定 + 发生时间',
+    Action.RETURN: ('【待归还确认】请确认已归还 {item} ×{quantity} ｜ 借用人 {borrower}'
+                    ' ｜ 到期 {due} ｜ 单号 {loan_id} ｜ 填：决定 + 发生时间'),
 }
 
 # 审批阶段另发一条催办待办给审批人。它的成败不进回执：审批结论的唯一真源是入口行的
@@ -77,20 +95,86 @@ _STAGE_TITLES = {
 _APPROVER_TODO_ACTIONS = (Action.APPROVE,)
 
 
-def stage_title(loan, action):
+@dataclass(frozen=True)
+class TitleDisplay:
+    """绑定里可选的一段「把标题写成人话」配置。三个键都可缺。
+
+    真实字段 ID / 表 ID / 表单链接只放本机绑定，不进仓库。缺一个键就按下面的口径退回，
+    绝不因为配置不全而让阶段建不出来：
+
+    - ``item_name_field``：库存表里物品名称那一列的字段 ID；没给就用物品记录 ID。
+    - ``borrower_names``：是否查通讯录显示名；查不到就用 userId。
+    - ``approve_entry_url``：审批收集表的分享链接；没给就不拼链接（保持老标题）。
+    """
+    item_name_field: str = ''
+    borrower_names: bool = False
+    approve_entry_url: str = ''
+
+    def __post_init__(self):
+        require(isinstance(self.item_name_field, str))
+        require(isinstance(self.approve_entry_url, str))
+        require(type(self.borrower_names) is bool)
+
+    @property
+    def names_enabled(self):
+        """要不要为标题多查一次名：只有配置真的要求了才查。"""
+        return bool(self.item_name_field.strip()) or self.borrower_names
+
+
+@dataclass(frozen=True)
+class DisplayNames:
+    """标题里替换 id 的显示串。空串 = 没查到，调用方退回 id。"""
+    item: str = ''
+    borrower: str = ''
+
+
+def _entry_suffix(url):
+    """审批待办里那句「去哪儿填」；没配置链接就什么都不加。"""
+    if not isinstance(url, str) or not url.strip():
+        return ''
+    return f' ｜ 填表→ {url.strip()}'
+
+
+def _display_names_from(payload):
+    """``title.names`` 报文里的显示名；形状不认就当成没查到（退回 id）。"""
+    if not isinstance(payload, dict) or payload.get('status') != 'success':
+        return DisplayNames()
+    result = payload.get('result')
+    if not isinstance(result, dict):
+        return DisplayNames()
+    item = result.get('item_name')
+    borrower = result.get('borrower_name')
+    return DisplayNames(item if isinstance(item, str) else '',
+                        borrower if isinstance(borrower, str) else '')
+
+
+def stage_title(loan, action, display=None, entry_url=''):
     """Human-readable stage todo title.
 
     The executor reads this in a todo list: keep the business单号 and what to do,
     and leave the internal operation id out of the title (it stays in the local
     stage index). Unknown actions fall back to the business单号 only.
+
+    ``display`` carries the resolved 借用人 / 物品 names and ``entry_url`` the
+    approval-collection link. Both are optional and purely cosmetic: a missing
+    or failed lookup degrades to the raw resource id / userId and to the
+    link-less title instead of blocking the stage.
+
+    这个字符串同时也是超时回查的匹配键（transport 把发出去的那份记在阶段索引里），
+    所以它必须只由「这笔单 + 这个动作 + 当次查到的显示名」决定，不能掺时间戳。
     """
     template = _STAGE_TITLES.get(action)
     shanghai = timezone(timedelta(hours=8))
+    names = display if isinstance(display, DisplayNames) else DisplayNames()
     if template is None:
         return f'{action.value} ｜ 单号 {loan.ref.resource_id}'
-    return template.format(quantity=loan.quantity,
-                           loan_id=loan.ref.resource_id,
-                           due=loan.due_at.astimezone(shanghai).strftime('%Y-%m-%d %H:%M'))
+    return template.format(
+        quantity=loan.quantity,
+        loan_id=loan.ref.resource_id,
+        due=loan.due_at.astimezone(shanghai).strftime('%Y-%m-%d %H:%M'),
+        item=names.item.strip() or loan.item.resource_id,
+        borrower=names.borrower.strip() or loan.borrower.user_id,
+        entry=_entry_suffix(entry_url))
 
 
 class DingTalkAdapter:
@@ -98,7 +182,8 @@ class DingTalkAdapter:
 
     def __init__(self, transport, journal, leases, fields, entry_fields,
                  apply_fields=None, application_container=None,
-                 return_form_fields=None, entry_container=None, loan_container=None):
+                 return_form_fields=None, entry_container=None, loan_container=None,
+                 title_display=None):
         self.transport = transport
         self.journal = journal
         self.leases = leases
@@ -109,6 +194,7 @@ class DingTalkAdapter:
         self.return_form_fields = return_form_fields
         self.entry_container = entry_container or ''
         self.loan_container = loan_container or ''
+        self.title_display = title_display
 
     def read_loan(self, ref):
         return decode_loan(ref, self._record_cells(ref), self.fields)
@@ -187,9 +273,10 @@ class DingTalkAdapter:
                 return self.query_stage(request)
         self.journal.save_receipt(StageReceipt(request.operation_id, Outcome.UNKNOWN))
         command = 'todo.create' if request.action in (Action.ISSUE, Action.RETURN) else 'form.create'
+        display = self._display_names(request.loan)
         try:
             payload = self.transport.exchange(command, self._stage_arguments(
-                request, request.operation_id, request.actor.user_id))
+                request, request.operation_id, request.actor.user_id, display))
             if command == 'todo.create':
                 require_todo_envelope(payload)
             else:
@@ -209,10 +296,35 @@ class DingTalkAdapter:
             self.journal.save_receipt(receipt)
             return receipt
         if request.action in _APPROVER_TODO_ACTIONS:
-            self._nudge_approver(request)
+            self._nudge_approver(request, display)
         return self.query_stage(request)
 
-    def _stage_arguments(self, request: StageRequest, operation_id, actor):
+    def _display_names(self, loan):
+        """借用人 / 物品的显示名；只有绑定点名要了才查，查不到一律退回 id。
+
+        这是纯装饰性的一次读，进不了任何回执：解析不出名字不改变阶段结果，也不改变
+        审批结论（结论只在入口行的「决定」列）。传输层把可用/失败都收成一个报文，
+        这里只做宽进严出的取值。
+        """
+        config = self.title_display
+        if config is None or not config.names_enabled:
+            return DisplayNames()
+        try:
+            payload = self.transport.exchange('title.names', {
+                'tenant_id': loan.ref.tenant_id,
+                'item_container': loan.item.container_id,
+                'item_id': loan.item.resource_id,
+                'borrower': loan.borrower.user_id,
+                'item_name_field': config.item_name_field.strip(),
+                'borrower_names': config.borrower_names,
+            })
+        except (UnknownResultError, DingTalkShapeError, ContractError,
+                KeyError, TypeError, ValueError):
+            return DisplayNames()
+        return _display_names_from(payload)
+
+    def _stage_arguments(self, request: StageRequest, operation_id, actor,
+                         display=None):
         """One stage payload; operation id and recipient stay the caller's choice.
 
         The approver nudge reuses this shape under its own operation id, so it can
@@ -226,7 +338,8 @@ class DingTalkAdapter:
             'item_container': request.loan.item.container_id,
             'item_id': request.loan.item.resource_id,
             'action': request.action.value,
-            'title': stage_title(request.loan, request.action),
+            'title': stage_title(request.loan, request.action, display,
+                                 self._approve_entry_url()),
             'actor': actor,
             'borrower': request.loan.borrower.user_id,
             'approver': request.loan.approver.user_id,
@@ -236,7 +349,12 @@ class DingTalkAdapter:
             'physical_ids': list(request.loan.physical_ids),
         }
 
-    def _nudge_approver(self, request: StageRequest):
+    def _approve_entry_url(self):
+        """审批收集表的分享链接，只从本机绑定读；没配就是空串（老标题）。"""
+        config = self.title_display
+        return '' if config is None else config.approve_entry_url.strip()
+
+    def _nudge_approver(self, request: StageRequest, display=None):
         """Send the approver a todo for this stage; the entry row stays the truth.
 
         Recipient is the loan's approver. This todo carries no authoritative
@@ -248,7 +366,7 @@ class DingTalkAdapter:
         try:
             payload = self.transport.exchange('todo.create', self._stage_arguments(
                 request, f'{request.operation_id}:approver-todo',
-                request.loan.approver.user_id))
+                request.loan.approver.user_id, display))
             require_todo_envelope(payload)
         except DingTalkShapeError:  # 超时、业务拒绝、形态异常：只是催办没发出去
             return None
@@ -346,7 +464,13 @@ class DingTalkAdapter:
         return IdentityBinding(contact, internal, source, created, readback)
 
     def resolve_return_form_loan(self, source, hint_ref):
-        """Return the sole borrowed loan for a minimal return-form row, else None."""
+        """Return the sole borrowed loan a return-form row names, else None.
+
+        ``#77``: when the row also carries the optional「归还物品」answer, the
+        match narrows from "this borrower's only open loan" to "this borrower's
+        only open loan of that item". Only the borrower knows which tool comes
+        back, so the answer is read, never guessed.
+        """
         if source.kind != 'form' or self.return_form_fields is None:
             return None
         cells = self._record_cells(source)
@@ -355,10 +479,54 @@ class DingTalkAdapter:
         actor = _identity(cells, self.return_form_fields.borrower, source.tenant_id)
         loan_container = self.loan_container or hint_ref.container_id
         text(loan_container)
-        matches = self._borrowed_loan_ids(source.tenant_id, loan_container, actor.user_id)
+        matches = self._matching_borrowed_loans(
+            source.tenant_id, loan_container, actor.user_id, cells)
         require(len(matches) == 1, Code.EVIDENCE)
         matched = Resource('record', source.tenant_id, loan_container, matches[0])
         return matched
+
+    def _matching_borrowed_loans(self, tenant_id, loan_container, borrower_user_id, cells):
+        """Open loans of one borrower, narrowed by the「归还物品」answer when given.
+
+        No usable answer: exactly the pre-#77 borrower-only list. With one, only
+        loans whose item is that item survive, and the caller still demands a
+        single match — two loans of the *same* item stay blocked, they are not a
+        tie we may break.
+
+        Candidates are re-read one by one rather than filtered platform-side so
+        that a row we cannot read fails closed (``EVIDENCE``). Silently dropping
+        an unreadable row would turn "more than one open loan" into a confident
+        single match.
+        """
+        loan_ids = self._borrowed_loan_ids(tenant_id, loan_container, borrower_user_id)
+        wanted = self._return_item_value(cells)
+        if not wanted:
+            return loan_ids
+        matched = []
+        for loan_id in loan_ids:
+            ref = Resource('record', tenant_id, loan_container, loan_id)
+            if self.read_loan(ref).item.resource_id == wanted:
+                matched.append(loan_id)
+        return matched
+
+    def _return_item_value(self, cells):
+        """Optional「归还物品」answer as text; ``''`` when unbound or unfilled.
+
+        Absent or null means the human left the question empty (that is how the
+        platform reports an unfilled cell), so the pre-#77 path applies. Anything
+        present but unreadable is a shape we have not observed: fail closed
+        instead of matching on a guess.
+        """
+        field_id = self.return_form_fields.item
+        if not field_id or field_id not in cells or cells[field_id] is None:
+            return ''
+        value = cells[field_id]
+        if isinstance(value, str):
+            return value.strip()
+        try:
+            return read_single_select(cells, field_id).name.strip()
+        except DingTalkShapeError as exc:
+            _closed(exc)
 
     def _cell_has_text(self, cells, field_id):
         if field_id not in cells or cells[field_id] is None:
@@ -432,6 +600,10 @@ class DingTalkAdapter:
         require(fields is not None, Code.CONFIG)
         require(source.kind == 'form' and source.container_id == self.application_container,
                 Code.EVIDENCE)
+        # 声明检查先做：没声明这一格是 CONFIG，不是「去读一个空的字段 ID」。
+        self._declared(fields.item_container)
+        self._declared(fields.item_id)
+        self._declared(fields.due_at)
         cells = self._record_cells(source)
         try:
             borrower = _identity(cells, fields.borrower, source.tenant_id)
@@ -441,9 +613,9 @@ class DingTalkAdapter:
                 physical_ids = _text_list(cells, fields.physical_ids)
             else:
                 physical_ids = ()
-            item_container = read_text(cells, self._declared(fields.item_container))
-            item_id = read_text(cells, self._declared(fields.item_id))
-            due_at = read_datetime(cells, self._declared(fields.due_at))
+            item_container = read_text(cells, fields.item_container)
+            item_id = read_text(cells, fields.item_id)
+            due_at = read_datetime(cells, fields.due_at)
         except ContractError:
             raise
         except (DingTalkShapeError, KeyError) as exc:
@@ -540,8 +712,7 @@ class DingTalkAdapter:
         question" (same convention the application read side already uses for
         逐件编号); it is not a field id and must never be queried as one.
         """
-        if (not isinstance(field_id, str) or not field_id.strip()
-                or field_id.startswith('unset:')):
+        if not _is_declared(field_id):
             raise ContractError(Code.CONFIG)
         return field_id
 
@@ -560,7 +731,8 @@ class DingTalkAdapter:
             actor = _identity(cells, fields.borrower, loan.ref.tenant_id)
             occurred = read_datetime(cells, fields.occurred_at)
             loan_container = self.loan_container or loan.ref.container_id
-            matches = self._borrowed_loan_ids(source.tenant_id, loan_container, actor.user_id)
+            matches = self._matching_borrowed_loans(
+                source.tenant_id, loan_container, actor.user_id, cells)
             require(len(matches) == 1, Code.EVIDENCE)
             require(matches[0] == loan.ref.resource_id, Code.WRONG_LOAN)
             require(actor == loan.borrower, Code.WRONG_PERSON)
@@ -582,6 +754,7 @@ class DingTalkAdapter:
 
     def _read_application_event(self, loan, source, cells):
         fields = self.apply_fields
+        due_field = fields.due_at
         try:
             action = Action.APPLY
             actor = _identity(cells, fields.borrower, loan.ref.tenant_id)
@@ -591,6 +764,9 @@ class DingTalkAdapter:
                 physical_ids = _text_list(cells, fields.physical_ids)
             else:
                 physical_ids = ()
+            # 申请行上的归还时间：#78 之后受理要比对它与台账行一致。绑定没声明这一格时
+            # 不读、也不比（None），这是启用检查项，不是「读到了空值」。
+            due_at = read_datetime(cells, due_field) if _is_declared(due_field) else None
         except ContractError:
             raise
         except DingTalkShapeError as exc:
@@ -598,7 +774,7 @@ class DingTalkAdapter:
         return Event(action, f'{source.resource_id}:{action.value}', loan.ref, source,
                      actor, occurred, loan.config_version, 'form', True,
                      quantity=quantity, physical_ids=physical_ids,
-                     evidence_ref=f'form:{source.resource_id}')
+                     evidence_ref=f'form:{source.resource_id}', due_at=due_at)
 
     def _entry_form_action(self, cells, fields):
         if fields.decision in cells and cells[fields.decision] is not None:

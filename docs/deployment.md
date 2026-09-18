@@ -160,7 +160,8 @@ https://docs.dingtalk.com/notable/share/form/<shareUuid>?source=link
 
 - **钉钉审批收集表只是填写前端**：不新增第二份申请入口，结论必须落到入口行的「决定」列（同一张入口表、同一行）。引擎建入口行时只预填单号、数量、物资编号、三方身份与阶段动作，**「决定」与「发生时间」两格留空**，由真人填；只填一格驱动会判 `EVIDENCE_REQUIRED` 并指明缺哪一格。
 - **决定值以词表为准**：`agree` / `同意` = 同意，`reject` / `拒绝` = 拒绝。表里写了词表以外的值一律 fail closed（`EVIDENCE_REQUIRED`），不从标题、选项顺序或阶段名反推。
-- **待审批阶段同时给审批人发一条待办**：标题沿用阶段标题（`【待审批】请审批借出 …`），收件人 = 台账行的审批人。它只是催办，不是第二份结论来源 —— 入口行建出来后才发出，它的成败不进阶段回执、也不占用阶段索引（催办用带后缀的操作号，阶段索引里本阶段的操作号仍指向入口行）。所以催办丢了只等于「没提醒」。
+- **待审批阶段同时给审批人发一条待办**：标题沿用阶段标题（`【待审批】请审批借出 <物品> ×<数量> ｜ 借用人 <借用人> ｜ 到期 <到期> ｜ 单号 <单号> ｜ 填：决定 + 发生时间`），收件人 = 台账行的审批人。绑定给了 `title_display.approve_entry_url` 时标题末尾还带 `｜ 填表→ <链接>`，让审批人点得进去；没配就没有这段。它只是催办，不是第二份结论来源 —— 入口行建出来后才发出，它的成败不进阶段回执、也不占用阶段索引（催办用带后缀的操作号，阶段索引里本阶段的操作号仍指向入口行）。所以催办丢了只等于「没提醒」。
+- **领用确认 / 归还确认待办的标题也带「谁 / 什么 / 什么时候」**：`【待领用确认】请确认已领用 <物品> ×<数量> ｜ 借用人 <借用人> ｜ 到期 <到期> ｜ 单号 <单号>`。物品与借用人优先用显示名（见上一节 `title_display`），查不到就退回资源 id / `userId`；`到期` 与「待归还」一样按北京时间渲染。
 
 `待归还请求`（`REQUEST_RETURN`）仍然只有入口行、不发待办。
 
@@ -183,12 +184,29 @@ python -m bootstrap --drive --runtime 运行目录 --lock-root 锁目录
 - `fields`：台账字段 ID（`FieldMap` 全套键），必填
 - `entry_fields`：阶段入口字段 ID（`EntryFieldMap`），必填
 - `apply_fields`：申请收集表字段 ID（`ApplicationFieldMap`），必填
-- `return_form_fields`：归还表单视图字段 ID（`ReturnFormFieldMap`：借用人、归还时间），必填
+- `return_form_fields`：归还表单视图字段 ID（`ReturnFormFieldMap`：借用人、归还时间，以及**可选**的「归还物品」），前两键必填
 - `loan_container`：台账借用单表容器 ID（归还表单按借用人匹配 `borrowed` 单时使用），必填
 
 `apply_fields` 里另有三格**只有自动发现用得到**：`item_container` / `item_id`（申请行上的物品指向）与 `due_at`（申请行上的归还时间）。它们可缺省；缺省或写成 `unset:xxx` 哨兵值时，该实例的申请行不会被自动建成台账行，而是逐行报 `CONFIG_RECONFIRM_REQUIRED` 等操作员手工登记 —— 这是有意的 fail closed：没有物品指向就无法建一条不自造物品的台账行。配齐后新申请不再需要人工登记（见下节）。
 
+可选的一段 `title_display`（只为把阶段待办标题写成人话，不参与任何结论；三个键都可缺，缺了按下面的口径退回，绝不会因为配置不全而让阶段建不出来）：
+
+- `title_display.item_name_field`：库存表里**物品名称**那一列（文本）的字段 ID。给了才在发待办前多读一次库存行，读不到就用物品记录 ID。
+- `title_display.borrower_names`：布尔。为 `true` 时才查一次通讯录显示名（`contact user get --ids`），查不到（无权限、离职、格式不认识）就用 `userId`。
+- `title_display.approve_entry_url`：审批收集表的分享链接。给了就拼进审批待办标题（`… ｜ 填表→ <链接>`），不给就保持不带链接的老标题。
+
+这三个键的值都是本机真值（字段 ID / 表单链接），**只放本机绑定，不进仓库**。链接只把人送到填写处：审批结论的真源仍是入口行的「决定」列。查名与拼链接都是纯装饰：读超时、报错、没回包一律退回 id / 老标题，阶段与结论都不受影响。
+
 缺上述映射、键不完整、或把台账整表拷进 `entry_fields`/`apply_fields`/`return_form_fields`，都是 `CONFIG`。读申请行用 `apply_fields`；读归还表单行（无 loan_id）用 `return_form_fields` 并按借用人唯一匹配；读引擎预建阶段入口行仍用 `entry_fields`。真实字段 ID 只放本机绑定，不进仓库。
+
+### 归还表单的「归还物品」格（可选，不绑也能跑）
+
+归还表单的前两格是**借用人 + 归还时间**，引擎据此按借用人唯一匹配名下 `borrowed` 单；同一借用人同时借了多件时 ≥2 张，按 `EVIDENCE_REQUIRED` 拦下（标「待指定单据」），不猜是哪一张。#77 给表单加一格**可选**的「归还物品」（单选题，题干与选项由人在网页端维护；开放接口不提供建题能力，见上），把匹配条件升级为 **(借用人 + 物品) 唯一**：
+
+- `return_form_fields.item` 是该格的字段 ID；**可缺省**。缺省、或绑定了但该行这一格没填 → 行为与 #49 完全一致（按借用人唯一匹配），老行不受影响。
+- 绑定了且行里有值 → 只保留「物品就是这一件」的候选单；仍然是**恰好 1 张才定性**，同一物品借了多件（≥2 张）继续 `EVIDENCE_REQUIRED`。
+- 候选项逐单回读，读不出来的单**不算命中**而是整条判 `EVIDENCE_REQUIRED` —— 静默丢掉一行会把「多张」变成「恰好一张」。
+- 该格的值要与该借出单指向的**物品台账记录 ID** 对得上（单选选项名写记录 ID，或直接用引用/文本字段填记录 ID）。按**物品名称**匹配需要「名称 → 记录 ID」的映射，本机绑定里没有这份映射，所以名称对不上时按 `EVIDENCE_REQUIRED` 拦下 —— 拦下不会错路由，但要走通就得把这一格的值口径定成记录 ID（操作员侧决定）。
 
 工作队列是运行目录下的 `sources.json`（Git 忽略），只存单据/来源引用，不是第二本库存账。`kind` 为 `apply` 或 `event`。`apply` 走 `admit_application` 后建立审批入口；`event` 走 `execute`，同意后系统预留，再按状态建借出/归还入口。回执落 `runtime/operations/<operation_id>.json`。阶段入口行由引擎创建，但**决定与发生时间两格必须由真人填**（引擎不预填时间，否则时间就不代表真人的实际动作时刻）：只填一格驱动会判 `EVIDENCE_REQUIRED` 并指明缺哪一格。每轮驱动先做一次**阶段对账**：凡是队列或日志里出现过的单据，若其当前状态本该有人工入口（待审批 / 待领用确认 / 待归还请求 / 待归还确认）而入口不存在，驱动按 `stage_operation_id` 幂等补齐 —— 已建过的（含 `UNKNOWN` 回执）不重建。
 
@@ -196,15 +214,45 @@ python -m bootstrap --drive --runtime 运行目录 --lock-root 锁目录
 
 ## 申请自动发现（免人工登记）
 
-每轮 `--drive` 消费队列**之前**先扫一次申请收集表结果表（`application_entry`），把「真人刚提交、本机还没引用过」的行自己登记掉：按 `apply_fields` 建一条台账行（`state=awaiting_approval`、审批人与管理人与配置版本只来自绑定），再往 `sources.json` 追加一条 `kind=apply` 引用。这一轮内审批入口与审批待办就会建出来，不需要操作员动手。
+每轮 `--drive` 消费队列**之前**先扫一次申请收集表结果表（`application_entry`），把「真人刚提交、本机还没引用过、且申请时间在启用水位之后」的行自己登记掉：按 `apply_fields` 建一条台账行（`state=awaiting_approval`、审批人与管理人与配置版本只来自绑定），再往 `sources.json` 追加一条 `kind=apply` 引用。这一轮内审批入口与审批待办就会建出来，不需要操作员动手。
+
+### 启用水位（`application_intake.since`）—— 不配就不建行
+
+启用水位是绑定里的**可选**一段：
+
+```json
+{ "application_intake": { "since": "2026-09-18T00:00:00+08:00" } }
+```
+
+- 只处理**申请时间**（`apply_fields.occurred_at`）≥ `since` 的行；申请时间在水位之前的行按**历史行**记账（报告行 `历史行（申请时间在水位之前，不建行也不登记）：<行 id>`），不建台账行、不登记、不推待办 —— 首次启用时表里往往已经有早已处理完的历史行，把它们当新申请建行会在启用当天批量推出审批待办。
+- **不配水位时发现只出报告（dry-run）：一行都不建**，每行按 `CONFIG_RECONFIRM_REQUIRED` 记跳过，并在报告里写 `水位未配置：本轮只出报告、不建任何台账行（dry-run）`。这是刻意的保守默认：本机没有任何判据能区分「历史行」与「刚提交的行」（登记册、队列、日志在首次启用时都不认识它们），所以先要操作员给出水位。
+- 水位必须带时区（`+08:00` 这类）；写成不带时区的本地时间、或键名拼错（如 `since_at`）、或值读不出来，都是 `CONFIG`（**不当作没配**）—— 静默退回「没配」这个保守默认会让人以为已经启用。
+- 水位是**本机真值**，只放 `runtime/binding.json`，不进仓库。加水位不会重建绑定：直接在那份 JSON 里加这一段即可（`binding.json` 是本机文件，写入一次后由操作员维护）。
+- 想补处理更早的申请：把 `since` 改早即可。已有台账行的行会走**认领**（见下），因此改早水位不会重复建行。
+
+## 申请自动发现（免人工登记）—— 幂等、fail closed、脱敏
 
 三条硬线：
 
-- **幂等**。一行申请只出一条台账行、一条队列引用。判据是本机所有已有引用：队列条目、操作日志里出现过的来源、`runtime/inbox-applications.json` 登记册，以及台账行「申请证据」格里的链路键 `form:<申请行 id>`（与 `accept_application` 写入的值同源）。重跑、重启、同一行被扫两次，都只多第一条。
-- **fail closed**。读不全的格子、必填缺失、`apply_fields` 没配物品/归还时间映射、同一行在一次扫描里重复出现、以及**上次建行结果不明**（写完拿不到回执或回读不通过），一律不猜：逐行按原因码记跳过，报告行形如 `跳过 申请 row=<申请行 id> <原因码>`；扫描本身失败则报 `申请发现：未读到申请表 <原因码>`，这一轮不登记任何申请。写入结果不明时**只认领不重发**：下一次按链路键精确检索（`申请证据 eq form:<行 id>`）认领已有的那条台账行。
-- **脱敏**。报告只出现申请行 id、台账行 id 与原因码；人名、数量、业务值只落本机运行目录（`sources.json` 与 `runtime/inbox-applications.json`，两者都在 Git 忽略范围）。新建台账行与申请行的对应关系只在这两个本机文件里，不进报告正文。
+- **幂等**。一行申请只出一条台账行、一条队列引用。判据有两层，缺一不可：(1) 本机已有引用 —— 队列条目、操作日志里出现过的来源、`runtime/inbox-applications.json` 登记册；(2) **台账行自己的「申请证据」格**里的链路键 `form:<申请行 id>`（与 `accept_application` 写入的值同源）。第 (2) 层是必须的：登记册是本机文件，删掉/换机之后它不认识任何行，只有台账行还认识 —— 所以**建行之前先按链路键精确查一次台账侧，查到就直接认领（只登记，不重发新建），查不到才允许新建**。重跑、重启、同一行被扫两次、删掉队列与登记册重来，台账行都只多第一条。
+
+### 已知残留：阶段入口的幂等判据是操作日志，不是台账行
+
+上面那句「台账行只多第一条」不覆盖**审批入口/审批待办**：阶段入口行的幂等判据是 `runtime/operations/<operation_id>.json` 里的**写入意图**（#68/#72 的设计），删掉这个目录，阶段对账就认不出已有的入口，会按同一个 `stage_operation_id` 再补一条审批入口与审批待办。它和本节的重复建行同源、不同层（一个在发现侧、一个在阶段侧），**不在 #78 范围内**，应单独成卡：修法是在「日志里没有这条意图」时先按 operation id 向平台查一次入口行，查得到就落回执、不再建。在那之前：`runtime/operations/` 是本机恢复凭据，不要当缓存删。`tests/bootstrap/test_inbox.py::test_known_gap_a_wiped_operation_journal_recreates_the_stage_entry` 把这个现状钉住，那张卡修完时它应当改成 `approver_todos == 1`。
+- **fail closed**。读不全的格子、必填缺失、`apply_fields` 没配物品/归还时间映射、同一行在一次扫描里重复出现、以及**上次建行结果不明**（写完拿不到回执或回读不通过），一律不猜：逐行按原因码记跳过，报告行形如 `跳过 申请 row=<申请行 id> <原因码>`。写入结果不明时**只认领不重发**：下一次按链路键精确检索（`申请证据 eq form:<行 id>`）认领已有的那条台账行。发现阶段本身抛异常（不是 `SECOND_INSTANCE_BLOCKED`）时，这一轮记 `WRITE_UNKNOWN_QUERY_FIRST` 并按「本轮未登记」继续：日志恢复与阶段对账照跑，一趟坏掉的发现不带停整轮。
+- **空表 ≠ 读不到**。扫描结果表 0 行时报告必须能把「今天没人申请」与「表格形态变了/查询失败回了 null」分开：报告行 `来源：申请表 container=<容器>，本次回读 N 行`；N 为 0 且扫描成功时才追加「结果表当前确实为空，不是读不到」。报文侧口径统一取 **`records: null` 且 `hasMore` 恰好为 `false` 才算空结果**，`hasMore` 缺失/非 `false`、或 `records` 键缺失一律 fail closed（`EVIDENCE_REQUIRED`），不会被读成「没人申请」。
+- **脱敏**。报告只出现申请行 id、台账行 id、结果表容器与原因码；人名、数量、业务值只落本机运行目录（`sources.json` 与 `runtime/inbox-applications.json`，两者都在 Git 忽略范围）。新建台账行与申请行的对应关系只在这两个本机文件里，不进报告正文。
 
 闸门不变：发现前先过 `assert_business_allowed`（绑定完整 + 机器租约在手），新建的台账行还要再过一次 `check_binding`；审批人、管理人、配置版本、主账范围都只来自绑定，绝不从申请行推断。
+
+### 申请行被改：受理时对归还时间（`due_at`）
+
+申请收集表是申请的**真源**，台账行是流程载体，两者必须指同一笔申请。受理（`accept_application`）逐项比对申请行与台账行，不一致就**可见地跳过**而不是静默按旧值走：
+
+- 数量 / 实物编号不一致 → `QUANTITY_MISMATCH`（原有）；
+- **归还时间不一致 → `DUE_AT_MISMATCH`（新增）**：申请提交后有人把归还时间改掉，等于换了一笔申请 —— 逾期提醒仍按台账行里的旧时间走，不看出来就是静默错。请人工决定是重登记还是让申请人重填。
+
+比对只在**申请入口声明了「归还时间」这一格**（`apply_fields.due_at` 不是空串、不是 `unset:` 哨兵）时进行。这一格是自动发现的必需项（见上），但手工登记的历史实例可能没声明：那时申请事件里 `due_at` 为空，比对不成立 —— 记作启用检查项，不假装比对过。
 
 登记册 `runtime/inbox-applications.json` 是本机文件，记录每个申请行 id 的状态：`creating`（已发写入，等待回执/认领）或 `registered`（已建行并已入队）。若某一行长期停在 `creating` 且报告一直报 `WRITE_UNKNOWN_QUERY_FIRST`，说明那次写入的结果本机无法证明：请人工到台账里核对这一行到底建没建；确认没建之后，把该申请行的条目从登记册里删掉再跑一轮，程序才会重新尝试建行 —— 这是刻意的，避免悄悄建出第二条。
 
@@ -217,6 +265,14 @@ python -m bootstrap --drive --runtime 运行目录 --lock-root 锁目录
 ## T10 缺陷：假实现必须对齐钉钉回读形态
 
 隔离传输不得把 singleSelect 的 `id` 设成与 `name` 相同，也不得回传空字符串字段。写入只发选项 name 字符串；读回必须是 `{id, name}`，适配器读 `.name`。假 dws CLI 读侧须把存盘中的 name 字符串物化成 `{id, name}`（与 MemoryTransport 一致），不得让生产解码接受裸字符串。物化口径按**字段类型**走，不靠字段白名单：两个替身共用 `tests/integrations/t03_live_cells.py`，字段类型在 state 的 `kinds` 里声明（select → `{id, name}`、person → `[{corpId, userId}]`、number → 字符串），未声明字段原样透传。单页/`--filters` 的 `record query --all` 命中为空时回 `records: null`（键在、值为 null），不是 `[]`。生产侧反向收紧：`id` 与 `name` 相同、出现的空字符串单元格都按未观察形态拒绝，替身不像真机时也不被迁就。空的归还字段按空而不是缺证。申请决定 `apply` 的 actor 是借款人。写超时后若台账和库存仍是发前快照，记 `NOT_SENT` 并允许按原操作重试；部分写入仍是 `UNKNOWN`，不重放。
+
+## T10 缺陷收口：读形态声明必须被守卫
+
+「按字段类型物化，不靠白名单」本身还不够：`_KINDS` 是手写的属性名清单，新增 number 类字段忘加进去时写载荷本来就是字符串，会**静默通过**；state 里没有 `kinds` 时假 CLI 会退化成完全透传（等价 #33 之前的松替身）且无告警；`return_container` / `return_id` 的真机类型从未被观测，生产却用 `read_text` 读，若真机是 singleSelect，替身会永远绿而生产报 `EVIDENCE`。三处的收口方式：
+
+1. **声明完整性**：四个 `*FieldMap` 的每个属性都必须在 `tests/integrations/t03_live_cells._KINDS` 里声明读形态；声明里出现不是映射属性的名字同样失败（`t03_kinds_guard.py`）。
+2. **读侧覆盖**：`tests/integrations/t03_read_sites.py` 用 `ast` 扫 `integrations/` 的读点，逐个解析「哪个字段属性由哪个读函数读取」，再要求声明覆盖之、且读法与声明相容（select 只能被 `read_single_select` 读，等等）。解析不出来的读点（动态字段名）报错，不静默跳过。假 dws CLI 侧：state 缺 `kinds` 或写了未知形态名时**拒绝服务**（stderr + 退出码 2），传输把它变成 `ContractError`，不再静默回原样载荷。
+3. **真机类型观测**：`tests/integrations/fixtures/t73_live_field_types.json` 记录 2026-09-18 的只读 `dws aitable field get` 观测（台账/库存/阶段入口/申请表四张表，只有字段属性名与类型，不含真实 ID 与业务数据）。台账 `return_container` / `return_id` 观测为 `text`，与生产的 `read_text` 一致；申请表 `physical_ids` 在本机 binding 里是 `unset`，该表真机类型未观测，在夹具的 `unobserved` 里注明。声明或读法与观测不符即失败，因此这类「未观测字段」不会再无声无息。
 
 ## 本阶段会做什么
 
@@ -269,3 +325,23 @@ python -B -m unittest discover -s tests/bootstrap -p "test_*.py" -v
 - `APPROVE` 的待办只是催办，不是结论来源：三条口径见上文「审批结论的唯一真源」。
 - `runtime/dws-stage-index.json` 是阶段索引（操作号 ↔ 钉钉 task id）：`todo task create` 没有描述字段可以放操作号，**该文件不可删**，删了就再也对不回「unknown 但待办已建出」的单。
 - **一单一行一轮**：`stage_operation_id` 对同一条台账行永久唯一，所以同一条行二次借出（人工把状态与 `consumed_events` 清回再走一遍）**不会再建任何入口** —— 需要重跑时请新建台账行，而不是复用旧行。
+
+## 0 命中不等于「没建出」
+
+**只看标题的回查是有前提的**，前提不成立时 0 命中什么也证明不了。两条口径都写在 `integrations/dingtalk/dws_transport.py` 的常量注释里，改这块前先读它们：
+
+- **`--status` 永不省略**：真机 `todo task list --help` 写的是 `--status string  true=已完成, false=未完成`，**没写默认值**；实测（2026-09-18，登录账号）`--status true` 47 条、不带 flag 也是 47 条、`--status false` 0 条 —— 账号当前没有未完成待办，所以「默认全部」和「默认仅已完成」在实测里**长得一模一样**。回查因此固定发两次（`--status false` + `--status true`）再按 `taskId` 合并：待办可能在建出后被真人点完成，只在第二个查询里。
+- **列表只覆盖登录账号自己作为执行者的待办**：真机 help 原文「自己创建但交给他人执行的待办不在返回范围内」，而阶段待办是用 `--executors <业务当事人>` 建的，**不保证等于登录账号**（多人流程下 actor 是借用人/审批人）。actor ＝ 登录账号时（单人部署，也是当前部署）0 命中才算「确认没建出」；actor ≠ 登录账号时待办建出来了、人也收到了，但列表里看不见。
+
+所以恢复失败会被**写成记录**，不再与「没建出」同形。`runtime/dws-stage-index.json` 的 pending 记录里：
+
+| 字段 | 含义 |
+| --- | --- |
+| `executor_contact` / `login_user_id` / `executor_scope` | 建出（或尝试建出）时的 actor、当时观测到的 dws 登录账号、以及两者关系（`self` / `other` / `unknown`）。登录账号来自 `dws auth status`，读不到就记 `unknown`，**不猜**。 |
+| `recovery_state` | `not_attempted`（还没回查）/ `not_built`（两个状态都查了、actor ＝ 登录账号、仍然 0 命中 —— 这一种才算确认没建出）/ `needs_manual_confirmation`（0 命中但范围不成立，或列表读不到，或同标题 2 条以上） |
+| `needs_manual_confirmation` / `recovery_reason` | 是否必须人工先确认；原因：`executor_scope` / `todo_list_unreadable` / `title_ambiguous` |
+| `recovery_attempts` / `recovery_matches` / `recovery_statuses` | 回查次数、命中条数、本次查过的状态（恒为 `["false","true"]`） |
+
+**运维出口**：`python -c "from integrations.dingtalk.dws_transport import pending_stage_report; ..."`（`pending_stage_report(runtime 目录)`，只读）把上面这些字段按一阶段一行列出来。`needs_manual_confirmation=True` 的单，请**先到钉钉里按标题/`claimed_task_id` 找那条待办**，确认真的没有，再清掉索引里的 pending 重来；驱动自己不会替你建第二条。
+
+`claimed_task_id`（建出回执到手、紧随其后的 `todo task get` 失败）走的是**另一条路**：按 task id 精确读回，`todo task get` 不受执行人范围限制，所以那条路与 actor、与登录账号都无关。

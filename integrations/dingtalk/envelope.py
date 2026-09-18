@@ -176,6 +176,12 @@ def query_rows(payload):
     and an empty result set is ``records: null`` (present key, null value), not
     ``[]``. A *missing* key stays an error: that is a shape change, not an empty
     set. Truncation fails closed instead of matching on an incomplete list.
+
+    ``records: null`` is only an empty result when ``hasMore`` says exactly
+    ``false``, the same rule :func:`extract_records` already applies: a null list
+    with a missing or non-``false`` ``hasMore`` is a shape change (or a failed
+    query answered with a null), never "no rows". Reading it as empty is how a
+    permanent, silent "nobody applied today" would look.
     """
     if not isinstance(payload, dict):
         raise UnsupportedShapeError('record query 未返回对象报文')
@@ -185,6 +191,12 @@ def query_rows(payload):
         raise UnsupportedShapeError('record query 报文缺少 records 键')
     records = payload['records']
     if records is None:
+        # 空结果集的已知形态：records=null 且 hasMore 恰好为 false。
+        if 'hasMore' not in payload or payload['hasMore'] is not False:
+            raise UnsupportedShapeError(
+                'record query 的 records 为 null 时 hasMore 必须恰好是 false，'
+                '不能当空结果'
+            )
         records = []
     elif not isinstance(records, list):
         raise UnsupportedShapeError('record query 的 records 不是数组')

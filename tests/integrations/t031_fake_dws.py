@@ -3,13 +3,14 @@
 Module name is unique so T09 file-based discovery does not collide. State is a
 JSON file in FAKE_DWS_STATE. SYNTHETIC identifiers only.
 
-The state file also carries the table schema (``kinds``: field id -> live cell
-kind, built with ``t03_live_cells.declared_kinds``). It is what makes reads look
-like the platform: this double stores the **write** payload, while a live read
-returns materialized cells (singleSelect option names as ``{id, name}``, person
-cells as ``[{corpId, userId}]``, numbers as strings). A field whose kind is not
-declared passes through unchanged, so the production readers fail closed instead
-of being handed a double-only shape.
+The state file must carry the table schema (``kinds``: field id -> live cell shape,
+built with ``t03_live_cells.declared_kinds``). It is what makes reads look like the
+platform: this double stores the **write** payload, while a live read returns
+materialized cells (singleSelect option names as ``{id, name}``, person cells as
+``[{corpId, userId}]``, numbers as strings). A record query against a state without a
+declared ``kinds`` is refused on stderr with a non-zero exit: the only thing this
+double could do then is echo write payloads back, which is the loose pre-#33 double
+(#73). An unknown shape name in the declaration is refused for the same reason.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ import sys
 import time
 from pathlib import Path
 
-from t03_live_cells import filter_value, live_cells
+from t03_live_cells import KindsError, filter_value, live_cells, validate_state_kinds
 
 
 def ok(**extra):
@@ -65,6 +66,7 @@ def load_state(path):
             'fail': {},
             'timeout': [],
             'late_write': [],
+            'calls': [],
             'seq': {'form': 0, 'todo': 0, 'internal': 9000000100},
         }
     return json.loads(path.read_text(encoding='utf-8'))
@@ -105,6 +107,10 @@ def filter_pairs(raw):
 BOOLEAN = {'--all', '--yes'}
 
 SPECS = {
+    'auth status': {
+        'required': {'--format'},
+        'optional': set(),
+    },
     'aitable record query': {
         'required': {'--base-id', '--table-id', '--format'},
         'optional': {'--all', '--record-ids', '--filters', '--field-ids'},
@@ -133,6 +139,10 @@ SPECS = {
         'required': {'--task-id', '--format'},
         'optional': set(),
     },
+    'contact user get': {
+        'required': {'--ids', '--format'},
+        'optional': set(),
+    },
     'chat message send': {
         'required': {'--title', '--text', '--yes', '--format'},
         'optional': {'--user', '--open-dingtalk-id'},
@@ -159,11 +169,25 @@ def parse_flags(argv):
     return flags, None
 
 
+def verb_of(argv):
+    """Longest command word count that names a known verb.
+
+    ``todo task list`` is three words, ``auth status`` is two; the flag offset
+    follows from the verb itself so neither shape has to be special-cased by the
+    caller.
+    """
+    for taken in (3, 2):
+        verb = ' '.join(argv[:taken])
+        if verb in SPECS:
+            return verb
+    return ' '.join(argv[:3])
+
+
 def require_spec(verb, argv):
     spec = SPECS.get(verb)
     if spec is None:
         return err('UNSUPPORTED_COMMAND')
-    flags, problem = parse_flags(argv[3:])
+    flags, problem = parse_flags(argv[len(verb.split()):])
     if problem:
         return err('UNKNOWN_FLAG', problem)
     allowed = spec['required'] | spec['optional']
@@ -201,7 +225,7 @@ def synthetic_option_write(cells):
 
 
 def main(argv):
-    verb = ' '.join(argv[:3])
+    verb = verb_of(argv)
     spec_error = require_spec(verb, argv)
     if spec_error:
         print(json.dumps(spec_error, ensure_ascii=True))
@@ -215,7 +239,14 @@ def main(argv):
         print(json.dumps(err(fail), ensure_ascii=True))
         return 0
     if argv[:3] == ['aitable', 'record', 'query']:
-        kinds = state.get('kinds') or {}
+        try:
+            kinds = validate_state_kinds(state)
+        except KindsError as exc:
+            sys.stderr.write(
+                f'fake dws 拒绝执行 record query：{exc}\n'
+                '声明字段类型的 state 缺失或写错时，替身只能把写入载荷原样回给读侧。\n'
+            )
+            return 2
         base_id = flag(argv, '--base-id')
         table_id = flag(argv, '--table-id')
         record_id = flag(argv, '--record-ids')
@@ -319,10 +350,27 @@ def main(argv):
         print(json.dumps(todo_ok(result={'taskId': task_id, 'todoDetailModel': detail}),
                          ensure_ascii=True))
         return 0
+    if argv[:2] == ['auth', 'status']:
+        # Live shape: a flat object with authenticated/token_valid/user_id.
+        if state.get('auth_unauthenticated'):
+            print(json.dumps({'success': True, 'authenticated': False,
+                              'token_valid': False}, ensure_ascii=True))
+            return 0
+        print(json.dumps(ok(authenticated=True, token_valid=True,
+                            user_id=state.get('login_user'),
+                            user_name='SYNTHETIC-login'), ensure_ascii=True))
+        return 0
     if argv[:3] == ['todo', 'task', 'list']:
         size = int(flag(argv, '--size'))
         status_flag = flag(argv, '--status')
         login_user = state.get('login_user')
+        # Every list call is written down: the recovery path must never lean on
+        # the undocumented default of ``--status``.
+        state.setdefault('calls', []).append({
+            'verb': 'todo task list', 'size': size, 'status': status_flag,
+            'login_user': login_user,
+        })
+        save_state(state_path, state)
         cards = []
         for task_id, todo in state['todos'].items():
             detail = todo.get('detail') or {}
@@ -341,7 +389,14 @@ def main(argv):
                 'finalStatusStage': 0,
                 'priority': 0,
             })
-        result = {'todoCards': cards[:size]}
+        if size > 20:
+            # Live: ``--size`` above one page makes the CLI page and merge by
+            # itself, so the merged answer carries no ``hasMore``/``nextToken``.
+            result = {'todoCards': cards}
+        else:
+            result = {'todoCards': cards[:size]}
+            if len(cards) > size:
+                result['hasMore'] = True
         if state.get('list_more'):
             result['hasMore'] = True
         print(json.dumps(todo_ok(result=result), ensure_ascii=True))
@@ -354,6 +409,17 @@ def main(argv):
             return 0
         print(json.dumps(todo_ok(result={'todoDetailModel': todo['detail']}),
                          ensure_ascii=True))
+        return 0
+    if argv[:3] == ['contact', 'user', 'get']:
+        # 显示名只认 state['contact_names'] 里点过名的 userId；没点名的查不到。
+        names = state.get('contact_names') or {}
+        rows = []
+        for user_id in (flag(argv, '--ids') or '').split(','):
+            name = names.get(user_id.strip()) if user_id.strip() else None
+            if not name:
+                continue
+            rows.append({'orgEmployeeModel': {'orgUserName': name}})
+        print(json.dumps(ok(result=rows), ensure_ascii=True))
         return 0
     if argv[:3] == ['chat', 'message', 'send']:
         print(json.dumps(ok(result={'openTaskId': 'SYNTHETIC-chat'}),

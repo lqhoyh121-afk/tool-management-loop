@@ -12,17 +12,68 @@ import os
 import subprocess
 import uuid
 from pathlib import Path
+from typing import NamedTuple
 
 from .cells import read_creator, read_single_select
 from .codec import _put_identity
-from .envelope import query_rows
+from .envelope import extract_records, query_rows, record_cells, record_id
 from .errors import DingTalkShapeError, UnsupportedShapeError, UnknownResultError
 from contracts.model import Code, ContractError, Identity, require, text
 
 
-# One page is enough to prove a stage title is absent; a reply that admits more
-# pages is rejected instead of being read as "no match".
+# ``--size`` above one page (20) makes the live CLI page and merge by itself, so
+# the merged reply carries no ``hasMore``/``nextToken``; a reply that still admits
+# more pages is rejected instead of being read as "no match".
 TODO_LIST_PAGE_SIZE = 100
+
+# Live ``todo task list --help`` (same account as this transport):
+#
+#     --status string   true=已完成, false=未完成
+#
+# The *default* (flag omitted) is not documented, and the live account could not
+# falsify it: measured 2026-09-18 with this transport's own login, ``--status
+# true`` → 47 cards, no flag → 47 cards, ``--status false`` → 0 cards, i.e.
+# "default = all" and "default = completed only" look identical while nothing is
+# open. Recovery therefore never relies on it: both predicates are asked for in
+# separate calls and merged by ``taskId``, because the todo may have been ticked
+# complete between create and readback.
+TODO_LIST_STATUSES = (False, True)
+
+# ``todo task list --help`` scope (verbatim): 「只返回当前登录用户作为执行者
+# (executor) 的待办… 自己创建但交给他人执行的待办不在返回范围内」. Stage todos are
+# created with ``--executors <业务当事人>``, which need not be the login account, so
+# a title scan proves existence but a 0-hit scan only proves absence *inside the
+# login user's executor scope*.
+RECOVERY_MATCHED = 'matched'
+RECOVERY_ABSENT = 'absent'
+RECOVERY_AMBIGUOUS = 'ambiguous'
+RECOVERY_UNREADABLE = 'unreadable'
+
+# What a pending stage record says about its own recovery (see
+# ``DwsTransport._annotate_recovery``): ``not_built`` is only ever written when
+# the scan really covered this actor's todo space; everything else needs a human,
+# because "never created" and "cannot see it" are the same 0 hits.
+RECOVERY_NOT_BUILT = 'not_built'
+RECOVERY_NOT_ATTEMPTED = 'not_attempted'
+RECOVERY_NEEDS_MANUAL = 'needs_manual_confirmation'
+
+SCOPE_SELF = 'self'
+SCOPE_OTHER = 'other'
+SCOPE_UNKNOWN = 'unknown'
+
+REASON_EXECUTOR_SCOPE = 'executor_scope'
+REASON_TITLE_AMBIGUOUS = 'title_ambiguous'
+REASON_LIST_UNREADABLE = 'todo_list_unreadable'
+
+_UNSET = object()
+
+
+class _TitleScan(NamedTuple):
+    """Result of scanning the todo space for one stage title."""
+
+    outcome: str
+    task_id: str | None = None
+    matches: int = 0
 
 
 def split_container(container_id):
@@ -47,6 +98,31 @@ def windows_native_path(path):
         if not drive or '/' in abs_path or not tail.startswith('\\'):
             raise UnsupportedShapeError('--records-file 只认 Windows 原生路径')
     return abs_path
+
+
+def contact_name(payload):
+    """``contact user get`` 里的显示名；形状不认就返回空串（调用方退回 userId）。
+
+    真机观测：``result`` 是数组，显示名在 ``result[0].orgEmployeeModel.orgUserName``。
+    这里只认见过的两级位置，其余一律当没查到 —— 标题少一个名字不是错误。
+    """
+    if not isinstance(payload, dict):
+        return ''
+    rows = payload.get('result')
+    if not isinstance(rows, list):
+        return ''
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        candidates = []
+        employee = row.get('orgEmployeeModel')
+        if isinstance(employee, dict):
+            candidates.append(employee.get('orgUserName'))
+        candidates.extend((row.get('orgUserName'), row.get('userName')))
+        for value in candidates:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ''
 
 
 def ok_envelope(**extra):
@@ -139,6 +215,7 @@ class DwsTransport:
         self.extra_env = dict(extra_env or {})
         self._stage_path = self.work_dir / 'dws-stage-index.json'
         self._files_dir = self.work_dir / 'dws-records-file'
+        self._login_user = _UNSET
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self._files_dir.mkdir(parents=True, exist_ok=True)
         if not self._stage_path.exists():
@@ -151,6 +228,8 @@ class DwsTransport:
                 return self._loan_query_borrowed(arguments)
             if command == 'stage.query':
                 return self._stage_query(arguments)
+            if command == 'title.names':
+                return self._title_names(arguments)
             argv = self._argv(command, arguments)
             payload = self._run(argv)
         except (subprocess.TimeoutExpired, OSError, UnknownResultError):
@@ -227,9 +306,16 @@ class DwsTransport:
             if status is not None:
                 argv.extend(['--status', 'true' if status else 'false'])
             return argv + common
+        if command == 'auth.status':
+            # Read-only: which account the CLI is logged in as. Needed to tell
+            # whether a 0-hit title scan proves anything (the todo list is scoped
+            # to the login user's executor todos).
+            return ['auth', 'status'] + common
         if command == 'todo.get':
             return ['todo', 'task', 'get',
                     '--task-id', arguments['task_id']] + common
+        if command == 'contact.user.get':
+            return ['contact', 'user', 'get', '--ids', arguments['ids']] + common
         if command == 'chat.send':
             title = arguments.get('title')
             body = arguments.get('text')
@@ -327,11 +413,18 @@ class DwsTransport:
         if isinstance(known, dict) and known.get('resource_id'):
             return
         if command == 'todo.create':
+            scope, login_user = self._executor_scope(arguments['actor'])
             meta = {'kind': 'todo',
                     'pending': True,
                     'title': todo_title(arguments),
                     'container': self.todo_container,
-                    'executor_contact': arguments['actor']}
+                    'executor_contact': arguments['actor'],
+                    # Whose todo list could hold this stage is part of the pending
+                    # record from the start: a later 0-hit title scan may only be
+                    # read as "never created" when the actor *is* the login user.
+                    'login_user_id': login_user,
+                    'executor_scope': scope,
+                    'recovery_state': RECOVERY_NOT_ATTEMPTED}
         else:
             meta = {'kind': 'form',
                     'pending': True,
@@ -393,7 +486,10 @@ class DwsTransport:
                 'internal_id': internal_id,
             }
         # Create succeeded but readback is incomplete — keep the known task id.
-        return {**shared, 'pending': True, 'claimed_task_id': resource_id}
+        scope, login_user = self._executor_scope(arguments['actor'])
+        return {**shared, 'pending': True, 'claimed_task_id': resource_id,
+                'login_user_id': login_user, 'executor_scope': scope,
+                'recovery_state': RECOVERY_NOT_ATTEMPTED}
 
     def _todo_internal_id_from_detail(self, detail):
         """Executor ID from a ``todo task get`` detail; unreadable is ``None``."""
@@ -416,6 +512,56 @@ class DwsTransport:
         detail = result.get('todoDetailModel')
         return detail if isinstance(detail, dict) else None
 
+    def _title_names(self, arguments):
+        """借用人 / 物品的显示名，只为把标题写成人话（issue #76）。
+
+        这里从不抛错：读不到就少给一个键，调用方退回资源 id / userId。多查一次的成本
+        用两个开关摊薄 —— 只有绑定给了 ``item_name_field`` 才读那格，只有点名要
+        ``borrower_names`` 才查通讯录。
+        """
+        result = {}
+        item = self._item_name(arguments)
+        if item:
+            result['item_name'] = item
+        if arguments.get('borrower_names'):
+            borrower = self._contact_name(arguments.get('borrower'))
+            if borrower:
+                result['borrower_name'] = borrower
+        return ok_envelope(result=result)
+
+    def _item_name(self, arguments):
+        """库存行里那一列物品名称；字段 ID 由绑定给，读不到就是空串。"""
+        field_id = arguments.get('item_name_field')
+        container_id = arguments.get('item_container')
+        item_id = arguments.get('item_id')
+        if not all(isinstance(value, str) and value.strip()
+                   for value in (field_id, container_id, item_id)):
+            return ''
+        try:
+            payload = self._run(self._argv('record.query', {
+                'container_id': container_id, 'resource_id': item_id}))
+            records = extract_records(payload)
+        except (DingTalkShapeError, subprocess.TimeoutExpired, OSError):
+            return ''
+        for record in records:
+            if record_id(record) != item_id:
+                continue
+            value = record_cells(record).get(field_id)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ''
+
+    def _contact_name(self, user_id):
+        """通讯录显示名；查不到（含无权限、离职、未登录）就是空串。"""
+        if not isinstance(user_id, str) or not user_id.strip():
+            return ''
+        try:
+            payload = self._run(self._argv('contact.user.get',
+                                           {'ids': user_id.strip()}))
+        except (DingTalkShapeError, subprocess.TimeoutExpired, OSError):
+            return ''
+        return contact_name(payload)
+
     def _stage_query(self, arguments):
         store = self._load_stages()
         if 'operation_id' in arguments:
@@ -424,8 +570,10 @@ class DwsTransport:
             meta = store['by_task'].get(arguments.get('task_id'))
         if isinstance(meta, dict) and meta.get('pending'):
             # Adopt the artifact when readback is complete; otherwise surface the
-            # pending record (including any claimed_task_id) for a later retry.
-            recovered = self._recover_pending(meta)
+            # pending record (including any claimed_task_id) for a later retry,
+            # annotated with why it is still unresolved and whether it needs a
+            # human (a 0-hit title scan is not "never created").
+            recovered, meta = self._recover_pending(meta)
             if recovered is not None:
                 meta = recovered
         if meta is None:
@@ -435,22 +583,27 @@ class DwsTransport:
     def _recover_pending(self, meta):
         """Adopt an already-created todo for a pending stage, else ``None``.
 
-        When ``claimed_task_id`` is known, ``todo task get`` is tried first — the
-        login-scoped list may not show todos whose executor differs from the CLI
-        account. Title matching is only used when no task id was ever recorded.
+        Returns ``(recovered_or_None, meta)``: the meta carried back is the
+        pending record as it should be surfaced, recovery annotations included.
+
+        When ``claimed_task_id`` is known, ``todo task get`` is tried first — it
+        is addressed by task id, not by executor scope, so the login-scoped list
+        does not matter. Title matching only runs when no task id was ever
+        recorded, and an inconclusive scan annotates the pending record instead of
+        passing for "not built".
         """
         if meta.get('kind') != 'todo':
-            return None
+            return None, meta
         claimed = meta.get('claimed_task_id')
         if isinstance(claimed, str) and claimed:
-            return self._finalize_todo_recovery(meta, claimed)
+            return self._finalize_todo_recovery(meta, claimed), meta
         title = meta.get('title')
         if not isinstance(title, str) or not title:
-            return None
-        task_id = self._todo_task_id_by_title(title)
-        if task_id is None:
-            return None
-        return self._finalize_todo_recovery(meta, task_id)
+            return None, meta
+        scan = self._todo_title_scan(title)
+        if scan.outcome == RECOVERY_MATCHED:
+            return self._finalize_todo_recovery(meta, scan.task_id), meta
+        return None, self._annotate_recovery(meta, scan)
 
     def _finalize_todo_recovery(self, meta, task_id):
         detail = self._todo_detail_for_stage(task_id)
@@ -471,26 +624,134 @@ class DwsTransport:
         return recovered
 
     def _todo_list_pairs(self):
-        """Merge incomplete and complete todos; default list status is ambiguous."""
+        """``(subject, taskId)`` of *both* completion statuses, merged.
+
+        The unflagged live default is ambiguous (see ``TODO_LIST_STATUSES``), so
+        recovery asks for ``--status false`` and ``--status true`` explicitly — a
+        todo the human completed between create and readback is only in the
+        second one. A failed or unreadable *either* call raises: half the todo
+        space is not a scan, and the caller must not read it as "no match".
+        """
         merged = {}
-        for done in (False, True):
+        for done in TODO_LIST_STATUSES:
             payload = self._run(self._argv(
                 'todo.list', {'size': TODO_LIST_PAGE_SIZE, 'status': done}))
             for subject, task_id in _todo_cards(payload):
                 merged.setdefault(task_id, subject)
         return [(subject, task_id) for task_id, subject in merged.items()]
 
-    def _todo_task_id_by_title(self, title):
-        """Task id of the *only* todo titled ``title``, else ``None``."""
+    def _todo_title_scan(self, title):
+        """Scan **both** statuses for ``title``; 0 hits is not proof of absence.
+
+        Three outcomes stay apart on purpose: ``matched`` (exactly one card),
+        ``absent`` (no card in this scan), ``ambiguous`` (2+ cards share the
+        title) and ``unreadable`` (the list itself could not be read). The live
+        list only covers the login user's own executor todos, so ``absent`` is
+        only conclusive together with the actor/login relation — the caller
+        decides that in ``_annotate_recovery``.
+        """
         try:
             cards = self._todo_list_pairs()
         except (UnknownResultError, UnsupportedShapeError,
                 subprocess.TimeoutExpired, OSError):
-            return None
+            return _TitleScan(RECOVERY_UNREADABLE)
         matches = [task_id for subject, task_id in cards if subject == title]
-        if len(matches) != 1:
+        if len(matches) == 1:
+            return _TitleScan(RECOVERY_MATCHED, matches[0], 1)
+        if not matches:
+            return _TitleScan(RECOVERY_ABSENT)
+        return _TitleScan(RECOVERY_AMBIGUOUS, None, len(matches))
+
+    def _todo_task_id_by_title(self, title):
+        """Task id of the *only* todo titled ``title``, else ``None``.
+
+        ``None`` covers absent, ambiguous **and** unreadable — callers that have
+        to tell those apart use ``_todo_title_scan``.
+        """
+        scan = self._todo_title_scan(title)
+        return scan.task_id if scan.outcome == RECOVERY_MATCHED else None
+
+    def _annotate_recovery(self, meta, scan):
+        """Write down why a pending stage is unresolved, and who must confirm it.
+
+        ``not_built`` is claimed **only** when the scan really covered this
+        actor's todo space: both completion statuses read back *and* the stage
+        actor is the dws login account, whose executor todos the live list
+        returns. Everywhere else — 0 hits while the actor is someone else (or the
+        login is unobservable), 2+ cards sharing the title, an unreadable list —
+        the record says ``needs_manual_confirmation``, because "the todo was never
+        created" and "the todo is invisible to this login" produce the same 0
+        hits. Annotating here is what keeps a stuck stage from looking like a
+        plain never-created one forever.
+        """
+        scope, login_user = self._executor_scope(meta.get('executor_contact'))
+        if scan.outcome == RECOVERY_ABSENT and scope == SCOPE_SELF:
+            state, reason = RECOVERY_NOT_BUILT, None
+        elif scan.outcome == RECOVERY_ABSENT:
+            state, reason = RECOVERY_NEEDS_MANUAL, REASON_EXECUTOR_SCOPE
+        elif scan.outcome == RECOVERY_AMBIGUOUS:
+            state, reason = RECOVERY_NEEDS_MANUAL, REASON_TITLE_AMBIGUOUS
+        else:
+            state, reason = RECOVERY_NEEDS_MANUAL, REASON_LIST_UNREADABLE
+        annotated = dict(meta)
+        annotated.update({
+            'recovery_state': state,
+            'needs_manual_confirmation': state != RECOVERY_NOT_BUILT,
+            'recovery_reason': reason,
+            'recovery_attempts': int(meta.get('recovery_attempts') or 0) + 1,
+            'recovery_matches': scan.matches,
+            'recovery_statuses': ['false', 'true'],
+            'login_user_id': login_user,
+            'executor_scope': scope,
+        })
+        operation_id = meta.get('operation_id')
+        if isinstance(operation_id, str) and operation_id:
+            store = self._load_stages()
+            store['by_operation'][operation_id] = annotated
+            self._save_stages(store)
+        return annotated
+
+    def _executor_scope(self, actor):
+        """``(relation, login_user_id)`` between a stage actor and the login user.
+
+        ``self`` means the todo list covers this actor's todos, so a 0-hit scan
+        means something; ``other`` means the todo exists but is out of the list's
+        reach; ``unknown`` means the login account could not be observed (never a
+        guess, never treated as proof).
+        """
+        login_user = self._login_user_id()
+        if login_user is None:
+            return SCOPE_UNKNOWN, None
+        if isinstance(actor, str) and actor and actor == login_user:
+            return SCOPE_SELF, login_user
+        return SCOPE_OTHER, login_user
+
+    def _login_user_id(self):
+        """Contact id the CLI is logged in as, or ``None`` when unobservable.
+
+        A successful observation is cached for this transport's lifetime; an
+        unreadable one is **not**, so a transient ``auth status`` failure cannot
+        blind the whole process into treating every scan as scope-unknown.
+        """
+        if self._login_user is _UNSET:
+            observed = self._read_login_user()
+            if observed is not None:
+                self._login_user = observed
+            return observed
+        return self._login_user
+
+    def _read_login_user(self):
+        try:
+            payload = self._run(self._argv('auth.status', {}))
+        except (UnknownResultError, UnsupportedShapeError,
+                subprocess.TimeoutExpired, OSError):
             return None
-        return matches[0]
+        if not isinstance(payload, dict) or payload.get('authenticated') is not True:
+            return None
+        user_id = payload.get('user_id')
+        if not isinstance(user_id, str) or not user_id.strip():
+            return None
+        return user_id
 
     def _loan_query_borrowed(self, arguments):
         """Borrowed loans of one borrower, via ``aitable record query --all``.
@@ -526,3 +787,47 @@ class DwsTransport:
         except (DingTalkShapeError, KeyError, TypeError) as exc:
             raise ContractError(Code.EVIDENCE) from exc
         return ok_envelope(result={'loan_ids': sorted(loan_ids)})
+
+
+def pending_stage_report(work_dir):
+    """Read-only ops view of the unresolved stage creates in a run directory.
+
+    The stage index is the only place that knows about a create whose reply was
+    lost, so this is the exit a human needs: one row per pending stage, with the
+    action, the title (or the claimed task id when the reply did arrive but the
+    post-create read did not) and what the last recovery attempt concluded.
+
+    ``needs_manual_confirmation`` means the stage was **not** proven missing: the
+    title scan either ran outside the login user's executor scope or could not
+    read the list at all, so a human has to look the todo up in DingTalk before
+    the driver is allowed to create a second one. Only ``not_built`` (scan over
+    both completion statuses, actor = login account, still 0 hits) is a stage
+    that is safe to build.
+    """
+    path = Path(work_dir) / 'dws-stage-index.json'
+    if not path.exists():
+        return ()
+    store = json.loads(path.read_text(encoding='utf-8'))
+    by_operation = store.get('by_operation') or {}
+    if not isinstance(by_operation, dict):
+        raise UnsupportedShapeError('dws-stage-index.json 的 by_operation 不是对象')
+    rows = []
+    for operation_id, meta in sorted(by_operation.items()):
+        if not isinstance(meta, dict) or not meta.get('pending'):
+            continue
+        rows.append({
+            'operation_id': operation_id,
+            'kind': meta.get('kind'),
+            'action': meta.get('action'),
+            'loan_id': meta.get('loan_id'),
+            'title': meta.get('title'),
+            'claimed_task_id': meta.get('claimed_task_id'),
+            'executor_contact': meta.get('executor_contact'),
+            'executor_scope': meta.get('executor_scope', SCOPE_UNKNOWN),
+            'login_user_id': meta.get('login_user_id'),
+            'recovery_state': meta.get('recovery_state', RECOVERY_NOT_ATTEMPTED),
+            'needs_manual_confirmation': bool(meta.get('needs_manual_confirmation')),
+            'recovery_reason': meta.get('recovery_reason'),
+            'recovery_attempts': int(meta.get('recovery_attempts') or 0),
+        })
+    return tuple(rows)
