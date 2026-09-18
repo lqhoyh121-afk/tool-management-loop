@@ -3,13 +3,14 @@
 Module name is unique so T09 file-based discovery does not collide. State is a
 JSON file in FAKE_DWS_STATE. SYNTHETIC identifiers only.
 
-The state file also carries the table schema (``kinds``: field id -> live cell
-kind, built with ``t03_live_cells.declared_kinds``). It is what makes reads look
-like the platform: this double stores the **write** payload, while a live read
-returns materialized cells (singleSelect option names as ``{id, name}``, person
-cells as ``[{corpId, userId}]``, numbers as strings). A field whose kind is not
-declared passes through unchanged, so the production readers fail closed instead
-of being handed a double-only shape.
+The state file must carry the table schema (``kinds``: field id -> live cell shape,
+built with ``t03_live_cells.declared_kinds``). It is what makes reads look like the
+platform: this double stores the **write** payload, while a live read returns
+materialized cells (singleSelect option names as ``{id, name}``, person cells as
+``[{corpId, userId}]``, numbers as strings). A record query against a state without a
+declared ``kinds`` is refused on stderr with a non-zero exit: the only thing this
+double could do then is echo write payloads back, which is the loose pre-#33 double
+(#73). An unknown shape name in the declaration is refused for the same reason.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ import sys
 import time
 from pathlib import Path
 
-from t03_live_cells import filter_value, live_cells
+from t03_live_cells import KindsError, filter_value, live_cells, validate_state_kinds
 
 
 def ok(**extra):
@@ -206,7 +207,14 @@ def main(argv):
         print(json.dumps(err(fail), ensure_ascii=True))
         return 0
     if argv[:3] == ['aitable', 'record', 'query']:
-        kinds = state.get('kinds') or {}
+        try:
+            kinds = validate_state_kinds(state)
+        except KindsError as exc:
+            sys.stderr.write(
+                f'fake dws 拒绝执行 record query：{exc}\n'
+                '声明字段类型的 state 缺失或写错时，替身只能把写入载荷原样回给读侧。\n'
+            )
+            return 2
         base_id = flag(argv, '--base-id')
         table_id = flag(argv, '--table-id')
         record_id = flag(argv, '--record-ids')

@@ -1,0 +1,67 @@
+{
+  "_warning": "只记录字段类型，不含真实 base/table/字段 ID，也不含任何业务数据；真实 ID 只存在本机 binding.json。",
+  "_command": "dws aitable field get --base-id <本机 base> --table-id <本机表> --yes --format json（只读）",
+  "_observed_at": "2026-09-18",
+  "_source": "本分支补做的只读字段类型观测（issue #73 第 3 项：return_container / return_id 的真机类型从未被观测）。命令只读，未写入任何表；字段属性名与 integrations/dingtalk/layout.py 的属性同名，避免记录生产字段 ID。",
+  "_why": "替身按『读回形态』物化单元格，声明必须与真机字段类型一致：singleSelect 字段读回 {id,name}，user/creator 字段读回 [{corpId,userId}]，其余类型读回字符串。没有这一步观测，『声明里没写 → 原样透传』会让替身永远绿，而生产在真机上 fail closed。",
+  "_tables_for_map": {
+    "FieldMap": ["loan_ledger", "stock_ledger", "stage_entry"],
+    "EntryFieldMap": ["stage_entry"],
+    "ApplicationFieldMap": ["application_form"],
+    "ReturnFormFieldMap": ["stage_entry"]
+  },
+  "tables": {
+    "loan_ledger": {
+      "state": "singleSelect",
+      "tracked": "singleSelect",
+      "quantity": "text",
+      "borrower": "user",
+      "approver": "user",
+      "manager": "user",
+      "due_at": "date",
+      "config_version": "text",
+      "item_container": "text",
+      "item_id": "text",
+      "physical_ids": "text",
+      "consumed_events": "text",
+      "application_evidence": "text",
+      "return_container": "text",
+      "return_id": "text"
+    },
+    "stock_ledger": {
+      "available": "text",
+      "reserved": "text",
+      "borrowed": "text",
+      "available_ids": "text",
+      "reserved_ids": "text",
+      "borrowed_ids": "text",
+      "revision": "text"
+    },
+    "stage_entry": {
+      "quantity": "text",
+      "physical_ids": "text",
+      "config_version": "text",
+      "borrower": "user",
+      "approver": "user",
+      "manager": "user",
+      "decision": "singleSelect",
+      "loan_container": "text",
+      "loan_id": "text",
+      "occurred_at": "date",
+      "action": "text",
+      "operation_id": "text",
+      "return_container": "text",
+      "return_id": "text"
+    },
+    "application_form": {
+      "quantity": "number",
+      "borrower": "creator",
+      "occurred_at": "createdTime"
+    }
+  },
+  "unobserved": {
+    "application_form": {
+      "physical_ids": "本机 binding 的 apply_fields.physical_ids 是 unset:physical_ids，该表上没有这个字段，真机类型未观测；借用台账与阶段入口两张表已观测为 text。"
+    }
+  }
+}

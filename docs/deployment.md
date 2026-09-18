@@ -195,6 +195,14 @@ python -m bootstrap --drive --runtime 运行目录 --lock-root 锁目录
 
 隔离传输不得把 singleSelect 的 `id` 设成与 `name` 相同，也不得回传空字符串字段。写入只发选项 name 字符串；读回必须是 `{id, name}`，适配器读 `.name`。假 dws CLI 读侧须把存盘中的 name 字符串物化成 `{id, name}`（与 MemoryTransport 一致），不得让生产解码接受裸字符串。物化口径按**字段类型**走，不靠字段白名单：两个替身共用 `tests/integrations/t03_live_cells.py`，字段类型在 state 的 `kinds` 里声明（select → `{id, name}`、person → `[{corpId, userId}]`、number → 字符串），未声明字段原样透传。单页/`--filters` 的 `record query --all` 命中为空时回 `records: null`（键在、值为 null），不是 `[]`。生产侧反向收紧：`id` 与 `name` 相同、出现的空字符串单元格都按未观察形态拒绝，替身不像真机时也不被迁就。空的归还字段按空而不是缺证。申请决定 `apply` 的 actor 是借款人。写超时后若台账和库存仍是发前快照，记 `NOT_SENT` 并允许按原操作重试；部分写入仍是 `UNKNOWN`，不重放。
 
+## T10 缺陷收口：读形态声明必须被守卫
+
+「按字段类型物化，不靠白名单」本身还不够：`_KINDS` 是手写的属性名清单，新增 number 类字段忘加进去时写载荷本来就是字符串，会**静默通过**；state 里没有 `kinds` 时假 CLI 会退化成完全透传（等价 #33 之前的松替身）且无告警；`return_container` / `return_id` 的真机类型从未被观测，生产却用 `read_text` 读，若真机是 singleSelect，替身会永远绿而生产报 `EVIDENCE`。三处的收口方式：
+
+1. **声明完整性**：四个 `*FieldMap` 的每个属性都必须在 `tests/integrations/t03_live_cells._KINDS` 里声明读形态；声明里出现不是映射属性的名字同样失败（`t03_kinds_guard.py`）。
+2. **读侧覆盖**：`tests/integrations/t03_read_sites.py` 用 `ast` 扫 `integrations/` 的读点，逐个解析「哪个字段属性由哪个读函数读取」，再要求声明覆盖之、且读法与声明相容（select 只能被 `read_single_select` 读，等等）。解析不出来的读点（动态字段名）报错，不静默跳过。假 dws CLI 侧：state 缺 `kinds` 或写了未知形态名时**拒绝服务**（stderr + 退出码 2），传输把它变成 `ContractError`，不再静默回原样载荷。
+3. **真机类型观测**：`tests/integrations/fixtures/t73_live_field_types.json` 记录 2026-09-18 的只读 `dws aitable field get` 观测（台账/库存/阶段入口/申请表四张表，只有字段属性名与类型，不含真实 ID 与业务数据）。台账 `return_container` / `return_id` 观测为 `text`，与生产的 `read_text` 一致；申请表 `physical_ids` 在本机 binding 里是 `unset`，该表真机类型未观测，在夹具的 `unobserved` 里注明。声明或读法与观测不符即失败，因此这类「未观测字段」不会再无声无息。
+
 ## 本阶段会做什么
 
 - 检查 Windows、Python 3.11+、文件选择能力。

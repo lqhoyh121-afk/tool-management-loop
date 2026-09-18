@@ -8,11 +8,17 @@ fake-only shape (a bare ``'awaiting_approval'`` for a select, an int for a numbe
 reaches production and production gets bent to accept what the platform never returns.
 
 Which field is which kind is a schema fact, not something the value reveals: a stored
-option name and a stored text value are both plain strings. Callers declare the map
-with :func:`declared_kinds` instead of hardcoding a couple of field ids; fields with no
-declared kind pass through unchanged, so a reader that only accepts observed shapes
-fails closed rather than being handed a materialized lie.
+option name and a stored text value are both plain strings. The declaration is
+:data:`_KINDS` — every attribute of every field map, with the read shape that field
+carries — and it is **checked rather than trusted**: ``t03_kinds_guard`` requires the
+declaration to cover the read sites found in the production sources and to agree with
+the live field types observed read-only in :file:`fixtures/t73_live_field_types.json`.
+A field missing from the declaration is a red test, never a silent pass-through (#73).
 
+These are read shapes, not a whitelist of business fields: fields declared
+``singleSelect`` / ``person`` / ``number`` are materialized by the doubles; the rest
+(``text``, ``datetime``) pass through unchanged, because the write payload already is
+the observed read shape — ``encode_*`` writes a timezone-aware ISO string for dates.
 Option ids are derived from the synthetic field id and the option name: stable for one
 option of one field (as on the platform), and never a live id.
 
@@ -24,29 +30,87 @@ import hashlib
 SINGLE_SELECT = 'singleSelect'
 PERSON = 'person'
 NUMBER = 'number'
+TEXT = 'text'
+DATETIME = 'datetime'
 
+#: Shapes the doubles rebuild on read; the other declared shapes pass through.
+MATERIALIZED = (SINGLE_SELECT, PERSON, NUMBER)
+
+#: Key the file double reads its ``{field_id: shape}`` map from.
+KINDS_KEY = 'kinds'
+
+
+class KindsError(Exception):
+    """A field-kind declaration the doubles refuse to guess around."""
+
+
+#: Every readable field attribute, with the read shape it carries. All attributes of
+#: the four production field maps appear here exactly once, so a field added to a map
+#: without a declared shape fails ``t03_kinds_guard`` loudly instead of silently
+#: passing through.
 _KINDS = (
     (SINGLE_SELECT, ('state', 'tracked', 'decision')),
     (PERSON, ('borrower', 'approver', 'manager')),
     (NUMBER, ('quantity', 'available', 'reserved', 'borrowed')),
+    (DATETIME, ('due_at', 'occurred_at')),
+    (TEXT, ('action', 'application_evidence', 'available_ids', 'borrowed_ids',
+            'config_version', 'consumed_events', 'item_container', 'item_id',
+            'loan_container', 'loan_id', 'operation_id', 'physical_ids',
+            'reserved_ids', 'return_container', 'return_id', 'revision')),
 )
+
+KINDS_DECLARATION = _KINDS
 
 
 def declared_kinds(*field_maps):
-    """``{field_id: kind}`` for the attributes the given field maps declare.
+    """``{field_id: shape}`` for the materialized attributes the given maps declare.
 
-    ``None`` maps are skipped so callers can pass optional layouts.
+    ``None`` maps are skipped so callers can pass optional layouts. Calling this with no
+    map at all is an error: the double would fall back to passing write payloads through
+    unchanged, which is the shape #33 removed.
     """
+    provided = [fields for fields in field_maps if fields is not None]
+    if not provided:
+        raise KindsError(
+            '没有字段映射就没有可物化的字段类型，替身会退化成原样透传（#33 之前的形态）'
+        )
     kinds = {}
-    for fields in field_maps:
-        if fields is None:
-            continue
-        for kind, attributes in _KINDS:
+    for fields in provided:
+        for shape, attributes in _KINDS:
+            if shape not in MATERIALIZED:
+                continue
             for attribute in attributes:
                 field_id = getattr(fields, attribute, None)
                 if isinstance(field_id, str) and field_id:
-                    kinds[field_id] = kind
+                    kinds[field_id] = shape
     return kinds
+
+
+def validate_state_kinds(state):
+    """The shape map a harness declared in the double's state, or a loud refusal.
+
+    The file double used to read ``state.get('kinds') or {}``: a hand-made state, an old
+    backup or another harness silently got the loose pre-#33 double, with payloads
+    passed through as if they were live reads. A missing key, a non-mapping, an empty
+    field id and an unknown shape name are all refusals now.
+    """
+    if KINDS_KEY not in state:
+        raise KindsError(
+            f'state 未声明 {KINDS_KEY}（字段 ID -> 读回形态）；缺它时假 CLI 只能原样透传，'
+            '读侧拿不到真机形态'
+        )
+    declared = state[KINDS_KEY]
+    if not isinstance(declared, dict):
+        raise KindsError(f'{KINDS_KEY} 应为「字段 ID -> 读回形态」的对象')
+    for field_id, shape in declared.items():
+        if not isinstance(field_id, str) or not field_id:
+            raise KindsError(f'{KINDS_KEY} 出现不是字段 ID 的键：{field_id!r}')
+        if shape not in MATERIALIZED:
+            raise KindsError(
+                f'字段 {field_id} 声明的读回形态 {shape!r} 未知；可用形态：'
+                f'{", ".join(MATERIALIZED)}'
+            )
+    return dict(declared)
 
 
 def option_id(field_id, name):
