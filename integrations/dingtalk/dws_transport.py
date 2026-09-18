@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .cells import read_creator, read_single_select
 from .codec import _put_identity
+from .envelope import extract_records, record_cells, record_id
 from .errors import DingTalkShapeError, UnsupportedShapeError, UnknownResultError
 from contracts.model import Code, ContractError, Identity, require, text
 
@@ -78,6 +79,31 @@ def windows_native_path(path):
         if not drive or '/' in abs_path or not tail.startswith('\\'):
             raise UnsupportedShapeError('--records-file 只认 Windows 原生路径')
     return abs_path
+
+
+def contact_name(payload):
+    """``contact user get`` 里的显示名；形状不认就返回空串（调用方退回 userId）。
+
+    真机观测：``result`` 是数组，显示名在 ``result[0].orgEmployeeModel.orgUserName``。
+    这里只认见过的两级位置，其余一律当没查到 —— 标题少一个名字不是错误。
+    """
+    if not isinstance(payload, dict):
+        return ''
+    rows = payload.get('result')
+    if not isinstance(rows, list):
+        return ''
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        candidates = []
+        employee = row.get('orgEmployeeModel')
+        if isinstance(employee, dict):
+            candidates.append(employee.get('orgUserName'))
+        candidates.extend((row.get('orgUserName'), row.get('userName')))
+        for value in candidates:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ''
 
 
 def ok_envelope(**extra):
@@ -182,6 +208,8 @@ class DwsTransport:
                 return self._loan_query_borrowed(arguments)
             if command == 'stage.query':
                 return self._stage_query(arguments)
+            if command == 'title.names':
+                return self._title_names(arguments)
             argv = self._argv(command, arguments)
             payload = self._run(argv)
         except (subprocess.TimeoutExpired, OSError, UnknownResultError):
@@ -237,6 +265,8 @@ class DwsTransport:
         if command == 'todo.get':
             return ['todo', 'task', 'get',
                     '--task-id', arguments['task_id']] + common
+        if command == 'contact.user.get':
+            return ['contact', 'user', 'get', '--ids', arguments['ids']] + common
         if command == 'chat.send':
             title = arguments.get('title')
             body = arguments.get('text')
@@ -422,6 +452,56 @@ class DwsTransport:
         result = payload.get('result') or {}
         detail = result.get('todoDetailModel')
         return detail if isinstance(detail, dict) else None
+
+    def _title_names(self, arguments):
+        """借用人 / 物品的显示名，只为把标题写成人话（issue #76）。
+
+        这里从不抛错：读不到就少给一个键，调用方退回资源 id / userId。多查一次的成本
+        用两个开关摊薄 —— 只有绑定给了 ``item_name_field`` 才读那格，只有点名要
+        ``borrower_names`` 才查通讯录。
+        """
+        result = {}
+        item = self._item_name(arguments)
+        if item:
+            result['item_name'] = item
+        if arguments.get('borrower_names'):
+            borrower = self._contact_name(arguments.get('borrower'))
+            if borrower:
+                result['borrower_name'] = borrower
+        return ok_envelope(result=result)
+
+    def _item_name(self, arguments):
+        """库存行里那一列物品名称；字段 ID 由绑定给，读不到就是空串。"""
+        field_id = arguments.get('item_name_field')
+        container_id = arguments.get('item_container')
+        item_id = arguments.get('item_id')
+        if not all(isinstance(value, str) and value.strip()
+                   for value in (field_id, container_id, item_id)):
+            return ''
+        try:
+            payload = self._run(self._argv('record.query', {
+                'container_id': container_id, 'resource_id': item_id}))
+            records = extract_records(payload)
+        except (DingTalkShapeError, subprocess.TimeoutExpired, OSError):
+            return ''
+        for record in records:
+            if record_id(record) != item_id:
+                continue
+            value = record_cells(record).get(field_id)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ''
+
+    def _contact_name(self, user_id):
+        """通讯录显示名；查不到（含无权限、离职、未登录）就是空串。"""
+        if not isinstance(user_id, str) or not user_id.strip():
+            return ''
+        try:
+            payload = self._run(self._argv('contact.user.get',
+                                           {'ids': user_id.strip()}))
+        except (DingTalkShapeError, subprocess.TimeoutExpired, OSError):
+            return ''
+        return contact_name(payload)
 
     def _stage_query(self, arguments):
         store = self._load_stages()

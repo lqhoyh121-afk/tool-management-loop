@@ -130,6 +130,10 @@ SPECS = {
         'required': {'--task-id', '--format'},
         'optional': set(),
     },
+    'contact user get': {
+        'required': {'--ids', '--format'},
+        'optional': set(),
+    },
     'chat message send': {
         'required': {'--title', '--text', '--yes', '--format'},
         'optional': {'--user', '--open-dingtalk-id'},
@@ -330,6 +334,17 @@ def main(argv):
             return 0
         print(json.dumps(todo_ok(result={'todoDetailModel': todo['detail']}),
                          ensure_ascii=True))
+        return 0
+    if argv[:3] == ['contact', 'user', 'get']:
+        # 显示名只认 state['contact_names'] 里点过名的 userId；没点名的查不到。
+        names = state.get('contact_names') or {}
+        rows = []
+        for user_id in (flag(argv, '--ids') or '').split(','):
+            name = names.get(user_id.strip()) if user_id.strip() else None
+            if not name:
+                continue
+            rows.append({'orgEmployeeModel': {'orgUserName': name}})
+        print(json.dumps(ok(result=rows), ensure_ascii=True))
         return 0
     if argv[:3] == ['chat', 'message', 'send']:
         print(json.dumps(ok(result={'openTaskId': 'SYNTHETIC-chat'}),

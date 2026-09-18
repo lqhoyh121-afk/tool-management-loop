@@ -9,7 +9,7 @@ Approval truth has exactly one place: the stage entry row's decision column
 (``_read_entry_form_event``). The approver's todo only carries the stage to
 the person — a completed todo is never an approval conclusion.
 """
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from contracts.flow import Receipt, verify
 from datetime import timedelta, timezone
@@ -62,11 +62,18 @@ def _form_action(name):
 
 
 
+# 标题是执行人在待办列表里唯一的信息来源：除了单号，还要能看出**谁借的、借的什么、
+# 什么时候到期**（issue #76 真机体验缺口）。`{item}` / `{borrower}` 优先用显示名，查不到
+# 就退回资源 id / userId（见 `stage_title` 与 `DisplayNames`）；`{entry}` 是审批入口链接，
+# 只有绑定显式给了才有内容（见 `_entry_suffix`）。
 _STAGE_TITLES = {
-    Action.APPROVE: '【待审批】请审批借出 ×{quantity} ｜ 单号 {loan_id} ｜ 填：决定 + 发生时间',
-    Action.ISSUE: '【待领用确认】请确认已领用 ×{quantity} ｜ 单号 {loan_id}',
+    Action.APPROVE: ('【待审批】请审批借出 {item} ×{quantity} ｜ 借用人 {borrower}'
+                     ' ｜ 到期 {due} ｜ 单号 {loan_id} ｜ 填：决定 + 发生时间{entry}'),
+    Action.ISSUE: ('【待领用确认】请确认已领用 {item} ×{quantity} ｜ 借用人 {borrower}'
+                   ' ｜ 到期 {due} ｜ 单号 {loan_id}'),
     Action.REQUEST_RETURN: '【待归还】到期 {due} ｜ 单号 {loan_id} ｜ 归还后请填归还表',
-    Action.RETURN: '【待归还确认】请确认已归还 ｜ 单号 {loan_id} ｜ 填：决定 + 发生时间',
+    Action.RETURN: ('【待归还确认】请确认已归还 {item} ×{quantity} ｜ 借用人 {borrower}'
+                    ' ｜ 到期 {due} ｜ 单号 {loan_id} ｜ 填：决定 + 发生时间'),
 }
 
 # 审批阶段另发一条催办待办给审批人。它的成败不进回执：审批结论的唯一真源是入口行的
@@ -75,20 +82,86 @@ _STAGE_TITLES = {
 _APPROVER_TODO_ACTIONS = (Action.APPROVE,)
 
 
-def stage_title(loan, action):
+@dataclass(frozen=True)
+class TitleDisplay:
+    """绑定里可选的一段「把标题写成人话」配置。三个键都可缺。
+
+    真实字段 ID / 表 ID / 表单链接只放本机绑定，不进仓库。缺一个键就按下面的口径退回，
+    绝不因为配置不全而让阶段建不出来：
+
+    - ``item_name_field``：库存表里物品名称那一列的字段 ID；没给就用物品记录 ID。
+    - ``borrower_names``：是否查通讯录显示名；查不到就用 userId。
+    - ``approve_entry_url``：审批收集表的分享链接；没给就不拼链接（保持老标题）。
+    """
+    item_name_field: str = ''
+    borrower_names: bool = False
+    approve_entry_url: str = ''
+
+    def __post_init__(self):
+        require(isinstance(self.item_name_field, str))
+        require(isinstance(self.approve_entry_url, str))
+        require(type(self.borrower_names) is bool)
+
+    @property
+    def names_enabled(self):
+        """要不要为标题多查一次名：只有配置真的要求了才查。"""
+        return bool(self.item_name_field.strip()) or self.borrower_names
+
+
+@dataclass(frozen=True)
+class DisplayNames:
+    """标题里替换 id 的显示串。空串 = 没查到，调用方退回 id。"""
+    item: str = ''
+    borrower: str = ''
+
+
+def _entry_suffix(url):
+    """审批待办里那句「去哪儿填」；没配置链接就什么都不加。"""
+    if not isinstance(url, str) or not url.strip():
+        return ''
+    return f' ｜ 填表→ {url.strip()}'
+
+
+def _display_names_from(payload):
+    """``title.names`` 报文里的显示名；形状不认就当成没查到（退回 id）。"""
+    if not isinstance(payload, dict) or payload.get('status') != 'success':
+        return DisplayNames()
+    result = payload.get('result')
+    if not isinstance(result, dict):
+        return DisplayNames()
+    item = result.get('item_name')
+    borrower = result.get('borrower_name')
+    return DisplayNames(item if isinstance(item, str) else '',
+                        borrower if isinstance(borrower, str) else '')
+
+
+def stage_title(loan, action, display=None, entry_url=''):
     """Human-readable stage todo title.
 
     The executor reads this in a todo list: keep the business单号 and what to do,
     and leave the internal operation id out of the title (it stays in the local
     stage index). Unknown actions fall back to the business单号 only.
+
+    ``display`` carries the resolved 借用人 / 物品 names and ``entry_url`` the
+    approval-collection link. Both are optional and purely cosmetic: a missing
+    or failed lookup degrades to the raw resource id / userId and to the
+    link-less title instead of blocking the stage.
+
+    这个字符串同时也是超时回查的匹配键（transport 把发出去的那份记在阶段索引里），
+    所以它必须只由「这笔单 + 这个动作 + 当次查到的显示名」决定，不能掺时间戳。
     """
     template = _STAGE_TITLES.get(action)
     shanghai = timezone(timedelta(hours=8))
+    names = display if isinstance(display, DisplayNames) else DisplayNames()
     if template is None:
         return f'{action.value} ｜ 单号 {loan.ref.resource_id}'
-    return template.format(quantity=loan.quantity,
-                           loan_id=loan.ref.resource_id,
-                           due=loan.due_at.astimezone(shanghai).strftime('%Y-%m-%d %H:%M'))
+    return template.format(
+        quantity=loan.quantity,
+        loan_id=loan.ref.resource_id,
+        due=loan.due_at.astimezone(shanghai).strftime('%Y-%m-%d %H:%M'),
+        item=names.item.strip() or loan.item.resource_id,
+        borrower=names.borrower.strip() or loan.borrower.user_id,
+        entry=_entry_suffix(entry_url))
 
 
 class DingTalkAdapter:
@@ -96,7 +169,8 @@ class DingTalkAdapter:
 
     def __init__(self, transport, journal, leases, fields, entry_fields,
                  apply_fields=None, application_container=None,
-                 return_form_fields=None, entry_container=None, loan_container=None):
+                 return_form_fields=None, entry_container=None, loan_container=None,
+                 title_display=None):
         self.transport = transport
         self.journal = journal
         self.leases = leases
@@ -107,6 +181,7 @@ class DingTalkAdapter:
         self.return_form_fields = return_form_fields
         self.entry_container = entry_container or ''
         self.loan_container = loan_container or ''
+        self.title_display = title_display
 
     def read_loan(self, ref):
         return decode_loan(ref, self._record_cells(ref), self.fields)
@@ -185,9 +260,10 @@ class DingTalkAdapter:
                 return self.query_stage(request)
         self.journal.save_receipt(StageReceipt(request.operation_id, Outcome.UNKNOWN))
         command = 'todo.create' if request.action in (Action.ISSUE, Action.RETURN) else 'form.create'
+        display = self._display_names(request.loan)
         try:
             payload = self.transport.exchange(command, self._stage_arguments(
-                request, request.operation_id, request.actor.user_id))
+                request, request.operation_id, request.actor.user_id, display))
             if command == 'todo.create':
                 require_todo_envelope(payload)
             else:
@@ -207,10 +283,35 @@ class DingTalkAdapter:
             self.journal.save_receipt(receipt)
             return receipt
         if request.action in _APPROVER_TODO_ACTIONS:
-            self._nudge_approver(request)
+            self._nudge_approver(request, display)
         return self.query_stage(request)
 
-    def _stage_arguments(self, request: StageRequest, operation_id, actor):
+    def _display_names(self, loan):
+        """借用人 / 物品的显示名；只有绑定点名要了才查，查不到一律退回 id。
+
+        这是纯装饰性的一次读，进不了任何回执：解析不出名字不改变阶段结果，也不改变
+        审批结论（结论只在入口行的「决定」列）。传输层把可用/失败都收成一个报文，
+        这里只做宽进严出的取值。
+        """
+        config = self.title_display
+        if config is None or not config.names_enabled:
+            return DisplayNames()
+        try:
+            payload = self.transport.exchange('title.names', {
+                'tenant_id': loan.ref.tenant_id,
+                'item_container': loan.item.container_id,
+                'item_id': loan.item.resource_id,
+                'borrower': loan.borrower.user_id,
+                'item_name_field': config.item_name_field.strip(),
+                'borrower_names': config.borrower_names,
+            })
+        except (UnknownResultError, DingTalkShapeError, ContractError,
+                KeyError, TypeError, ValueError):
+            return DisplayNames()
+        return _display_names_from(payload)
+
+    def _stage_arguments(self, request: StageRequest, operation_id, actor,
+                         display=None):
         """One stage payload; operation id and recipient stay the caller's choice.
 
         The approver nudge reuses this shape under its own operation id, so it can
@@ -224,7 +325,8 @@ class DingTalkAdapter:
             'item_container': request.loan.item.container_id,
             'item_id': request.loan.item.resource_id,
             'action': request.action.value,
-            'title': stage_title(request.loan, request.action),
+            'title': stage_title(request.loan, request.action, display,
+                                 self._approve_entry_url()),
             'actor': actor,
             'borrower': request.loan.borrower.user_id,
             'approver': request.loan.approver.user_id,
@@ -234,7 +336,12 @@ class DingTalkAdapter:
             'physical_ids': list(request.loan.physical_ids),
         }
 
-    def _nudge_approver(self, request: StageRequest):
+    def _approve_entry_url(self):
+        """审批收集表的分享链接，只从本机绑定读；没配就是空串（老标题）。"""
+        config = self.title_display
+        return '' if config is None else config.approve_entry_url.strip()
+
+    def _nudge_approver(self, request: StageRequest, display=None):
         """Send the approver a todo for this stage; the entry row stays the truth.
 
         Recipient is the loan's approver. This todo carries no authoritative
@@ -246,7 +353,7 @@ class DingTalkAdapter:
         try:
             payload = self.transport.exchange('todo.create', self._stage_arguments(
                 request, f'{request.operation_id}:approver-todo',
-                request.loan.approver.user_id))
+                request.loan.approver.user_id, display))
             require_todo_envelope(payload)
         except DingTalkShapeError:  # 超时、业务拒绝、形态异常：只是催办没发出去
             return None
