@@ -11,7 +11,7 @@ later pass used to report nothing but DUPLICATE_EVENT. See
 `_finish_pending_reservation`.
 """
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from contracts.flow import Outcome
@@ -73,6 +73,11 @@ class DriveReport:
     (operation ids) and never mixed into the recovery count. ``stage_checked``
     holds the known loan refs the reconcile examined. Reconcile skips travel in
     ``skipped`` like every other skip, tagged ``kind='stage'``.
+
+    ``healed`` is not a fourth bucket: every healed loan also appears in
+    ``processed``, because the pass really did write its reservation. The entry
+    carries the read failure the queue row reported (``code``), which is why the
+    heal ran, and never decided whether it ran.
     """
 
     recovered: tuple
@@ -81,6 +86,7 @@ class DriveReport:
     blocked: tuple
     stage_checked: tuple = ()
     stage_created: tuple = ()
+    healed: tuple = ()
 
 
 def _drive_outcome(item, code):
@@ -154,6 +160,11 @@ def format_drive_lines(report):
     if waiting:
         ids = '，'.join(o.source_id for o in waiting)
         lines.append(f'  其中待人工 {len(waiting)} 条（阶段待办尚未完成，不是证据不足）：{ids}')
+    if report.healed:
+        lines.append(
+            '  自愈补齐 {summary}，按已落库审批补写预留'.format(
+                summary=format_outcome_summary(report.healed))
+        )
     for label, outcomes in (('跳过', report.skipped), ('挂起', report.blocked)):
         for outcome in outcomes:
             lines.append(
@@ -200,10 +211,22 @@ class DriveLoop:
         self.locks = locks
 
     def run(self):
+        """One pass, with ``blocked_loans`` limited to genuinely unresolved writes.
+
+        The set carries the journal's unresolved operation ids plus the loan of
+        an item that just failed with ``UNKNOWN`` — the only case where
+        ``WRITE_UNKNOWN_QUERY_FIRST`` about a sibling entry is true. A loan
+        blocked for any other reason (half-finished transition, unreadable
+        evidence, a stock snapshot that no longer matches the approval) must not
+        spread: the sibling entries of that loan are still evaluated against
+        their own fresh read, otherwise one bad row starves the entry that can
+        finish the transition and reports every sibling under a code that lies.
+        """
         assert_business_allowed(self.engine.binding, self.engine.lease, self.locks)
         processed = []
         skipped = []
         blocked = []
+        healed = []
         recovered = self._recover()
         stage_checked, stages_created, stage_skips = self._reconcile_stages()
         skipped.extend(stage_skips)
@@ -213,9 +236,8 @@ class DriveLoop:
                 blocked.append(_drive_outcome(item, Code.UNKNOWN.value))
                 continue
             try:
-                self._handle(item)
+                explanation = self._handle(item)
             except _Pending as exc:
-                blocked_loans.add(item.loan_ref)
                 blocked.append(_drive_outcome(item, exc.code.value))
                 continue
             except ContractError as exc:
@@ -228,8 +250,10 @@ class DriveLoop:
                 skipped.append(_drive_outcome(item, exc.code.value))
                 continue
             processed.append(item)
+            if explanation is not None:
+                healed.append(_drive_outcome(item, explanation.value))
         return DriveReport(tuple(recovered), tuple(processed), tuple(skipped), tuple(blocked),
-                           tuple(stage_checked), tuple(stages_created))
+                           tuple(stage_checked), tuple(stages_created), tuple(healed))
 
     def _recover(self):
         recovered = []
@@ -281,6 +305,14 @@ class DriveLoop:
         return matched
 
     def _handle(self, item):
+        """One queue item; returns the read failure a heal had to work around.
+
+        An item normally drives the transition its own row carries. The
+        exception is a loan whose row still reads ``reservation_pending``: there
+        this row's evidence is not the judge — see
+        `_finish_pending_reservation` — and the original failure travels back to
+        the report as an explanation, never as the decision.
+        """
         loan_ref = self._resolve_loan_ref(item)
         loan = self.engine.reader.read_loan(loan_ref)
         check_binding(self.engine.binding, loan)
@@ -289,37 +321,48 @@ class DriveLoop:
             self.engine.admit_application(loan_ref, item.source)
             current = self.engine.reader.read_loan(loan_ref)
             self._ensure_current_stage(current)
-            return
+            return None
         try:
             execution = self.engine.execute(loan_ref, item.source)
         except ContractError as exc:
-            if exc.code != Code.DUPLICATE or loan.state != State.RESERVATION_PENDING:
+            if exc.code in (Code.INSTANCE, Code.UNKNOWN):
                 raise
-            self._finish_pending_reservation(item, loan)
-            return
+            if loan.state != State.RESERVATION_PENDING:
+                raise
+            return self._finish_pending_reservation(loan, exc.code)
         if execution.outcome == Outcome.UNKNOWN:
             raise ContractError(Code.UNKNOWN)
         if execution.outcome != Outcome.VERIFIED:
-            return
+            # 平台明确回报这次写没有落地（NOT_SENT/NOT_APPLIED）：跳过它，
+            # 不能静默计成「已处理」——单还停在原地，人要看得见。
+            raise ContractError(Code.READBACK)
         current = execution.loan
         if current.state == State.RESERVATION_PENDING:
             event = self.engine.reader.read_event(current, item.source)
-            self._reserve(current, event)
-            return
+            return self._reserve(current, event)
         self._ensure_current_stage(current)
+        return None
 
-    def _reserve(self, loan, event):
-        """Run the system reservation, then expose the next human stage."""
+    def _reserve(self, loan, event, original=None):
+        """Run the system reservation, then expose the next human stage.
+
+        Returns the read failure the caller was working around (``original``),
+        so a heal can be reported as a heal. A reservation the platform reports
+        as never sent or never applied is a skip, not a processed item.
+        """
         reserved = self.engine.reserve(loan.ref, event)
         if reserved.outcome == Outcome.UNKNOWN:
             raise ContractError(Code.UNKNOWN)
+        if reserved.outcome in (Outcome.NOT_SENT, Outcome.NOT_APPLIED):
+            # 预留没落地：跳过并留给下一轮，别报告成功。
+            raise ContractError(Code.READBACK)
         if reserved.outcome != Outcome.VERIFIED:
-            return
+            return original
         self._ensure_current_stage(reserved.loan)
+        return original
 
-    def _finish_pending_reservation(self, item, loan):
-        """审批已写、预留未写：finish the reservation instead of only reporting
-        DUPLICATE_EVENT on every pass.
+    def _finish_pending_reservation(self, loan, original=None):
+        """借出行停在 reservation_pending：从日志补齐这一跳，而不是每轮只报重复事件。
 
         The approval event is already in the loan's `consumed_events`, so the
         engine refuses to re-plan it and the loan would sit in
@@ -333,36 +376,62 @@ class DriveLoop:
           same-id/different-payload intent and unresolved writes are queried
           instead of replayed, so nothing is submitted twice;
         * plan() refuses RESERVE unless the fresh loan read still says
-          `reservation_pending` and the reserve event was never consumed, so an
-          already-applied reservation cannot move stock again;
-        * the stock move is compare-before-write on a fresh inventory read with
-          quantity and physical-id preconditions, not a blind increment.
+          `reservation_pending` and the reserve event was never consumed, and
+          the movement itself only proves what the read it was planned from
+          shows: enough `available` for the quantity, plus the adapter's
+          compare-before-write against that same read — a guard over the
+          window between read and write, not a proof about history;
+        * what history is checked against is the stock snapshot recorded in the
+          approval receipt: the fresh stock read must still match it (adapter
+          revision token aside). A hand-edited table — stock row already
+          `reserved` while the loan row still says `reservation_pending` —
+          fails that comparison, so this pass reports a blocked item and moves
+          nothing instead of reserving the quantity a second time. Any stock
+          movement between the approval write and this pass (a concurrent loan,
+          say) is escalated to a human for the same reason.
 
-        Unprovable evidence is reported as a blocked item, never retried.
+        Unprovable evidence is reported as a blocked item, never retried, and
+        never guessed at.
         """
-        event = self._recorded_approval(loan, item.source)
-        if event is None:
+        current = self.engine.reader.read_loan(loan.ref)
+        if current.state != State.RESERVATION_PENDING:
             raise _Pending(Code.STATE)
-        self._reserve(loan, event)
+        record = self._recorded_approval(current)
+        if record is None:
+            raise _Pending(Code.STATE)
+        event, snapshot = record
+        if snapshot is None:
+            raise _Pending(Code.STATE)
+        fresh = self.engine.reader.read_inventory(current.item)
+        if replace(fresh, revision=snapshot.revision) != snapshot:
+            # 库存行和审批回执记录的快照对不上：已经有人动过这张表，这一份预留
+            # 到没到账无从证明，交给人工，别照着猜再迁一次。
+            raise _Pending(Code.CONFLICT)
+        return self._reserve(current, event, original)
 
-    def _recorded_approval(self, loan, source):
-        """The applied approval event for this loan, or None when unprovable.
+    def _recorded_approval(self, loan):
+        """The applied approval for this loan plus its recorded stock snapshot.
 
         Only a readback-verified approval write whose event the ledger already
-        consumed qualifies; zero or several candidates fail closed.
+        consumed qualifies; zero or several candidates fail closed. The queue
+        row that carried the entry is deliberately *not* part of the key: a
+        hand-edited or re-typed row must not be able to hide the approval write
+        that did land, and the loan ref + ``action == APPROVE`` + consumed +
+        ``VERIFIED`` + exactly-one-candidate conditions already make the match
+        unique. Returns ``(event, snapshot)`` or ``None``.
         """
         found = []
         for operation_id in self.store.ids():
             intent, receipt = self.store.load(operation_id)
             if isinstance(intent, StageRequest) or intent.event.action != Action.APPROVE:
                 continue
-            if intent.before.ref != loan.ref or intent.event.source != source:
+            if intent.before.ref != loan.ref:
                 continue
             if receipt is None or receipt.outcome != Outcome.VERIFIED:
                 continue
             if intent.event.event_id not in loan.consumed_events:
                 continue
-            found.append(intent.event)
+            found.append((intent.event, receipt.inventory))
         return found[0] if len(found) == 1 else None
 
     def _known_loans(self):

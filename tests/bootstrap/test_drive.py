@@ -21,7 +21,7 @@ from bootstrap.journal import FileJournal
 from bootstrap.wizard import main
 from contracts.model import Action, Code, ContractError, Identity, IdentityBinding, Inventory, Resource, State
 from contracts.ports import LedgerScope, RuntimeBinding, StageReceipt, stage_operation_id
-from contracts.flow import Outcome
+from contracts.flow import Outcome, Receipt
 from workflow.engine import LendingEngine
 
 
@@ -694,6 +694,262 @@ class DriveTests(unittest.TestCase):
                        'synthetic-not-a-block'):
             self.blocked(Code.CONFIG, lambda broken=broken: title_display_from_document(
                 binding_document(title_display=broken)))
+
+
+    def test_hand_edited_stock_snapshot_blocks_the_heal_without_moving_stock(self):
+        """库存行已是「已预留」而借出行仍停在 reservation_pending：不许再迁一次库存。
+
+        手改表造出的形状：审批已落库、预留也已经在库存行上，只有借出行没跟着走。
+        这一跳的判据是审批回执记录的库存快照，不是「借出行还说 pending」。
+        """
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            self.approval_written(harness)
+            harness.writer.ledger_stock = Inventory(fixtures.ITEM, 3, 2, 0, (), (), (),
+                                                    'synthetic-hand-edit')
+            sources = StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),))
+
+            report = DriveLoop(harness.engine, sources, harness.journal, harness.locks).run()
+
+            self.assertEqual(report.processed, ())
+            self.assertEqual([o.code for o in report.blocked], [Code.CONFLICT.value])
+            self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state,
+                             State.RESERVATION_PENDING)
+            # 关键断言：库存一步没动（旧行为会再迁一次 → (1,4,0)）。
+            self.assertEqual(
+                (harness.writer.ledger_stock.available, harness.writer.ledger_stock.reserved,
+                 harness.writer.ledger_stock.borrowed),
+                (3, 2, 0),
+            )
+            self.assertEqual(harness.writer.writes, 1)  # 只有那次审批写
+
+            # 再跑一轮：顺序不变也不会自己动起来。
+            again = DriveLoop(harness.engine, sources, harness.journal, harness.locks).run()
+            self.assertEqual([o.code for o in again.blocked], [Code.CONFLICT.value])
+            self.assertEqual(
+                (harness.writer.ledger_stock.available, harness.writer.ledger_stock.reserved,
+                 harness.writer.ledger_stock.borrowed),
+                (3, 2, 0),
+            )
+            self.assertEqual(harness.writer.writes, 1)
+        finally:
+            harness.stop()
+
+    def test_approval_that_never_landed_blocks_the_heal(self):
+        """审批回执不是 VERIFIED（NOT_SENT）：审批其实没写成功，不许照着它动库存。"""
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            approve = harness.event(Action.APPROVE)
+            harness.reader.set_event(fixtures.LOAN, fixtures.FORM, approve)
+            execution = harness.engine.execute(fixtures.LOAN, fixtures.FORM)
+            self.assertEqual(execution.outcome, Outcome.VERIFIED)
+            harness.reader.set_loan(replace(harness.reader.read_loan(fixtures.LOAN),
+                                            state=State.RESERVATION_PENDING,
+                                            consumed_events=(approve.event_id,)))
+            # 平台其实没有收到这次审批写：回执改写成 NOT_SENT（带真实回读快照的形态，
+            # 真适配器 query 就是这么回的），只有本机镜像以为它落地了。
+            harness.journal.save_receipt(Receipt(
+                execution.operation_id, Outcome.NOT_SENT, 'synthetic-not-sent-readback',
+                harness.reader.read_loan(fixtures.LOAN), harness.writer.ledger_stock))
+
+            report = DriveLoop(
+                harness.engine, StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),)),
+                harness.journal, harness.locks).run()
+
+            self.assertEqual(report.processed, ())
+            self.assertEqual([o.code for o in report.blocked], [Code.STATE.value])
+            self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state,
+                             State.RESERVATION_PENDING)
+            # 关键断言：按未落地的审批发放是不允许的，库存不动。
+            self.assertEqual(
+                (harness.writer.ledger_stock.available, harness.writer.ledger_stock.reserved,
+                 harness.writer.ledger_stock.borrowed),
+                (5, 0, 0),
+            )
+            self.assertEqual(harness.writer.writes, 1)
+        finally:
+            harness.stop()
+
+    def test_two_recorded_approvals_fail_closed(self):
+        """两条都已落库、都被消费的审批：不挑一条用，挂起等人工，库存不动。
+
+        挑任意一条都会让 operation_id 随候选而变，换来换去就不再幂等。
+        """
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            first = harness.event(Action.APPROVE)
+            second = replace(first, source=fixtures.APPLY_FORM, event_id='synthetic-approve-2')
+            harness.reader.set_event(fixtures.LOAN, fixtures.FORM, first)
+            harness.reader.set_event(fixtures.LOAN, fixtures.APPLY_FORM, second)
+            harness.engine.execute(fixtures.LOAN, fixtures.FORM)
+            # 第二个来源行也写了一次审批：借出行复位后重放一次，两条都真实落库。
+            harness.reader.set_loan(replace(harness.reader.read_loan(fixtures.LOAN),
+                                            state=State.AWAITING_APPROVAL))
+            harness.engine.execute(fixtures.LOAN, fixtures.APPLY_FORM)
+
+            report = DriveLoop(
+                harness.engine, StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),)),
+                harness.journal, harness.locks).run()
+
+            self.assertEqual(report.processed, ())
+            self.assertEqual([o.code for o in report.blocked], [Code.STATE.value])
+            self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state,
+                             State.RESERVATION_PENDING)
+            # 关键断言：多候选必须拒绝，库存不动。
+            self.assertEqual(
+                (harness.writer.ledger_stock.available, harness.writer.ledger_stock.reserved,
+                 harness.writer.ledger_stock.borrowed),
+                (5, 0, 0),
+            )
+            self.assertEqual(harness.writer.writes, 2)
+        finally:
+            harness.stop()
+
+    def test_blocked_sibling_entry_is_not_reported_as_an_unresolved_write(self):
+        """同单另一条条目不得被牵连成「写入未决」：那是假话，还会把自愈饿死。
+
+        审批回执是 verified，机器上没有任何未决写；同单第一条挂起不该让第二条
+        改口成 WRITE_UNKNOWN_QUERY_FIRST。
+        """
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            approve = harness.event(Action.APPROVE)
+            loan, stock = fixtures.settled(fixtures.loan(), approve, fixtures.stock())
+            harness.reader.set_loan(loan)  # 借出行停在 reservation_pending、审批已被消费
+            harness.writer.ledger_stock = stock
+            harness.reader.set_event(fixtures.LOAN, fixtures.FORM, approve)
+            harness.reader.set_event(fixtures.LOAN, fixtures.APPLY_FORM, approve)
+
+            report = DriveLoop(
+                harness.engine,
+                StaticSources((
+                    WorkItem('event', fixtures.LOAN, fixtures.FORM),
+                    WorkItem('event', fixtures.LOAN, fixtures.APPLY_FORM),
+                )),
+                harness.journal, harness.locks).run()
+
+            self.assertEqual([o.code for o in report.blocked],
+                             [Code.STATE.value, Code.STATE.value])
+            self.assertNotIn(Code.UNKNOWN.value, [o.code for o in report.blocked])
+            self.assertEqual(harness.writer.writes, 0)
+            self.assertEqual(harness.writer.ledger_stock.available, 5)
+        finally:
+            harness.stop()
+
+    def test_heal_does_not_depend_on_the_queue_row_it_arrived_on(self):
+        """自愈的判据是日志里已落库的审批，不是队列那行的来源。
+
+        同一份审批被复制成另一行时，那一行的条目也必须能补完预留；不然同单的
+        坏行会把唯一能完成这一跳的条目一起挡住。
+        """
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            self.approval_written(harness)
+            approve = harness.reader.read_event(harness.reader.read_loan(fixtures.LOAN),
+                                                fixtures.FORM)
+            stale = fixtures.APPLY_FORM
+            harness.reader.set_event(fixtures.LOAN, stale, approve)
+
+            report = DriveLoop(
+                harness.engine,
+                StaticSources((
+                    WorkItem('event', fixtures.LOAN, stale),
+                    WorkItem('event', fixtures.LOAN, fixtures.FORM),
+                )),
+                harness.journal, harness.locks).run()
+
+            self.assertEqual([o.code for o in report.blocked], [])
+            self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state, State.AWAITING_ISSUE)
+            self.assertEqual(
+                (harness.writer.ledger_stock.available, harness.writer.ledger_stock.reserved,
+                 harness.writer.ledger_stock.borrowed),
+                (3, 2, 0),
+            )
+            self.assertEqual(harness.writer.writes, 2)
+            self.assertEqual([o.code for o in report.healed], [Code.DUPLICATE.value])
+        finally:
+            harness.stop()
+
+    def test_edited_decision_row_still_heals_from_the_recorded_approval(self):
+        """审批行被改成拒绝：单不该只落一条跳过，预留按日志里的审批补上。"""
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            self.approval_written(harness)
+            harness.reader.set_event(fixtures.LOAN, fixtures.FORM, harness.event(Action.REJECT))
+
+            report = DriveLoop(
+                harness.engine, StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),)),
+                harness.journal, harness.locks).run()
+
+            self.assertEqual(len(report.processed), 1)
+            self.assertEqual(report.blocked, ())
+            self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state, State.AWAITING_ISSUE)
+            self.assertEqual(
+                (harness.writer.ledger_stock.available, harness.writer.ledger_stock.reserved,
+                 harness.writer.ledger_stock.borrowed),
+                (3, 2, 0),
+            )
+            self.assertEqual(harness.writer.writes, 2)
+            # 原错误码作为说明输出，不当作判据。
+            self.assertEqual([o.code for o in report.healed], [Code.STATE.value])
+            lines = '\n'.join(format_drive_lines(report))
+            self.assertIn('自愈补齐 1（INVALID_STATE×1）', lines)
+        finally:
+            harness.stop()
+
+    def test_unreadable_decision_row_still_heals_from_the_recorded_approval(self):
+        """审批行读不出来（EVIDENCE_REQUIRED）：同样按已落库的审批补完预留。"""
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            self.approval_written(harness)
+
+            def unreadable(_loan, _source):
+                raise ContractError(Code.EVIDENCE)
+
+            harness.reader.read_event = unreadable
+            report = DriveLoop(
+                harness.engine, StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),)),
+                harness.journal, harness.locks).run()
+
+            self.assertEqual(report.blocked, ())
+            self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state, State.AWAITING_ISSUE)
+            self.assertEqual(
+                (harness.writer.ledger_stock.available, harness.writer.ledger_stock.reserved,
+                 harness.writer.ledger_stock.borrowed),
+                (3, 2, 0),
+            )
+            self.assertEqual(harness.writer.writes, 2)
+            self.assertEqual([o.code for o in report.healed], [Code.EVIDENCE.value])
+        finally:
+            harness.stop()
+
+    def test_reservation_reported_as_never_sent_is_a_visible_skip(self):
+        """预留那一步平台回报 NOT_SENT：跳过它，不能静默计成「已处理」。"""
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            self.approval_written(harness)
+            original = harness.writer.submit
+
+            def submit(intent, binding, lease):
+                if intent.event.action == Action.RESERVE:
+                    return Receipt(intent.operation_id, Outcome.NOT_SENT)
+                return original(intent, binding, lease)
+
+            harness.writer.submit = submit
+            report = DriveLoop(
+                harness.engine, StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),)),
+                harness.journal, harness.locks).run()
+
+            self.assertEqual(report.processed, ())
+            self.assertEqual([o.code for o in report.blocked], [])
+            self.assertEqual([o.code for o in report.skipped if o.kind == 'event'],
+                             [Code.READBACK.value])
+            self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state,
+                             State.RESERVATION_PENDING)
+            self.assertEqual(harness.writer.ledger_stock.available, 5)
+            self.assertEqual(harness.writer.ledger_stock.reserved, 0)
+        finally:
+            harness.stop()
 
 
 if __name__ == '__main__':
