@@ -75,6 +75,32 @@ def _form_action(name):
         raise ContractError(Code.EVIDENCE) from exc
 
 
+def _matching_item_ids(rows, name_field, wanted):
+    """库存记录里名称**逐字**等于 ``wanted`` 的那些记录 id（issue #89）。
+
+    名称格缺失的行直接跳过：一条没有名字的记录不可能是「名字叫 wanted」的那一条，
+    跳过它不是丢掉候选，而是它根本没参与这个名字的竞争。
+
+    名称格出现却读不成名字（空串这类未观察形态，或者根本不是字符串）是
+    ``EVIDENCE``：静默跳掉会让两条同名物品看起来只有一条命中，于是拿一条同名但
+    未被验证的记录去建台账行 —— 那是猜，不是核对。
+
+    比对只去首尾空白，不做前缀 / 包含 / 大小写模糊匹配：「万用表」对上「高压万用表」
+    会建出一条指向**另一个工具**的台账行，正是这里不能做的事。
+    """
+    matched = []
+    for row in rows:
+        cells = record_cells(row)
+        if name_field not in cells or cells[name_field] is None:
+            continue
+        value = cells[name_field]
+        if not isinstance(value, str) or not value.strip():
+            raise ContractError(Code.EVIDENCE)
+        if value.strip() == wanted:
+            matched.append(record_id(row))
+    return matched
+
+
 
 # 标题是执行人在待办列表里唯一的信息来源：除了单号，还要能看出**谁借的、借的什么、
 # 什么时候到期**（issue #76 真机体验缺口）。`{item}` / `{borrower}` 优先用显示名，查不到
@@ -184,7 +210,7 @@ class DingTalkAdapter:
     def __init__(self, transport, journal, leases, fields, entry_fields,
                  apply_fields=None, application_container=None,
                  return_form_fields=None, entry_container=None, loan_container=None,
-                 title_display=None):
+                 title_display=None, inventory_container=None):
         self.transport = transport
         self.journal = journal
         self.leases = leases
@@ -196,6 +222,10 @@ class DingTalkAdapter:
         self.entry_container = entry_container or ''
         self.loan_container = loan_container or ''
         self.title_display = title_display
+        # 库存（物品记录）所在容器：申请行按「工具」名称解析物品时的搜索范围（#89）。
+        # 活绑定里就是台账作用域那一张表（``ledger.container_key``）—— 与
+        # ``check_binding`` 要求物品记录所在的位置同源，不引入第二个常量。
+        self.inventory_container = inventory_container or ''
 
     def read_loan(self, ref):
         return decode_loan(ref, self._record_cells(ref), self.fields)
@@ -731,14 +761,17 @@ class DingTalkAdapter:
         """One application row as a validated draft; every gap fails closed.
 
         缺项、缺失字段映射、形态未观察过都不补默认值：调用方据此按跳过记账。
+
+        物品指向（issue #89）：申请行**不再必须**携带「容器 + 记录 ID」两格。两格都声明
+        且这一行都填了就用它们（#78 的老口径一字不改），否则按「工具」单选的名字在库存
+        容器里解析出唯一一条物品记录；两条路都走不通就是 ``CONFIG`` / ``EVIDENCE``，
+        口径见 :meth:`_application_item`。
         """
         fields = self.apply_fields
         require(fields is not None, Code.CONFIG)
         require(source.kind == 'form' and source.container_id == self.application_container,
                 Code.EVIDENCE)
-        # 声明检查先做：没声明这一格是 CONFIG，不是「去读一个空的字段 ID」。
-        self._declared(fields.item_container)
-        self._declared(fields.item_id)
+        # 归还时间的声明检查保留（#78）：本机已配，缺它就没有「到期」可比。
         self._declared(fields.due_at)
         cells = self._record_cells(source)
         try:
@@ -749,22 +782,124 @@ class DingTalkAdapter:
                 physical_ids = _text_list(cells, fields.physical_ids)
             else:
                 physical_ids = ()
-            item_container = read_text(cells, fields.item_container)
-            item_id = read_text(cells, fields.item_id)
             due_at = read_datetime(cells, fields.due_at)
+            item = self._application_item(source.tenant_id, cells)
         except ContractError:
             raise
         except (DingTalkShapeError, KeyError) as exc:
             _closed(exc)
         return ApplicationDraft(
             source=source,
-            item=Resource('record', source.tenant_id, item_container, item_id),
+            item=item,
             borrower=borrower,
             quantity=quantity,
             physical_ids=physical_ids,
             occurred_at=occurred,
             due_at=due_at,
         )
+
+    def _application_item(self, tenant_id, cells):
+        """申请行指向的物品记录：行内两格优先，其次按「工具」名称解析（issue #89）。
+
+        「直接携带」= 两格都在绑定里声明过、**且**这一行都填了：那是 #78 的老口径，
+        一字不改地优先。只填了其中一格是半份答案 —— ``EVIDENCE``，既不猜另一半，也不
+        退回按名称解析：申请行里已经给出了一部分指向，绕开它去按名字找是另一种猜。
+
+        两格都没在这行给出（没声明，或者声明了但这一行没填）才按名称解析：本机申请表
+        只有 6 列、这两格是默认空值，名称解析是唯一可能的路径。
+        """
+        direct = self._direct_item(tenant_id, cells)
+        if direct is not None:
+            return direct
+        return self._item_by_name(tenant_id, cells)
+
+    def _direct_item(self, tenant_id, cells):
+        """行内「容器 + 记录 ID」两格给出的物品记录；这行没给出就是 ``None``。
+
+        两格是**文字**格（与台账行上的同名两格同一类型）：读不出来（空串这类未观察
+        形态）在调用处按 ``EVIDENCE`` 收尾，绝不读成空容器或空 id。
+        """
+        container_field = self.apply_fields.item_container
+        id_field = self.apply_fields.item_id
+        container_given = (_is_declared(container_field)
+                           and container_field in cells and cells[container_field] is not None)
+        id_given = (_is_declared(id_field)
+                    and id_field in cells and cells[id_field] is not None)
+        if not (container_given or id_given):
+            return None
+        require(container_given and id_given, Code.EVIDENCE)
+        return Resource('record', tenant_id,
+                        read_text(cells, container_field), read_text(cells, id_field))
+
+    def _item_by_name(self, tenant_id, cells):
+        """「工具」单选的名字 → 库存容器里唯一一条同名物品记录（issue #89）。
+
+        名字来自申请行上的「工具」单选题（``apply_fields.item``；本机真机类型是
+        singleSelect，选项名就是库存表名称列里的物品名）。申请人填不出记录 ID，所以
+        名字是申请行唯一能给出的物品信息；解析不出来一律 fail closed，按行给出可见
+        原因码：
+
+        * 没声明「工具」格 / 没给库存容器 / 没给名称列 → ``CONFIG``
+          （实例没把这条路的配置配全；没声明「工具」格的实例仍是 #78 的老行为：
+          逐行 ``CONFIG_RECONFIRM_REQUIRED``，等操作员补绑定，不静默建行）
+        * 这一行没填「工具」→ ``EVIDENCE``（没有可解析的名字，不猜是哪个物品）
+        * 库存表读不出来 / 某一行名称格不是已观察形态 → ``EVIDENCE``（读不全就不比）
+        * 名称对不上任何一条记录、或对上不止一条 → ``EVIDENCE``
+
+        候选是**整张库存表**、在引擎侧逐行读名比对，不在传输层按名称过滤：平台侧的
+        等值过滤会把「读不出来的行」静默变成「不存在的行」，多命中就看不出来了
+        （与 #77 的 ``_matching_borrowed_loans`` 同一口径）。
+        """
+        item_field = self.apply_fields.item
+        require(_is_declared(item_field), Code.CONFIG)
+        container = self.inventory_container
+        require(isinstance(container, str) and bool(container.strip()), Code.CONFIG)
+        name_field = self._item_name_field()
+        if item_field not in cells or cells[item_field] is None:
+            raise ContractError(Code.EVIDENCE)
+        try:
+            wanted = read_single_select(cells, item_field).name.strip()
+            require(bool(wanted), Code.EVIDENCE)
+            rows = self._inventory_rows(tenant_id, container)
+            matched = _matching_item_ids(rows, name_field, wanted)
+        except ContractError:
+            raise
+        except (DingTalkShapeError, KeyError, TypeError) as exc:
+            _closed(exc)
+        require(len(matched) == 1, Code.EVIDENCE)
+        return Resource('record', tenant_id, container, matched[0])
+
+    def _item_name_field(self):
+        """库存名称列的字段 ID（``title_display.item_name_field``，#76 的只读通道）。
+
+        没配就没有「名字」可读：这个实例的申请行不能按名称解析，按 ``CONFIG`` 记账。
+        与 #77 同一口径 —— 那条路的名称比对要求的也是同一格。
+        """
+        display = self.title_display
+        if display is None:
+            raise ContractError(Code.CONFIG)
+        field_id = display.item_name_field
+        require(isinstance(field_id, str) and bool(field_id.strip()), Code.CONFIG)
+        return field_id.strip()
+
+    def _inventory_rows(self, tenant_id, container):
+        """库存容器的全部行（一次 ``row.list``）；读不到就 fail closed。
+
+        ``records: null`` 且 ``hasMore`` 恰好为 false 才是「库存表真的没有物品」——
+        那种情况由调用处的「唯一命中」判定成 ``EVIDENCE``，不会被读成「名称没问题」。
+        """
+        try:
+            payload = self.transport.exchange('row.list', {
+                'tenant_id': tenant_id,
+                'container_id': container,
+            })
+            return query_rows(payload)
+        except UnknownResultError as exc:
+            _closed(exc, Code.UNKNOWN)
+        except BusinessErrorResponse as exc:
+            _closed(exc, _business_code(exc))
+        except DingTalkShapeError as exc:
+            _closed(exc)
 
     def create_application_loan(self, draft: ApplicationDraft, binding, lease):
         """Create the ledger row for one application and prove it by readback.

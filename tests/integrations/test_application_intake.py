@@ -27,7 +27,7 @@ from bootstrap.instance import MachineLock
 from bootstrap.journal import FileJournal
 from contracts.model import Code, ContractError, Resource, State
 from contracts.ports import LedgerScope, RuntimeBinding
-from integrations.dingtalk.adapter import DingTalkAdapter
+from integrations.dingtalk.adapter import DingTalkAdapter, TitleDisplay
 from integrations.dingtalk.application import application_marker
 from integrations.dingtalk.codec import _put_identity, encode_loan
 from integrations.dingtalk.dws_transport import DwsTransport
@@ -496,3 +496,76 @@ class AutoIntakeDriveTests(unittest.TestCase):
         text = '\n'.join(format_intake_lines(report.intake))
         self.assertIn('水位未配置', text)
         self.assertIn('application_intake.since', text)
+
+
+#: 库存名称列的字段 ID（绑定里的 ``title_display.item_name_field``）与「工具」答案。
+NAME_FIELD = 'fldSYN-stock-item-name'
+TOOL = 'SYN-万用表'
+
+
+class NameResolvedIntakeDriveTests(AutoIntakeDriveTests):
+    """#89 的验收主路径：申请行只填「工具 / 数量 / 归还日期」，物品按名称解析。
+
+    这一层把 ``AutoIntakeDriveTests`` 的全部端到端断言（一轮内出台账行 + 审批入口 +
+    审批待办、重跑不建第二条、水位之前的行不建、空表与形态变化 fail closed）在
+    **新的物品来源**上再跑一遍：申请行不再携带「容器 + 记录 id」两格，物品由「工具」
+    单选的选项名在库存容器里解析出来，所以同一套幂等 / 水位 / fail-closed 断言都
+    必须照样成立。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # 库存记录必须就是绑定作用域里的那一条：解析出来的物品要能过 check_binding。
+        self.transport.seed_record(ITEM, {NAME_FIELD: TOOL})
+        self.adapter = DingTalkAdapter(
+            self.transport, self.store, self.locks, SYNTHETIC_FIELDS,
+            SYNTHETIC_ENTRY_FIELDS, apply_fields=SYNTHETIC_APPLY_FIELDS,
+            application_container=APPLY_CONTAINER,
+            return_form_fields=SYNTHETIC_RETURN_FORM_FIELDS,
+            entry_container='synthetic-forms', loan_container=LOAN_CONTAINER,
+            inventory_container=ITEM.container_id,
+            title_display=TitleDisplay(item_name_field=NAME_FIELD))
+
+    def submit(self, row_id='synthetic-apply-row-1', occurred=None, tool=TOOL):
+        cells = {
+            SYNTHETIC_APPLY_FIELDS.borrower: _put_identity(BORROWER),
+            SYNTHETIC_APPLY_FIELDS.quantity: '2',
+            SYNTHETIC_APPLY_FIELDS.physical_ids: '[]',
+            SYNTHETIC_APPLY_FIELDS.occurred_at: (
+                NOW - timedelta(days=1) if occurred is None else occurred).isoformat(),
+            SYNTHETIC_APPLY_FIELDS.item: tool,
+            SYNTHETIC_APPLY_FIELDS.due_at: (NOW + timedelta(days=2)).isoformat(),
+        }
+        ref = Resource('form', 'synthetic-org', APPLY_CONTAINER, row_id)
+        self.transport.seed_record(ref, cells)
+        return ref
+
+    def test_the_registered_row_points_at_the_named_inventory_record(self):
+        """零人工登记：一行只填「工具」也能建成台账行，且指向名称解析出来的记录。"""
+        self.submit()
+        engine, loop = self.start()
+        try:
+            report = loop.run()
+        finally:
+            engine.stop()
+        self.assertEqual(report.intake.skipped, ())
+        self.assertEqual(len(report.intake.findings), 1)
+        loan = self.adapter.read_loan(self.sources.pending()[0].loan_ref)
+        self.assertEqual(loan.item, ITEM)
+        self.assertEqual(loan.state, State.AWAITING_APPROVAL)
+
+    def test_a_tool_name_that_matches_nothing_is_skipped_visibly(self):
+        """名称对不上库存记录：逐行可见原因码，不建行、不登记、不推待办（fail closed）。"""
+        row = self.submit(tool='SYN-绝缘手套')
+        engine, loop = self.start()
+        try:
+            report = loop.run()
+        finally:
+            engine.stop()
+        self.assertEqual(report.intake.findings, ())
+        self.assertEqual([(skip.row_id, skip.code) for skip in report.intake.skipped],
+                         [(row.resource_id, Code.EVIDENCE.value)])
+        self.assertEqual(self.transport.writes_of('loan.create'), [])
+        self.assertEqual(self.transport.writes_of('form.create'), [])
+        self.assertEqual(self.transport.writes_of('todo.create'), [])
+        self.assertEqual(self.sources.pending(), ())

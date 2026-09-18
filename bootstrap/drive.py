@@ -845,7 +845,7 @@ def title_display_from_document(document):
 def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=None,
                  apply_fields=None, application_container=None,
                  return_form_fields=None, loan_container=None,
-                 title_display=None):
+                 title_display=None, inventory_container=None):
     """Build DingTalkAdapter only from explicit binding fields. Never guess dws."""
     from integrations.dingtalk.adapter import DingTalkAdapter
     from integrations.dingtalk.dws_transport import DwsTransport
@@ -872,6 +872,15 @@ def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=No
         require(isinstance(loan_container, str) and loan_container.strip(), Code.CONFIG)
     if title_display is None:
         title_display = title_display_from_document(document)
+    if inventory_container is None:
+        # 申请行按「工具」名称解析物品时的搜索范围（#89）：就是台账作用域那一张表。
+        # 与 ``check_binding`` 要求物品记录所在的位置同源 —— 解析到别的表里的记录会
+        # 在建行时被 WRONG_LOAN 拦下，所以这里不引入第二个常量、也不猜。
+        ledger = document.get('ledger')
+        require(isinstance(ledger, dict), Code.CONFIG)
+        inventory_container = ledger.get('container_key')
+        require(isinstance(inventory_container, str) and inventory_container.strip(),
+                Code.CONFIG)
     transport = DwsTransport(
         cmd, fields, form_container=form_container, todo_container=todo_container,
         work_dir=runtime, entry_fields=entry_fields,
@@ -881,6 +890,7 @@ def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=No
         apply_fields=apply_fields, application_container=application_container,
         return_form_fields=return_form_fields, entry_container=form_container,
         loan_container=loan_container, title_display=title_display,
+        inventory_container=inventory_container,
     )
 
 
