@@ -49,14 +49,16 @@ class KindsError(Exception):
 #: without a declared shape fails ``t03_kinds_guard`` loudly instead of silently
 #: passing through.
 #:
-#: ``item`` is #77's optional「归还物品」cell on the return form. The read side
-#: (``DingTalkAdapter._return_item_value``) takes the ``{id, name}`` object of the
-#: single-select question and matches on ``.name`` (a plain string, which the live
-#: pre-#77 rows and a text field in that slot would produce, is tolerated too), so the
-#: declared read shape is ``singleSelect`` — the shape the double must materialize. The
-#: live type is *not* observed: that question is added by a human on the form view and
-#: the stage-entry table does not carry it yet, which is what the fixture's
-#: 「真机类型未观测」note records.
+#: ``item`` is a single-select question under that name on two tables. On the
+#: application table it is #89's「工具」question, whose option name the engine resolves to
+#: an inventory record (``DingTalkAdapter._item_by_name``); its live type was observed
+#: read-only as ``singleSelect``. On the stage-entry table it is #77's optional
+#: 「归还物品」question: the read side (``DingTalkAdapter._return_item_value``) takes the
+#: ``{id, name}`` object and matches on ``.name`` (a plain string, which the live pre-#77
+#: rows and a text field in that slot would produce, is tolerated too), so the declared
+#: read shape is ``singleSelect`` — the shape the double must materialize. That table's
+#: live type is *not* observed: the question is added by a human on the form view and the
+#: table does not carry it yet, which is what the fixture's「真机类型未观测」note records.
 _KINDS = (
     (SINGLE_SELECT, ('state', 'tracked', 'decision', 'item')),
     (PERSON, ('borrower', 'approver', 'manager')),

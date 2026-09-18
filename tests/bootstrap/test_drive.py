@@ -770,6 +770,32 @@ class DriveTests(unittest.TestCase):
         self.assertFalse(link_only.names_enabled)
         self.assertTrue(link_only.approve_entry_url)
 
+    def test_live_adapter_resolves_items_inside_the_ledger_scope(self):
+        """#89：按「工具」名称解析物品的搜索范围 = 绑定台账作用域那一张表。
+
+        解析出来的物品必须落在这个作用域里，否则建行时 ``check_binding`` 会按
+        ``WRONG_LOAN`` 拦下 —— 所以范围与绑定同源，不引入第二个常量、也不猜。
+        """
+        from bootstrap.drive import live_adapter
+        from bootstrap.journal import FileJournal
+
+        document = binding_document(
+            dws_cmd=[sys.executable, '-c', 'pass'],
+            form_container='baseForm/tblForm',
+            todo_container='todoSpace/executors',
+        )
+        adapter = live_adapter(
+            self.runtime, FileJournal(self.runtime / 'operations'),
+            MachineLock(self.locks), document)
+        self.assertEqual(adapter.inventory_container,
+                         document['ledger']['container_key'])
+        # 调用方显式给值时以调用方的为准（注入替身的测试用得上）。
+        injected = live_adapter(
+            self.runtime, FileJournal(self.runtime / 'operations'),
+            MachineLock(self.locks), document,
+            inventory_container='synthetic-stock-injected')
+        self.assertEqual(injected.inventory_container, 'synthetic-stock-injected')
+
     def test_broken_title_display_blocked_as_config(self):
         from bootstrap.drive import title_display_from_document
         for broken in ({'item_name_field': 7},

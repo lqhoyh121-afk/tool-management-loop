@@ -2,7 +2,7 @@
   "_warning": "只记录字段类型，不含真实 base/table/字段 ID，也不含任何业务数据；真实 ID 只存在本机 binding.json。",
   "_command": "dws aitable field get --base-id <本机 base> --table-id <本机表> --yes --format json（只读）",
   "_observed_at": "2026-09-18",
-  "_source": "本分支补做的只读字段类型观测（issue #73 第 3 项：return_container / return_id 的真机类型从未被观测）。命令只读，未写入任何表；字段属性名与 integrations/dingtalk/layout.py 的属性同名，避免记录生产字段 ID。",
+  "_source": "本分支补做的只读字段类型观测（issue #73 第 3 项：return_container / return_id 的真机类型从未被观测）；#89 又补一次申请表 field get（同一条只读命令），观测到申请表上的「工具」单选题（属性名 item）与「归还日期」（属性名 due_at），并复核该表只有 6 列、没有物品指向的两格。命令只读，未写入任何表；字段属性名与 integrations/dingtalk/layout.py 的属性同名，避免记录生产字段 ID。",
   "_why": "替身按『读回形态』物化单元格，声明必须与真机字段类型一致：singleSelect 字段读回 {id,name}，user/creator 字段读回 [{corpId,userId}]，其余类型读回字符串。没有这一步观测，『声明里没写 → 原样透传』会让替身永远绿，而生产在真机上 fail closed。",
   "_tables_for_map": {
     "FieldMap": ["loan_ledger", "stock_ledger", "stage_entry"],
@@ -56,15 +56,16 @@
     "application_form": {
       "quantity": "number",
       "borrower": "creator",
-      "occurred_at": "createdTime"
+      "occurred_at": "createdTime",
+      "due_at": "date",
+      "item": "singleSelect"
     }
   },
   "unobserved": {
     "application_form": {
       "physical_ids": "本机 binding 的 apply_fields.physical_ids 是 unset:physical_ids，该表上没有这个字段，真机类型未观测；借用台账与阶段入口两张表已观测为 text。",
-      "item_container": "#78 自动发现要用它（申请行上的物品指向，另一半是 item_id）才能建出不自己造物品的台账行。本夹具的申请表观测只记录了 quantity / borrower / occurred_at 三格（见 tables.application_form），这三格没有进那次只读观测：要么表上还没有这三格，要么建了但没被这次 field get 覆盖。启用自动发现的实例必须先在 apply_fields 里声明它们，并补一次只读 field get 观测把这三格挪进 tables.application_form 后删掉本条注记；没声明它们的实例继续逐行 CONFIG_RECONFIRM_REQUIRED，绝不按未观测的形态去读。",
-      "item_id": "同 application_form/item_container：本表这一格的真机类型未观测，原因见那条注记（#78 物品指向的另一半）。读侧按 text 读。",
-      "due_at": "同 application_form/item_container：本表这一格的真机类型未观测，原因见那条注记。读侧按 datetime 读（apply_fields.due_at），沿用台账与阶段入口两张表 due_at=date 的观测。"
+      "item_container": "#89 只读 field get 复核：本机申请表只有 6 列（提交时间 / 数量 / 工具 / 提交人 / 归还日期 / 标题），**没有**物品指向的两格。从 #89 起这两格不再是自动发现的必需项（申请行的物品由「工具」单选按名称解析，见 DingTalkAdapter._application_item），但仍保留为可选声明：某个实例真在申请行上打了这两格并填写时，读侧按 text 读它们并**优先**采用。本机没有这两格，所以真机类型无从观测。",
+      "item_id": "同 application_form/item_container：物品指向的容器与记录 id 这两格不在本机申请表上，真机类型无从观测；读侧按 text 读，且只在申请行真的填了这两格时才读。"
     },
     "stage_entry": {
       "item": "#77 的可选「归还物品」格。这一格是人在这张表的表单视图上手工加的单选题（开放接口不提供建题能力，见 docs/deployment.md），本机该表当前只有 14 个字段、没有这一格（本次只读 field get 复核：return_id / 归还时间 / action / 借用人 / return_container / approver / manager / quantity / decision / physical_ids / operation_id / loan_id / loan_container / config_version），所以真机类型未观测，无从观测。读侧 DingTalkAdapter._return_item_value() 取 {id,name} 单选对象的 .name（纯字符串也容忍），声明为 singleSelect；等这一格真的上线，再做一次只读观测把它挪进 tables.stage_entry 并删掉本条注记。"

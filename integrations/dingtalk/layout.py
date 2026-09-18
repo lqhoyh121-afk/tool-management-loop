@@ -57,17 +57,28 @@ class EntryFieldMap:
 class ApplicationFieldMap:
     """Application collection table field IDs. Distinct from stage-entry EntryFieldMap.
 
-    ``item_container`` / ``item_id`` / ``due_at`` are what turns an application row
-    into a ledger row (issue #78). They are optional only so an existing binding
-    keeps loading: a missing or ``unset:``-prefixed value means "this instance has
-    not declared that question", and the discovery then fails closed and reports
-    the row as unregistered instead of inventing an item or a due time.
+    ``item`` is the「工具」question (#89): a single-select whose **option name** is the
+    item's name as the stock table spells it (``title_display.item_name_field``). It is
+    how a live application row names its item, because a human can pick a name in a
+    dropdown but cannot type ``<container>`` + ``<record id>`` into the form.
+
+    ``item_container`` / ``item_id`` stay supported and are read **first**: a row that
+    really carries both cells keeps the pre-#89 exact pointer, and only a row without
+    them is resolved by name. They remain optional keys so an existing binding keeps
+    loading; a missing or ``unset:``-prefixed value means "this instance has not
+    declared that question", and the discovery then fails closed and reports the row as
+    unregistered instead of inventing an item.
+
+    ``due_at`` stays required for automatic discovery: without it there is no
+    acceptance-time comparison (#78 第 5 条), so the row is ``CONFIG`` rather than
+    registered with an invented due time.
     """
 
     quantity: str
     physical_ids: str
     borrower: str
     occurred_at: str
+    item: str = ''
     item_container: str = ''
     item_id: str = ''
     due_at: str = ''
@@ -149,6 +160,7 @@ SYNTHETIC_APPLY_FIELDS = ApplicationFieldMap(
     physical_ids='fldSYN-apply-pids',
     borrower='fldSYN-apply-borrower',
     occurred_at='fldSYN-apply-occurred',
+    item='fldSYN-apply-item',
     item_container='fldSYN-apply-item-container',
     item_id='fldSYN-apply-item-id',
     due_at='fldSYN-apply-due',

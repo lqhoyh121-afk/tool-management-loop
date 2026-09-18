@@ -192,14 +192,17 @@ class KindsDeclarationTests(unittest.TestCase):
             mentions(problems, 'physical_ids', '既没有观测，也没有'), problems)
 
     def test_the_optional_return_item_rests_on_its_written_gap_note(self):
-        """#77's「归还物品」cell (#83 sync): a single-select whose live type is not observed.
+        """#77's「归还物品」cell (#83/#89 sync): the stage-entry table still has no such field.
 
-        The question is added by a human on the return form view and the stage-entry
-        table does not carry it yet, so the declaration rests on the fixture's
-        「真机类型未观测」note — not on a guessed live type, and not on a pass-through.
+        #89 observed the application table's「工具」question read-only — same attribute
+        name ``item``, live type ``singleSelect`` — so ``item`` is no longer an attribute
+        with no observation anywhere. On **stage_entry** the question is still added by a
+        human on the return form view and the table does not carry it yet, so that
+        declaration continues to rest on the fixture's「真机类型未观测」note: not on a
+        guessed live type, and not on a pass-through.
         """
         self.assertEqual(declared()['item'], SINGLE_SELECT)
-        self.assertNotIn('item', observed_live_types())
+        self.assertEqual(observed_live_types()['item'], frozenset({'singleSelect'}))
         fixture = live_type_fixture()
         self.assertIn('item', fixture['unobserved']['stage_entry'])
         self.assertNotIn('item', fixture['tables']['stage_entry'])
@@ -211,16 +214,18 @@ class KindsDeclarationTests(unittest.TestCase):
         fixture = json.loads(json.dumps(live_type_fixture()))
         fixture['unobserved']['stage_entry'].pop('item')
         problems = check(fixture=fixture)
-        self.assertTrue(mentions(problems, 'item', '没有真机字段类型观测'), problems)
+        # #89 起 item 在申请表上有观测，所以这里亮的是「逐表」那条：阶段入口表上既没有
+        # 观测也没有注记。全局那条由 test_a_declared_field_without_an_observation 守着。
         self.assertTrue(mentions(problems, 'item', '既没有观测，也没有'), problems)
+        self.assertTrue(mentions(problems, 'ReturnFormFieldMap', 'stage_entry'), problems)
 
     def test_a_blank_gap_note_does_not_excuse_a_missing_observation(self):
         """A「未观测」note without a reason is the silent pass-through #73 removes."""
         fixture = json.loads(json.dumps(live_type_fixture()))
         fixture['unobserved']['stage_entry']['item'] = '   '
         problems = check(fixture=fixture)
-        self.assertTrue(mentions(problems, 'item', '没有真机字段类型观测'), problems)
         self.assertTrue(mentions(problems, 'item', '既没有观测，也没有'), problems)
+        self.assertTrue(mentions(problems, 'ReturnFormFieldMap', 'stage_entry'), problems)
 
     def test_a_gap_note_never_excuses_a_shape_the_read_side_does_not_speak(self):
         """The note buys the missing observation only; the read side still rules."""
