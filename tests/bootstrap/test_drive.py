@@ -218,6 +218,53 @@ class DriveTests(unittest.TestCase):
         finally:
             harness.stop()
 
+    def test_every_processed_item_is_named_with_its_transition(self):
+        """摘要里的「处理 N」必须条条点得出名字与迁移（#93）。
+
+        真机实测：一条已完成的阶段待办被消费、台账推到已借出，报告里除「处理 1」之外
+        一个字都没有 —— 「漏消费」与「消费了」在日志上长得一模一样。所以每条处理都要有
+        一行，且行里的迁移是这一条的**净效果**（审批这一条落了两笔写，只报一段）。
+        """
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            harness.reader.set_event(fixtures.LOAN, fixtures.FORM,
+                                     harness.event(Action.APPROVE))
+            sources = StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),))
+
+            report = DriveLoop(harness.engine, sources, harness.journal,
+                               harness.locks).run()
+
+            self.assertEqual(len(report.processed), 1)
+            self.assertEqual(len(report.evidence), 1)
+            named = report.evidence[0]
+            self.assertEqual((named.kind, named.loan_id, named.source_kind, named.source_id),
+                             ('event', fixtures.LOAN.resource_id,
+                              fixtures.FORM.kind, fixtures.FORM.resource_id))
+            self.assertEqual(named.before_state, State.AWAITING_APPROVAL.value)
+            self.assertEqual(named.after_state, State.AWAITING_ISSUE.value)
+            lines = format_drive_lines(report)
+            self.assertEqual(sum(1 for line in lines if line.startswith('  处理 ')),
+                             len(report.processed))
+            self.assertIn(f'  处理 event loan={fixtures.LOAN.resource_id} '
+                          f'form={fixtures.FORM.resource_id} '
+                          f'awaiting_approval→awaiting_issue_confirmation',
+                          '\n'.join(lines))
+        finally:
+            harness.stop()
+
+    def test_a_pass_that_did_nothing_names_nothing(self):
+        """反向判据：没得处理时不许印「处理」行（有行就等于说推进了单）。"""
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            report = DriveLoop(harness.engine, StaticSources(()), harness.journal,
+                               harness.locks).run()
+            self.assertEqual((report.processed, report.evidence), ((), ()))
+            lines = format_drive_lines(report)
+            self.assertIn('处理 0，', lines[0])
+            self.assertNotIn('  处理 ', '\n'.join(lines))
+        finally:
+            harness.stop()
+
     def test_apply_source_creates_approval_stage(self):
         harness = DriveHarness(self.runtime, self.locks)
         try:
