@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from contracts.model import Code, ContractError, Resource, State, aware, require
-from contracts.ports import check_binding
+from contracts.ports import FormRow, check_binding, row_ref
 from integrations.dingtalk.application import application_marker
 
 from .gate import assert_business_allowed
@@ -196,7 +196,10 @@ class ApplicationIntake:
         seen = set()
         for row in rows:
             scanned += 1
-            row_id = row.resource_id
+            # 扫描行（``FormRow``）带着扫描时的单元格：下面只把它折算成引用用 —— 要建行
+            # 的行一律拿裸引用精读一次，扫描内容只用来「确证不用管」（见 _scanned_history）。
+            ref = row_ref(row)
+            row_id = ref.resource_id
             if row_id in seen:
                 # 同一行在一份清单里出现两次：不猜哪一次是真的，两次都不动。
                 skipped.append(IntakeSkip(row_id, Code.DUPLICATE.value))
@@ -212,7 +215,7 @@ class ApplicationIntake:
                     skipped.append(IntakeSkip(row_id, Code.INVALID.value))
                     continue
                 try:
-                    loan_ref = self._adopt(row)
+                    loan_ref = self._adopt(ref)
                 except ContractError as exc:
                     if exc.code == Code.INSTANCE:
                         raise
@@ -222,7 +225,7 @@ class ApplicationIntake:
                     # 记过「正在建」但按链路键找不到行：不重发，等人工核。
                     skipped.append(IntakeSkip(row_id, Code.UNKNOWN.value))
                     continue
-                findings.append(RegisteredApply(row, loan_ref))
+                findings.append(RegisteredApply(ref, loan_ref))
                 continue
             if row_id in known_ids:
                 known += 1
@@ -231,8 +234,13 @@ class ApplicationIntake:
                 # 没有水位就不建：首次启用不得把表里的历史行全建成台账行。
                 skipped.append(IntakeSkip(row_id, Code.CONFIG.value))
                 continue
+            # 扫描内容在手上时先看时间格（本地解码，不发平台调用）：确证在水位之前的行不
+            # 值得再发一次精读。判不准（没带单元格、时间格解不出来）照旧往下逐行精读。
+            if self._scanned_history(row):
+                history.append(row_id)
+                continue
             try:
-                draft = self.port.read_application(row)
+                draft = self.port.read_application(ref)
             except ContractError as exc:
                 if exc.code == Code.INSTANCE:
                     raise
@@ -243,16 +251,35 @@ class ApplicationIntake:
                 history.append(row_id)
                 continue
             try:
-                loan_ref = self._create(row_id, row, draft)
+                loan_ref = self._create(row_id, ref, draft)
             except ContractError as exc:
                 if exc.code == Code.INSTANCE:
                     raise
                 skipped.append(IntakeSkip(row_id, exc.code.value))
                 continue
-            findings.append(RegisteredApply(row, loan_ref))
+            findings.append(RegisteredApply(ref, loan_ref))
         return self._report(container, scanned=scanned, known=known,
                             findings=tuple(findings), skipped=tuple(skipped),
                             history=tuple(history))
+
+    def _scanned_history(self, row):
+        """扫描内容能不能确证「这一行在水位之前」（只解时间格，不构造草稿）。
+
+        只在端口把**扫描时的单元格**一起给了（``FormRow``）时才问，而且问端口里那个只解
+        时间格的探针：构造申请草稿会顺带读一整张库存表（按名称解析物品），预筛一次等于
+        再加一次全表读。判不准（探针不存在、时间格解不出来）返回 ``False`` —— 预筛只会
+        **少做**平台调用，永远不会把「判不准」当成「不用管」。
+        """
+        if not isinstance(row, FormRow) or self.since is None:
+            return False
+        probe = getattr(self.port, 'scanned_application_time', None)
+        if probe is None:
+            return False
+        try:
+            occurred = probe(row)
+        except ContractError:
+            return False
+        return occurred is not None and occurred < self.since
 
     def _report(self, container, **fields):
         return IntakeReport(container=container, since=self._since_text(), **fields)

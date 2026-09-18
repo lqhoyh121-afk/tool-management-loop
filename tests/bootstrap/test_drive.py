@@ -1,11 +1,12 @@
 """L1/L2 lending drive over FileJournal. SYNTHETIC ports only; no live DingTalk."""
 import importlib.util
 import io
+import json
 import sys
 import tempfile
 import unittest
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -17,11 +18,12 @@ from bootstrap.binding import save_binding
 from bootstrap.drive import (HANG_NOTES, DriveLoop, FileSources, Hang, StaticSources,
                              WorkItem, drive_exit_code, dump_sources, format_drive_lines,
                              run_bound_drive)
-from bootstrap.instance import MachineLock
+from bootstrap.instance import MachineLock, pid_alive, slot_path
 from bootstrap.journal import FileJournal
 from bootstrap.wizard import main
 from contracts.model import Action, Code, ContractError, Identity, IdentityBinding, Inventory, Resource, State
-from contracts.ports import LedgerScope, RuntimeBinding, StageReceipt, stage_operation_id
+from contracts.ports import (LedgerScope, RuntimeBinding, StageReceipt, lease_key,
+                             stage_operation_id)
 from contracts.flow import Outcome, Receipt
 from workflow.engine import LendingEngine
 
@@ -694,6 +696,84 @@ class DriveTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('驱动完成', stdout.getvalue())
         self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state, State.AWAITING_ISSUE)
+
+    def test_cli_drive_skips_the_round_when_another_instance_holds_the_lock(self):
+        """被占用（不是死锁）：明说「上一轮未结束，本轮跳过」，这一轮一个写入都不做。
+
+        退出码 0：占用中是「另一个实例正在推进」的正常稳态，跳过不是失败（等下一轮即可）。
+        文字里保留 ``SECOND_INSTANCE_BLOCKED``，定时脚本现有的分支照着它认。
+        """
+        harness = DriveHarness(self.runtime, self.locks)      # 另一个实例：持锁在跑
+        approve = harness.event(Action.APPROVE)
+        harness.reader.set_event(fixtures.LOAN, fixtures.FORM, approve)
+        dump_sources(self.runtime / 'sources.json', (
+            WorkItem('event', fixtures.LOAN, fixtures.FORM),
+        ))
+        stdout = io.StringIO()
+        code = main(
+            ['--drive', '--runtime', str(self.runtime), '--lock-root', str(self.locks)],
+            stdin=io.StringIO(''), stdout=stdout, wait_on_error=False,
+            environ_kwargs=dict(ENV, runtime_dir=str(self.runtime)),
+            ports={
+                'reader': harness.reader,
+                'writer': harness.writer,
+                'stages': harness.stages,
+                'sources': FileSources(self.runtime / 'sources.json'),
+                'locks': harness.locks,
+                'store': harness.journal,
+            },
+        )
+        text = stdout.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn('上一轮未结束，本轮跳过', text)
+        self.assertIn('SECOND_INSTANCE_BLOCKED', text)
+        self.assertNotIn('锁接管', text)
+        self.assertNotIn('驱动完成', text)
+        self.assertEqual(harness.writer.writes, 0)
+        self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state, State.AWAITING_APPROVAL)
+        harness.stop()
+
+    def test_cli_drive_takes_over_an_abandoned_slot_and_says_so(self):
+        """被杀进程留下的锁槽：这一轮自动接管并继续跑，报告与「被占用」分开说。"""
+        harness = DriveHarness(self.runtime, self.locks)
+        scope = harness.binding.ledger
+        harness.stop()
+        dead = next(candidate for candidate in range(999_999, 999_000, -1)
+                    if pid_alive(candidate) is False)
+        slot = slot_path(self.locks, scope)
+        slot.mkdir(parents=True)
+        (slot / 'scope').write_text(lease_key(scope) + '\n', encoding='utf-8')
+        now = datetime.now().astimezone().isoformat(timespec='seconds')
+        (slot / 'holder.json').write_text(json.dumps({
+            'pid': dead, 'started_at': now, 'heartbeat_at': now}), encoding='utf-8')
+        approve = harness.event(Action.APPROVE)
+        harness.reader.set_event(fixtures.LOAN, fixtures.FORM, approve)
+        dump_sources(self.runtime / 'sources.json', (
+            WorkItem('event', fixtures.LOAN, fixtures.FORM),
+        ))
+        stdout = io.StringIO()
+        code = main(
+            ['--drive', '--runtime', str(self.runtime), '--lock-root', str(self.locks)],
+            stdin=io.StringIO(''), stdout=stdout, wait_on_error=False,
+            environ_kwargs=dict(ENV, runtime_dir=str(self.runtime)),
+            ports={
+                'reader': harness.reader,
+                'writer': harness.writer,
+                'stages': harness.stages,
+                'sources': FileSources(self.runtime / 'sources.json'),
+                'locks': harness.locks,
+                'store': harness.journal,
+            },
+        )
+        text = stdout.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn('锁接管', text)
+        self.assertIn('不需要人工清槽', text)
+        self.assertIn('驱动完成', text)
+        self.assertNotIn('本轮跳过', text)
+        # 接管之后这一轮真的跑完了业务：申请已批，进「待发放」。
+        self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state, State.AWAITING_ISSUE)
+        self.assertFalse(slot.exists())
 
     def test_cli_drive_without_dws_config_fails_closed(self):
         stdout = io.StringIO()

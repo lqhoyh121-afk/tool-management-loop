@@ -30,7 +30,7 @@
 from dataclasses import dataclass
 
 from contracts.model import Code, ContractError, Resource, State, aware, require
-from contracts.ports import check_binding
+from contracts.ports import FormRow, check_binding, row_ref
 
 from .gate import assert_business_allowed
 from .inbox import referenced_sources
@@ -49,6 +49,10 @@ REGISTER_NOTES = {
 DUPLICATE_NOTE = '同一行在一次扫描里出现两次，两次都不动'
 #: 没配水位时每行都记这条：报告要写明「配了才会自动登记」。
 NO_WATERMARK_NOTE = REGISTER_NOTES[Code.CONFIG.value]
+#: 扫描内容就地定性这一行的三种结论（判不准时是 ``None``，交给逐行精读）。
+_SCANNED_ENTRY = 'entry'
+_SCANNED_HISTORY = 'history'
+_SCANNED_CONFIG = 'config'
 
 
 @dataclass(frozen=True)
@@ -199,7 +203,8 @@ class ReturnIntake:
         seen = set()
         for row in rows:
             scanned += 1
-            row_id = row.resource_id
+            ref = row_ref(row)
+            row_id = ref.resource_id
             if row_id in seen:
                 # 同一行在一份清单里出现两次：不猜哪一次是真的，两次都不动。
                 skipped.append(ReturnSkip(row_id, Code.DUPLICATE.value, DUPLICATE_NOTE))
@@ -208,8 +213,22 @@ class ReturnIntake:
             if row_id in known_ids:
                 known += 1
                 continue
+            # 扫描内容在手上先就地定性一次：入口行 / 空白行 / 水位之前的行不值得再为它发
+            # 一次平台读（归还表里大多数行是这三种）。判不准（端口的扫描行没带单元格、
+            # 形态没见过、解码不通过）一律 ``None``，照旧逐行精读。
+            scope = self._scanned_scope(row)
+            if scope == _SCANNED_ENTRY:
+                entry_rows.append(row_id)
+                continue
+            if scope == _SCANNED_CONFIG:
+                skipped.append(ReturnSkip(row_id, Code.CONFIG.value, NO_WATERMARK_NOTE))
+                continue
+            if scope == _SCANNED_HISTORY:
+                history.append(row_id)
+                continue
+            # 要**动**这一行（登记一条引用）才精读：判据永远来自裸引用上的一次平台读。
             try:
-                draft = self.port.read_return(row)
+                draft = self.port.read_return(ref)
             except ContractError as exc:
                 if exc.code == Code.INSTANCE:
                     raise
@@ -228,17 +247,42 @@ class ReturnIntake:
                 history.append(row_id)
                 continue
             try:
-                loan_ref = self._register(row, draft)
+                loan_ref = self._register(ref, draft)
             except ContractError as exc:
                 if exc.code == Code.INSTANCE:
                     raise
                 skipped.append(ReturnSkip(row_id, exc.code.value,
                                           REGISTER_NOTES.get(exc.code.value, '')))
                 continue
-            findings.append(RegisteredReturn(row, loan_ref))
+            findings.append(RegisteredReturn(ref, loan_ref))
         return self._report(container, scanned=scanned, known=known,
                             findings=tuple(findings), skipped=tuple(skipped),
                             history=tuple(history), entry_rows=tuple(entry_rows))
+
+    def _scanned_scope(self, row):
+        """扫描内容能不能就地定性这一行（**不发平台调用**）。
+
+        只在端口把**扫描时的单元格**一起给了（``FormRow``）时判，而且只用两样本地事实：
+        这一行是不是归还提交（与 :meth:`read_return` 同一套判据）、归还时间在不在水位之后。
+        判出来是入口行 / 空白行 / 水位之前 / 水位没配的归还提交，就不必再为它发一次平台
+        读 —— 归还表 22 行里省下的就是这一笔（单轮 60~100 秒的大头）。
+
+        判不准一律返回 ``None``：裸引用（替身端口、老接口）、形态没见过、解码不通过都交给
+        逐行精读。预筛只会**少做**平台调用，永远不会把「判不准」当成「不用管」。
+        """
+        if not isinstance(row, FormRow):
+            return None
+        try:
+            draft = self.port.read_return(row)
+        except ContractError:
+            return None
+        if draft is None:
+            return _SCANNED_ENTRY
+        if self.since is None:
+            return _SCANNED_CONFIG
+        if draft.occurred_at < self.since:
+            return _SCANNED_HISTORY
+        return None
 
     def _report(self, container, **fields):
         return ReturnReport(container=container, since=self._since_text(), **fields)

@@ -9,9 +9,10 @@ from bootstrap.env_check import check_environment, format_report, has_gate_failu
 from bootstrap.file_preview import PreviewError, format_preview, preview_workbook
 from bootstrap.gate import assert_business_allowed
 from bootstrap.import_confirm import confirm_import
-from bootstrap.instance import MachineLock
+from bootstrap.instance import (MachineLock, format_refusal_lines,
+                                format_takeover_lines)
 from bootstrap.paths import lock_root, runtime_dir
-from contracts.model import ContractError
+from contracts.model import Code, ContractError
 
 MENU = """
 请选择（预览不写钉钉；导入确认须走绑定与闸门）:
@@ -97,16 +98,34 @@ def _confirm(path, runtime, locks_dir, out_stream):
 
 def _drive(runtime, locks_dir, out_stream, ports):
     kwargs = {}
+    locks = None
     if ports is not None:
+        locks = ports.get('locks')
         kwargs = {
             'reader': ports['reader'],
             'writer': ports['writer'],
             'stages': ports['stages'],
             'sources': ports.get('sources'),
-            'locks': ports.get('locks'),
+            'locks': locks,
             'store': ports.get('store'),
         }
-    report = run_bound_drive(runtime, locks_dir, **kwargs)
+    if locks is None:
+        # 锁对象留在本地：这一轮**接管**了谁、被谁**挡住**，只有它知道 —— 报告要分开说。
+        locks = MachineLock(locks_dir)
+        kwargs['locks'] = locks
+    try:
+        report = run_bound_drive(runtime, locks_dir, **kwargs)
+    except ContractError as exc:
+        if exc.code != Code.INSTANCE:
+            raise
+        # 占用中 = 上一轮还没结束（每分钟定时与手动跑互抢的常见形态）：明说「本轮跳过」，
+        # 并把占用者的 pid/起始时间/心跳摆出来，与「接管了死锁」区分开。跳过不是失败，
+        # 退出码 0（另一实例正在推进），等下一轮即可。
+        for line in format_refusal_lines(locks):
+            _write(out_stream, line)
+        return 0
+    for line in format_takeover_lines(locks):
+        _write(out_stream, line)
     for line in format_drive_lines(report):
         _write(out_stream, line)
     code = drive_exit_code(report)

@@ -116,7 +116,8 @@ class IntakeAdapterTests(unittest.TestCase):
     def test_scan_returns_row_refs_and_an_empty_table_is_empty(self):
         self.assertEqual(self.adapter.pending_applications('synthetic-org'), ())
         row = self.submit()
-        self.assertEqual(self.adapter.pending_applications('synthetic-org'), (row,))
+        scanned = self.adapter.pending_applications('synthetic-org')
+        self.assertEqual([item.ref for item in scanned], [row])
 
     def test_row_reads_into_a_draft_with_the_marker_of_its_source(self):
         row = self.submit()
@@ -281,7 +282,8 @@ class CliIntakeTests(unittest.TestCase):
 
     def test_cli_scan_and_read_use_the_application_table_only(self):
         row = self.submit()
-        self.assertEqual(self.adapter.pending_applications('synthetic-org'), (row,))
+        scanned = self.adapter.pending_applications('synthetic-org')
+        self.assertEqual([item.ref for item in scanned], [row])
         draft = self.adapter.read_application(row)
         self.assertEqual(draft.quantity, 2)
         self.assertEqual(draft.item.resource_id, 'recItem')
