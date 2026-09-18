@@ -36,6 +36,12 @@ Refs #3。在冻结的 `contracts/` 之上实现 ReadPort / WritePort / StagePor
 
 台账记录走 `FieldMap`（`codec.decode_loan` / `encode_loan` / 库存）。申请收集表走 `ApplicationFieldMap`；阶段入口走 `EntryFieldMap`（`adapter._read_form_event` 按 `source.container_id` 分流；`form.create` 仍写阶段入口）。`config_version`、`quantity`、`physical_ids`、`borrower`、`approver`、`manager`、`return_container`、`return_id` 等在多表上是不同字段 ID；缺任一套映射是 CONFIG，不得把台账 `fields` 套到入口或申请表。真实 ID 只存在本机 `binding.json`，合成夹具不得冒充生产字段。阶段入口「决定」另认 `request_return`/`归还`/`拒绝` 等现场选项名，以及引擎写入的 `action` 文本字段。singleSelect **写**只发选项 name 字符串；**读**只接受 `{id, name}` 对象，业务值取 `.name`（`.id` 是服务端随机串，不得回传合成 id）。空的 `return_id` / `return_container` 钉钉不回传，解码按空字符串，不得当缺证失败；反过来，出现的**空字符串**不是已观察形态，按缺字段拒绝。隔离替身读侧按 state 里声明的 `kinds` 物化读回形态（select `{id, name}`、person `[{corpId, userId}]`、number 字符串），`id` 与 `name` 相同的自造选项按未观察形态拒绝。
 
+读形态声明（`tests/integrations/t03_live_cells._KINDS`）不是「信任清单」，而是被三处**守卫**的（#73）：
+
+1. 字段映射：四个 `*FieldMap` 的每个属性都必须声明读形态，且声明里不能有不是映射属性的名字。新增字段不声明就是红测试，不会默认拿到原样透传。
+2. 读侧：`tests/integrations/t03_read_sites.py` 用 `ast` 走 `integrations/` 源码，列出每个读函数作用在哪个字段属性上；声明漏了这个字段、或读法（select/person/number/date/text）与声明不一致即失败。解析不出来的读点（动态字段名）直接报错，不静默跳过。
+3. 真机：声明必须与只读字段类型观测一致（`tests/integrations/fixtures/t73_live_field_types.json`，`dws aitable field get`，2026-09-18）。台账 `return_container` / `return_id` 真机类型已观测为 `text`（此前 12 条真机回读里从未出现，属未观测项）；申请表 `physical_ids` 在本机 binding 里是 `unset`，该表上的真机类型仍未观测，已在夹具的 `unobserved` 注记里写明。
+
 - number：字符串，显式解析为有限小数后再收窄为整数。
 - date：带时区 ISO 字符串。
 - 角色/creator：`[{corpId,userId}]`。
@@ -112,7 +118,8 @@ node <injected-dws.js> chat message send --user <userId> --title <title> --text 
 | 未支持错误封套 | aitable 通道：公开报告未确认顶层 `errorCode` / `errorMsg` | aitable 即使带空 `records` 也报错；todo 通道封套见 #34 |
 | singleSelect 写 | T07 #30：`record update` 只接受选项 name 字符串 | `encode_loan` 写 name；写 synthetic option id 返回 `SELECT_OPTION_NOT_FOUND` |
 | singleSelect 读 | T01/T07：`{id, name}` 对象，业务值在 `.name`，`.id` 是服务端随机串 | `decode_loan` 与阶段决定只读 `{id, name}`；裸字符串报错；`id` 与 `name` 相同按自造形态报错 |
-| 隔离替身的读回 | 替身存的是**写入**载荷，真机读回是物化后的单元格 | 两个替身共用 `t03_live_cells.py`：按 state 里的 `kinds` 物化 select/person/number；未声明字段原样透传，让解码 fail closed |
+| 隔离替身的读回 | 替身存的是**写入**载荷，真机读回是物化后的单元格；字段类型来自 `dws aitable field get` 只读观测 | 两个替身共用 `t03_live_cells.py`：按 state 里的 `kinds` 物化 select/person/number；字段类型声明必须覆盖读侧并与真机观测一致（`t03_kinds_guard.py` + `t03_read_sites.py`）。state 缺 `kinds` 或写了未知形态时，假 CLI 直接拒绝服务（stderr + 退出码 2），不退化成原样透传 |
+| 真机字段类型 | 台账/库存/阶段入口/申请表四张表的字段类型已用只读 `dws aitable field get` 观测（`fixtures/t73_live_field_types.json`） | 声明或读法与观测不符即失败；申请表 `physical_ids` 在本机 binding 里 `unset`，该表真机类型未观测，夹具 `unobserved` 里逐条注明 |
 | 未填单元格 | 钉钉不回传未填字段（如空 `return_id` / `return_container`） | 缺字段或 `null` 算「可选且为空」；出现的**空字符串**按缺字段报错，不猜 |
 | creator 单元格 | `[{corpId, userId}]`，组织加人员的二元身份；不能用姓名代替 | 解析为 `record_creator`；codec 在本适配器自写自读的角色字段上收成 contact Identity |
 | number 单元格 | 本次回读为字符串，需显式数值解析 | 只接受字符串，解析为有限 `Decimal` |
@@ -136,10 +143,11 @@ node <injected-dws.js> chat message send --user <userId> --title <title> --text 
 4. 跨创建者待办内部 ID 映射（T01 未验）。
 5. 字段级权限、OA、并发、断网重启、跨机器。
 6. 真实组织 L4。本目录的 unittest 只覆盖注入传输。
+7. 字段类型观测是 2026-09-18 的一次只读快照（`fixtures/t73_live_field_types.json`）。平台改字段类型、申请表补上 `physical_ids` 之后需要重新观测；申请表 `physical_ids` 的真机类型至今未观测。
 
 ## 测试
 
-合成夹具：`tests/integrations/fixtures/t01_observed_shapes.json`（解析形态）与 `tests/contracts/fixtures.py`（契约对象）。字符串标识用 `SYNTHETIC-` 前缀；待办内部整数 ID 落在 `9000000000` 及以上。注入传输是 `t03_memory_transport.py`，不用通用名 `support`。两个替身（内存传输与 `t031_fake_dws.py` 假 CLI）的读回形态共用 `t03_live_cells.py`：字段类型由 state 的 `kinds` 声明，不靠字段白名单，也不靠替身猜 `'awaiting_approval'` 这种裸字符串。
+合成夹具：`tests/integrations/fixtures/t01_observed_shapes.json`（解析形态）、`tests/integrations/fixtures/t73_live_field_types.json`（只读观测到的真机字段类型）与 `tests/contracts/fixtures.py`（契约对象）。字符串标识用 `SYNTHETIC-` 前缀；待办内部整数 ID 落在 `9000000000` 及以上。注入传输是 `t03_memory_transport.py`，不用通用名 `support`。两个替身（内存传输与 `t031_fake_dws.py` 假 CLI）的读回形态共用 `t03_live_cells.py`：字段类型由 state 的 `kinds` 声明，不靠字段白名单，也不靠替身猜 `'awaiting_approval'` 这种裸字符串；声明本身由 `t03_kinds_guard.py` 对着 `t03_read_sites.py` 扫出的读点和真机观测校验，`test_live_cell_kinds.py` 里带「去掉/写错一个 select 声明必须变红」的变异用例。
 
 ```text
 python -B scripts/repo_checks.py
