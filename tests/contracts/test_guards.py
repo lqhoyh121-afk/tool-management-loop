@@ -51,6 +51,22 @@ class GuardTests(unittest.TestCase):
         self.blocked(Code.INVALID, lambda: accept_application(
             loan(), replace(event(Action.APPLY, BORROWER), quantity=2)))
 
+    def test_application_return_time_must_match_the_ledger_row(self):
+        """申请行 vs 台账行的归还时间：带了就必须要对得上（#78 第 5 条）。"""
+        draft = replace(loan(), due_at=NOW + timedelta(days=2))
+        application = replace(event(Action.APPLY, BORROWER), quantity=2)
+        # 老入口没声明这一格：事件里没有归还时间，比对不成立，照旧放行。
+        self.assertIsNone(application.due_at)
+        self.assertEqual(accept_application(draft, application).state,
+                         State.AWAITING_APPROVAL)
+        # 带上了且与台账行一致：放行。
+        self.assertEqual(
+            accept_application(draft, replace(application, due_at=draft.due_at)).state,
+            State.AWAITING_APPROVAL)
+        # 被改过（=换了另一笔申请）：可见地跳过，不静默按旧时间走。
+        self.blocked(Code.DUE, lambda: accept_application(
+            draft, replace(application, due_at=draft.due_at + timedelta(days=3))))
+
     def test_missing_identity(self):
         self.blocked(Code.IDENTITY, lambda: plan(loan(), event(Action.APPROVE, None), stock()))
 

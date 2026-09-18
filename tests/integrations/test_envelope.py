@@ -9,6 +9,7 @@ from t03_fixture_loader import sample
 
 from integrations.dingtalk.envelope import (
     extract_records,
+    query_rows,
     read_envelope,
     read_todo_envelope,
     record_cells,
@@ -189,6 +190,40 @@ class RecordListTests(unittest.TestCase):
     def test_cells_of_wrong_type_are_refused(self):
         with self.assertRaises(UnsupportedShapeError):
             record_cells({'recordId': 'SYNTHETIC-record-0004', 'cells': []})
+
+
+class QueryRowTests(unittest.TestCase):
+    """``query_rows``：``records: null`` 只有在 ``hasMore`` 恰好 false 时才是空结果。
+
+    与 ``extract_records`` 同一口径（issue #78 第 3 条）。把「读不到」读成「表是空的」
+    是唯一会静默、永久丢掉申请的路径：报告会说「今天没人申请」而功能其实已经失效。
+    """
+
+    def test_null_records_with_no_more_pages_is_empty(self):
+        self.assertEqual(query_rows({'records': None, 'hasMore': False}), [])
+
+    def test_null_records_missing_has_more_is_refused(self):
+        with self.assertRaises(UnsupportedShapeError):
+            query_rows({'records': None})
+
+    def test_null_records_with_more_pages_is_refused(self):
+        with self.assertRaises(UnsupportedShapeError):
+            query_rows({'records': None, 'hasMore': True})
+
+    def test_null_records_with_falsy_non_false_has_more_is_refused(self):
+        for falsy in (0, '', None, []):
+            with self.assertRaises(UnsupportedShapeError):
+                query_rows({'records': None, 'hasMore': falsy})
+
+    def test_missing_records_key_is_still_a_shape_change(self):
+        with self.assertRaises(UnsupportedShapeError):
+            query_rows({'hasMore': False, 'total': 0})
+
+    def test_rows_still_pass_through(self):
+        payload = {'records': [{'recordId': 'SYNTHETIC-record-0005', 'cells': {}}],
+                   'hasMore': False}
+        self.assertEqual([record_id(row) for row in query_rows(payload)],
+                         ['SYNTHETIC-record-0005'])
 
 
 if __name__ == '__main__':

@@ -1,5 +1,6 @@
 import importlib.util
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import sys
 import tempfile
 import unittest
@@ -10,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from t04_binding_doc import binding_document
 
-from bootstrap.binding import binding_from_document, load_binding, save_binding
+from bootstrap.binding import (binding_from_document, intake_since_from_document,
+                               load_binding, save_binding)
 from contracts.model import Code, ContractError
 from contracts.ports import check_binding
 from integrations.dingtalk.layout import (
@@ -130,3 +132,44 @@ class BindingTests(unittest.TestCase):
         check_binding(binding, replace(current, item=other_item))
         other_ledger = replace(current.item, container_id='synthetic-other-table')
         self.blocked(Code.WRONG_LOAN, lambda: check_binding(binding, replace(current, item=other_ledger)))
+
+
+class IntakeWatermarkTests(unittest.TestCase):
+    """``application_intake.since``（#78 第 2 条）：配了就读出来，配错是 CONFIG。
+
+    「配错」绝不能退回「没配」那个保守默认 —— 那样操作员会以为已经启用自动发现。
+    """
+
+    def blocked(self, code, fn):
+        with self.assertRaises(ContractError) as raised:
+            fn()
+        self.assertEqual(raised.exception.code, code)
+
+    def test_absent_watermark_is_no_watermark(self):
+        self.assertIsNone(intake_since_from_document({}))
+        self.assertIsNone(intake_since_from_document({'application_intake': {}}))
+
+    def test_the_watermark_is_read_back_timezone_aware(self):
+        since = intake_since_from_document(
+            binding_document(application_intake={'since': '2029-12-30T08:00:00+08:00'}))
+        self.assertEqual(since,
+                         datetime(2029, 12, 30, 8, 0, tzinfo=timezone(timedelta(hours=8))))
+        self.assertIsNotNone(since.utcoffset())
+
+    def test_a_broken_watermark_is_config_not_silently_unset(self):
+        for document in (
+                {'application_intake': 'now'},
+                {'application_intake': {'since': 'not-a-time'}},
+                {'application_intake': {'since': '2029-12-30T08:00:00'}},
+                {'application_intake': {'since': '  2029-12-30T08:00:00+08:00  '}},
+                {'application_intake': {'since': 123}},
+                {'application_intake': {'since_at': '2029-12-30T08:00:00+08:00'}}):
+            self.blocked(Code.CONFIG,
+                         lambda document=document: intake_since_from_document(document))
+
+    def test_the_binding_document_still_loads_with_the_extra_key(self):
+        document = binding_document(
+            application_intake={'since': '2029-12-30T08:00:00+08:00'})
+        binding, _application, *_rest = binding_from_document(document)
+        self.assertEqual(binding.config_version, 'synthetic-config-v1')
+        self.assertIsNotNone(intake_since_from_document(document))

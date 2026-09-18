@@ -20,8 +20,10 @@ from contracts.ports import StageRequest, check_binding, stage_operation_id
 from workflow.engine import LendingEngine
 
 from .binding import (binding_from_document, field_maps_from_document,
-                      read_binding_document, require_complete)
+                      intake_since_from_document, read_binding_document, require_complete)
 from .gate import assert_business_allowed
+from .inbox import (REGISTER_NAME, ApplicationIntake, IntakeReport, IntakeSkip,
+                    format_intake_lines)
 from .instance import MachineLock
 from .journal import FileJournal
 from .snapshot import decode_resource, encode_resource
@@ -78,6 +80,13 @@ class DriveReport:
     ``processed``, because the pass really did write its reservation. The entry
     carries the read failure the queue row reported (``code``), which is why the
     heal ran, and never decided whether it ran.
+
+    ``intake`` is the application discovery account for this pass (issue #78) or
+    None when discovery is not wired. Discovered applications enter the queue
+    like any other work item; the account only says what was scanned,
+    registered and skipped. A discovery that blew up is reported inside that
+    account (``scan_code``), never as a failed pass: the recovery and the stage
+    reconcile below still run on the work the queue already holds.
     """
 
     recovered: tuple
@@ -87,6 +96,16 @@ class DriveReport:
     stage_checked: tuple = ()
     stage_created: tuple = ()
     healed: tuple = ()
+    intake: object = None
+
+
+def _failed_intake(code, note='发现扫描抛异常，本轮未登记'):
+    """发现阶段没跑完的账目：本轮不登记任何申请，但这一轮照常继续。
+
+    ``scan_code`` 非空即「查表没结论」，报告里与「扫到 0 行、表真的空」区分开。
+    """
+    return IntakeReport(scan_code=code, scan_note=note,
+                        skipped=(IntakeSkip('-', code),))
 
 
 def _drive_outcome(item, code):
@@ -165,6 +184,8 @@ def format_drive_lines(report):
             '  自愈补齐 {summary}，按已落库审批补写预留'.format(
                 summary=format_outcome_summary(report.healed))
         )
+    if report.intake is not None:
+        lines.extend(format_intake_lines(report.intake))
     for label, outcomes in (('跳过', report.skipped), ('挂起', report.blocked)):
         for outcome in outcomes:
             lines.append(
@@ -192,6 +213,34 @@ class FileSources:
                                   decode_resource(raw['source'])))
         return tuple(items)
 
+    def append(self, registrations):
+        """Register discovered applications in the queue; existing pairs are kept.
+
+        This is the durable half of 「登记 apply 引用」: the queue is what the next
+        pass reconciles stages from, so a pair that is already there is never
+        written twice (idempotent under restarts and re-scans).
+        """
+        current = list(self.pending())
+        seen = {(item.kind, item.loan_ref, item.source) for item in current}
+        added = []
+        for registration in registrations:
+            item = WorkItem(registration.kind, registration.loan_ref, registration.source)
+            key = (item.kind, item.loan_ref, item.source)
+            if key in seen:
+                continue
+            seen.add(key)
+            added.append(item)
+        if not added:
+            return ()
+        payload = [{'kind': item.kind, 'loan': encode_resource(item.loan_ref),
+                    'source': encode_resource(item.source)} for item in current + added]
+        payload_text = json.dumps(payload, ensure_ascii=True, indent=2) + '\n'
+        tmp = self.path.with_suffix('.tmp')
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(payload_text, encoding='utf-8')
+        tmp.replace(self.path)
+        return tuple(added)
+
 
 class StaticSources:
     def __init__(self, items):
@@ -204,11 +253,12 @@ class StaticSources:
 class DriveLoop:
     """One non-interactive pass. Restart always reconciles unresolved ops first."""
 
-    def __init__(self, engine, sources, store, locks):
+    def __init__(self, engine, sources, store, locks, intake=None):
         self.engine = engine
         self.sources = sources
         self.store = store
         self.locks = locks
+        self.intake = intake
 
     def run(self):
         """One pass, with ``blocked_loans`` limited to genuinely unresolved writes.
@@ -226,12 +276,17 @@ class DriveLoop:
         processed = []
         skipped = []
         blocked = []
+        # 申请发现先于队列消费：真人新提交的行必须在**同一轮**里变成审批入口，
+        # 而不是等操作员登记。发现本身也只写本机队列与台账行，闸门照旧。
+        reported = self._run_intake()
+        discovered = tuple(WorkItem(finding.kind, finding.loan_ref, finding.source)
+                           for finding in getattr(reported, 'findings', ()))
         healed = []
         recovered = self._recover()
-        stage_checked, stages_created, stage_skips = self._reconcile_stages()
+        stage_checked, stages_created, stage_skips = self._reconcile_stages(discovered)
         skipped.extend(stage_skips)
         blocked_loans = set(self._unresolved_loans())
-        for item in self._work():
+        for item in self._work(discovered):
             if item.loan_ref in blocked_loans:
                 blocked.append(_drive_outcome(item, Code.UNKNOWN.value))
                 continue
@@ -253,7 +308,26 @@ class DriveLoop:
             if explanation is not None:
                 healed.append(_drive_outcome(item, explanation.value))
         return DriveReport(tuple(recovered), tuple(processed), tuple(skipped), tuple(blocked),
-                           tuple(stage_checked), tuple(stages_created), tuple(healed))
+                           tuple(stage_checked), tuple(stages_created),
+                           tuple(healed), reported)
+
+    def _run_intake(self):
+        """这一轮的申请发现账目；没接发现就是 None。
+
+        发现是**便利**，不是这一轮本身：只有实例闸门（``SECOND_INSTANCE_BLOCKED``）
+        才允许带着整轮一起停，其余任何异常都记进发现账目（``scan_code``）并按「本轮
+        未登记」继续 —— 一趟坏掉的发现不该把日志恢复与阶段对账一起带走。
+        """
+        if self.intake is None:
+            return None
+        try:
+            return self.intake.run()
+        except ContractError as exc:
+            if exc.code == Code.INSTANCE:
+                raise
+            return _failed_intake(exc.code.value, note='发现扫描未完成，本轮未登记')
+        except Exception:
+            return _failed_intake(Code.UNKNOWN.value)
 
     def _recover(self):
         recovered = []
@@ -273,10 +347,10 @@ class DriveLoop:
                 refs.append(intent.before.ref)
         return tuple(refs)
 
-    def _work(self):
+    def _work(self, extra=()):
         seen = set()
         items = []
-        for item in tuple(self.sources.pending()) + self._stage_items():
+        for item in tuple(self.sources.pending()) + tuple(extra) + self._stage_items():
             key = (item.kind, item.loan_ref, item.source)
             if key in seen:
                 continue
@@ -434,7 +508,7 @@ class DriveLoop:
             found.append((intent.event, receipt.inventory))
         return found[0] if len(found) == 1 else None
 
-    def _known_loans(self):
+    def _known_loans(self, extra=()):
         """Loan refs the queue or the journal already mentions, first-seen order.
 
         Both journal entry kinds count: a verified stage receipt names the loan
@@ -443,10 +517,14 @@ class DriveLoop:
         stage receipts missed every loan whose sole trace is a write intent —
         the local index dropping that one record is enough — and such a loan
         never got its entry point rebuilt.
+
+        Applications discovered this pass count too: their ledger row is brand
+        new, so the reconcile is what gives it a human entry point even if the
+        `apply` item itself is skipped later in the same pass.
         """
         refs = []
         seen = set()
-        for item in self._work():
+        for item in self._work(extra):
             if item.loan_ref not in seen:
                 seen.add(item.loan_ref)
                 refs.append(item.loan_ref)
@@ -469,7 +547,7 @@ class DriveLoop:
             refs.append(intent.before.ref)
         return tuple(refs)
 
-    def _reconcile_stages(self):
+    def _reconcile_stages(self, extra=()):
         """Create the current stage for known loans that no item drives here.
 
         A loan can reach a stage-bearing state without this pass witnessing the
@@ -493,7 +571,7 @@ class DriveLoop:
         checked = []
         created = []
         skipped = []
-        for ref in self._known_loans():
+        for ref in self._known_loans(extra):
             checked.append(ref)
             operation_id = None
             try:
@@ -601,6 +679,24 @@ def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=No
     )
 
 
+def application_intake(engine, reader, sources, store, locks, runtime, document=None):
+    """Discovery port when the injected reader can scan applications, else None.
+
+    Feature-detected on purpose: an injected port that has no application read
+    side (a query-only double, a mirror reader) keeps the drive exactly as it
+    was, and a live adapter always has both halves. The enable water mark comes
+    from the binding document (``application_intake.since``); unset means the
+    discovery only reports and never writes.
+    """
+    if not (hasattr(reader, 'pending_applications') and hasattr(reader, 'read_application')
+            and hasattr(reader, 'create_application_loan')
+            and hasattr(reader, 'find_application_loan')):
+        return None
+    return ApplicationIntake(engine, reader, sources, store, locks,
+                             Path(runtime) / REGISTER_NAME,
+                             since=intake_since_from_document(document or {}))
+
+
 def run_bound_drive(runtime, lock_root, reader=None, writer=None, stages=None,
                     sources=None, locks=None, store=None):
     runtime = Path(runtime)
@@ -621,7 +717,9 @@ def run_bound_drive(runtime, lock_root, reader=None, writer=None, stages=None,
         sources = FileSources(runtime / 'sources.json')
     engine = start_engine(reader, writer, stages, store, locks, binding)
     try:
-        return DriveLoop(engine, sources, store, locks).run()
+        return DriveLoop(engine, sources, store, locks,
+                         intake=application_intake(engine, reader, sources, store, locks,
+                                                   runtime, document)).run()
     finally:
         engine.stop()
 

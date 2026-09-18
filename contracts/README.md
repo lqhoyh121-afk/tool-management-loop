@@ -38,7 +38,7 @@ Python类型定义为唯一字段清单（`model.py`、`ports.py`）。存储/�
 
 | 前态 | Action | 放行事实 | 回读后态 / 库存变化 |
 |---|---|---|---|
-| 新申请 | apply | 可信提交人=borrower，数量/编号一致，预计归还晚于提交 | accept_application规范化为awaiting_approval；不发放 |
+| 新申请 | apply | 可信提交人=borrower，数量/编号一致，归还时间与台账行一致（申请入口声明了那一格时），预计归还晚于提交 | accept_application规范化为awaiting_approval；不发放 |
 | awaiting_approval | approve | 指定审批人在受限表单明确同意 | reservation_pending；库存不动 |
 | awaiting_approval | reject | 指定审批人明确拒绝 | rejected；库存不动 |
 | reservation_pending | reserve | 单写入者读到足量可用库存/编号 | awaiting_issue_confirmation；available→reserved |
@@ -77,7 +77,7 @@ StageRequest在构造时即校验前态与角色；阶段资源已发出不受pl
 
 | 错误码 | 处理，不默认自动重试 |
 |---|---|
-| INVALID_INPUT / QUANTITY_MISMATCH / PHYSICAL_IDS_REQUIRED | 修正真实输入或待补充，不自动造值 |
+| INVALID_INPUT / QUANTITY_MISMATCH / PHYSICAL_IDS_REQUIRED / DUE_AT_MISMATCH | 修正真实输入或待补充，不自动造值 |
 | IDENTITY_REQUIRED / WRONG_PERSON / WRONG_LOAN / EVIDENCE_REQUIRED | 拒绝放行；补可信来源或修复关联，不改角色猜测 |
 | CONFIG_RECONFIRM_REQUIRED | 停止并显式重新确认路由；在途版本不得静默覆盖 |
 | INVALID_STATE / DUPLICATE_EVENT | 不写；重复需load原回执，冲突决定交核查 |
