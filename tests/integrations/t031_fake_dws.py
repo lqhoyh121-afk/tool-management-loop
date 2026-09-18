@@ -65,6 +65,7 @@ def load_state(path):
             'fail': {},
             'timeout': [],
             'late_write': [],
+            'calls': [],
             'seq': {'form': 0, 'todo': 0, 'internal': 9000000100},
         }
     return json.loads(path.read_text(encoding='utf-8'))
@@ -105,6 +106,10 @@ def filter_pairs(raw):
 BOOLEAN = {'--all', '--yes'}
 
 SPECS = {
+    'auth status': {
+        'required': {'--format'},
+        'optional': set(),
+    },
     'aitable record query': {
         'required': {'--base-id', '--table-id', '--format'},
         'optional': {'--all', '--record-ids', '--filters', '--field-ids'},
@@ -160,11 +165,25 @@ def parse_flags(argv):
     return flags, None
 
 
+def verb_of(argv):
+    """Longest command word count that names a known verb.
+
+    ``todo task list`` is three words, ``auth status`` is two; the flag offset
+    follows from the verb itself so neither shape has to be special-cased by the
+    caller.
+    """
+    for taken in (3, 2):
+        verb = ' '.join(argv[:taken])
+        if verb in SPECS:
+            return verb
+    return ' '.join(argv[:3])
+
+
 def require_spec(verb, argv):
     spec = SPECS.get(verb)
     if spec is None:
         return err('UNSUPPORTED_COMMAND')
-    flags, problem = parse_flags(argv[3:])
+    flags, problem = parse_flags(argv[len(verb.split()):])
     if problem:
         return err('UNKNOWN_FLAG', problem)
     allowed = spec['required'] | spec['optional']
@@ -196,7 +215,7 @@ def synthetic_option_write(cells):
 
 
 def main(argv):
-    verb = ' '.join(argv[:3])
+    verb = verb_of(argv)
     spec_error = require_spec(verb, argv)
     if spec_error:
         print(json.dumps(spec_error, ensure_ascii=True))
@@ -299,10 +318,27 @@ def main(argv):
         print(json.dumps(todo_ok(result={'taskId': task_id, 'todoDetailModel': detail}),
                          ensure_ascii=True))
         return 0
+    if argv[:2] == ['auth', 'status']:
+        # Live shape: a flat object with authenticated/token_valid/user_id.
+        if state.get('auth_unauthenticated'):
+            print(json.dumps({'success': True, 'authenticated': False,
+                              'token_valid': False}, ensure_ascii=True))
+            return 0
+        print(json.dumps(ok(authenticated=True, token_valid=True,
+                            user_id=state.get('login_user'),
+                            user_name='SYNTHETIC-login'), ensure_ascii=True))
+        return 0
     if argv[:3] == ['todo', 'task', 'list']:
         size = int(flag(argv, '--size'))
         status_flag = flag(argv, '--status')
         login_user = state.get('login_user')
+        # Every list call is written down: the recovery path must never lean on
+        # the undocumented default of ``--status``.
+        state.setdefault('calls', []).append({
+            'verb': 'todo task list', 'size': size, 'status': status_flag,
+            'login_user': login_user,
+        })
+        save_state(state_path, state)
         cards = []
         for task_id, todo in state['todos'].items():
             detail = todo.get('detail') or {}
@@ -321,7 +357,14 @@ def main(argv):
                 'finalStatusStage': 0,
                 'priority': 0,
             })
-        result = {'todoCards': cards[:size]}
+        if size > 20:
+            # Live: ``--size`` above one page makes the CLI page and merge by
+            # itself, so the merged answer carries no ``hasMore``/``nextToken``.
+            result = {'todoCards': cards}
+        else:
+            result = {'todoCards': cards[:size]}
+            if len(cards) > size:
+                result['hasMore'] = True
         if state.get('list_more'):
             result['hasMore'] = True
         print(json.dumps(todo_ok(result=result), ensure_ascii=True))

@@ -264,3 +264,23 @@ python -B -m unittest discover -s tests/bootstrap -p "test_*.py" -v
 - `APPROVE` 的待办只是催办，不是结论来源：三条口径见上文「审批结论的唯一真源」。
 - `runtime/dws-stage-index.json` 是阶段索引（操作号 ↔ 钉钉 task id）：`todo task create` 没有描述字段可以放操作号，**该文件不可删**，删了就再也对不回「unknown 但待办已建出」的单。
 - **一单一行一轮**：`stage_operation_id` 对同一条台账行永久唯一，所以同一条行二次借出（人工把状态与 `consumed_events` 清回再走一遍）**不会再建任何入口** —— 需要重跑时请新建台账行，而不是复用旧行。
+
+## 0 命中不等于「没建出」
+
+**只看标题的回查是有前提的**，前提不成立时 0 命中什么也证明不了。两条口径都写在 `integrations/dingtalk/dws_transport.py` 的常量注释里，改这块前先读它们：
+
+- **`--status` 永不省略**：真机 `todo task list --help` 写的是 `--status string  true=已完成, false=未完成`，**没写默认值**；实测（2026-09-18，登录账号）`--status true` 47 条、不带 flag 也是 47 条、`--status false` 0 条 —— 账号当前没有未完成待办，所以「默认全部」和「默认仅已完成」在实测里**长得一模一样**。回查因此固定发两次（`--status false` + `--status true`）再按 `taskId` 合并：待办可能在建出后被真人点完成，只在第二个查询里。
+- **列表只覆盖登录账号自己作为执行者的待办**：真机 help 原文「自己创建但交给他人执行的待办不在返回范围内」，而阶段待办是用 `--executors <业务当事人>` 建的，**不保证等于登录账号**（多人流程下 actor 是借用人/审批人）。actor ＝ 登录账号时（单人部署，也是当前部署）0 命中才算「确认没建出」；actor ≠ 登录账号时待办建出来了、人也收到了，但列表里看不见。
+
+所以恢复失败会被**写成记录**，不再与「没建出」同形。`runtime/dws-stage-index.json` 的 pending 记录里：
+
+| 字段 | 含义 |
+| --- | --- |
+| `executor_contact` / `login_user_id` / `executor_scope` | 建出（或尝试建出）时的 actor、当时观测到的 dws 登录账号、以及两者关系（`self` / `other` / `unknown`）。登录账号来自 `dws auth status`，读不到就记 `unknown`，**不猜**。 |
+| `recovery_state` | `not_attempted`（还没回查）/ `not_built`（两个状态都查了、actor ＝ 登录账号、仍然 0 命中 —— 这一种才算确认没建出）/ `needs_manual_confirmation`（0 命中但范围不成立，或列表读不到，或同标题 2 条以上） |
+| `needs_manual_confirmation` / `recovery_reason` | 是否必须人工先确认；原因：`executor_scope` / `todo_list_unreadable` / `title_ambiguous` |
+| `recovery_attempts` / `recovery_matches` / `recovery_statuses` | 回查次数、命中条数、本次查过的状态（恒为 `["false","true"]`） |
+
+**运维出口**：`python -c "from integrations.dingtalk.dws_transport import pending_stage_report; ..."`（`pending_stage_report(runtime 目录)`，只读）把上面这些字段按一阶段一行列出来。`needs_manual_confirmation=True` 的单，请**先到钉钉里按标题/`claimed_task_id` 找那条待办**，确认真的没有，再清掉索引里的 pending 重来；驱动自己不会替你建第二条。
+
+`claimed_task_id`（建出回执到手、紧随其后的 `todo task get` 失败）走的是**另一条路**：按 task id 精确读回，`todo task get` 不受执行人范围限制，所以那条路与 actor、与登录账号都无关。
