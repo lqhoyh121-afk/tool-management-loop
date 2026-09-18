@@ -146,12 +146,24 @@ class ReturnRowReadTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, code)
 
     def test_scan_lists_every_row_of_the_return_table_including_entry_rows(self):
-        """扫描只回答「有哪些行」：入口行也在里面，过滤会把读不到当成没有归还。"""
+        """扫描只回答「有哪些行」：入口行也在里面，过滤会把读不到当成没有归还。
+
+        扫描行同时带上**这一次回读的单元格**（发现侧据此就地判掉入口行 / 水位之前的行，
+        不再为每一行发一次平台读）：这两件事一起钉住。
+        """
         self.assertEqual(self.adapter.pending_returns('synthetic-org'), ())
         loan, _cells = borrowed_loan()
         row = self.seed(RETURN_ROW, return_row_cells())
         entry = self.seed('synthetic-entry-row', entry_row_cells(loan.ref))
-        self.assertEqual(set(self.adapter.pending_returns('synthetic-org')), {entry, row})
+        scanned = self.adapter.pending_returns('synthetic-org')
+        self.assertEqual({item.ref for item in scanned}, {entry, row})
+        by_id = {item.resource_id: item for item in scanned}
+        before = len(self.transport.writes_of('record.query'))
+        # 归还行：扫描内容就够判成草稿（不再回读一次平台）。
+        self.assertEqual(self.adapter.read_return(by_id[RETURN_ROW]).occurred_at, RETURNED_AT)
+        # 入口行：扫描内容就够判成「不是归还提交」。
+        self.assertIsNone(self.adapter.read_return(by_id['synthetic-entry-row']))
+        self.assertEqual(self.transport.writes_of('record.query')[before:], [])
 
     def test_a_submitted_return_row_reads_into_a_draft(self):
         row = self.seed(RETURN_ROW, return_row_cells())

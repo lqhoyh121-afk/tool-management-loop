@@ -16,7 +16,8 @@ from datetime import timedelta, timezone
 
 from contracts.model import (Action, Code, ContractError, Event, Identity,
                              IdentityBinding, Outcome, Resource, State, require, text)
-from contracts.ports import StageReceipt, StageRequest, check_binding, verify_stage
+from contracts.ports import (FormRow, StageReceipt, StageRequest, check_binding,
+                             row_ref, verify_stage)
 
 from .application import ApplicationDraft, application_marker
 from .cells import (MissingFieldError, read_datetime, read_single_select,
@@ -462,6 +463,38 @@ class DingTalkAdapter:
         except DingTalkShapeError as exc:
             _closed(exc)
 
+    def scanned_application_time(self, source):
+        """扫描行自己写的申请时间（**只解时间格**，不发任何平台调用）。
+
+        发现环节用它预筛「确证在水位之前」的行：那种行不值得再发一次精读。这里刻意**不**
+        构造草稿 —— 构造草稿会顺带解析「工具」名称（那是一整张库存表的读），预筛一次就
+        等于再加一次全表读，比省下来的还贵。解不出来（没带单元格、时间格形态没见过、
+        这一格没声明）返回 ``None``，调用方按「判不准」交给精读。
+        """
+        if not isinstance(source, FormRow):
+            return None
+        fields = self.apply_fields
+        if fields is None:
+            return None
+        try:
+            return read_datetime(source.cells, fields.occurred_at)
+        except ContractError:
+            return None
+        except (DingTalkShapeError, KeyError, TypeError):
+            return None
+
+    def _row_cells(self, source):
+        """这一行的单元格：扫描行（``FormRow``）已经带着就用手上的，裸引用才发平台读。
+
+        ``FormRow`` 的单元格来自**同一次扫描**（``record query --all`` 本来就逐行带回来
+        了）：拿它定性「这一行要不要管」不再多付一次平台调用（归还 22 行 / 申请 13 行每轮
+        省下的就是这一笔）。要**动手**的行（登记、建行）调用方拿裸引用再精确读一遍，所以
+        新鲜度一字未改：这里的单元格只用来判「不用管」，从不用来当写入依据。
+        """
+        if isinstance(source, FormRow):
+            return source.cells
+        return self._record_cells(source)
+
     def _put_record(self, ref, cells):
         payload = self.transport.exchange('record.update', {
             'tenant_id': ref.tenant_id,
@@ -524,19 +557,24 @@ class DingTalkAdapter:
         only open loan of that item" — by the item's record id or, since the
         question is a name-only dropdown, by its inventory name. Only the borrower
         knows which tool comes back, so the answer is read, never guessed.
+
+        整行照旧**精确读一次**（``_record_cells``）：定位到的这张单要拿来登记，判据不许
+        用扫描时抱回来的单元格（``FormRow``）。所以这里只把扫描行折算成引用，不用它
+        的单元格。
         """
-        if source.kind != 'form' or self.return_form_fields is None:
+        ref = row_ref(source)
+        if ref.kind != 'form' or self.return_form_fields is None:
             return None
-        cells = self._record_cells(source)
-        if not self._is_return_form_submission(cells, source):
+        cells = self._record_cells(ref)
+        if not self._is_return_form_submission(cells, ref):
             return None
-        actor = _identity(cells, self.return_form_fields.borrower, source.tenant_id)
+        actor = _identity(cells, self.return_form_fields.borrower, ref.tenant_id)
         loan_container = self.loan_container or hint_ref.container_id
         text(loan_container)
         matches = self._matching_borrowed_loans(
-            source.tenant_id, loan_container, actor.user_id, cells)
+            ref.tenant_id, loan_container, actor.user_id, cells)
         require(len(matches) == 1, Code.EVIDENCE)
-        matched = Resource('record', source.tenant_id, loan_container, matches[0])
+        matched = Resource('record', ref.tenant_id, loan_container, matches[0])
         return matched
 
     def _matching_borrowed_loans(self, tenant_id, loan_container, borrower_user_id, cells):
@@ -661,12 +699,17 @@ class DingTalkAdapter:
         return container, fields
 
     def pending_returns(self, tenant_id):
-        """归还收集表结果表的行引用（只回不透明行 id，不带单元格）。
+        """归还收集表结果表的行：引用 + **这次扫描已经抱回来的单元格**。
 
         归还表单与本机建的阶段入口行共用这张表，所以这里如实列出**每一行**、不在传输层
         过滤：哪一行是归还提交由 :meth:`read_return` 逐行判（入口行带台账单据指向）。
         过滤会把「表格读不出来」静默变成「今天没有归还」，调用方（发现）自己持有幂等
         判据，这里回答的只是「有哪些行」。
+
+        ``record query --all`` 本来就把每行的单元格一起回来了，所以一起交给调用方：发现
+        侧据此在本地判掉「不是归还提交」「水位之前」的行，不再为每一行发一次平台读
+        （那是单轮 60~100 秒的大头）。真正的判据仍是裸引用上的精确读（见
+        :meth:`read_return`）。
         """
         container, _fields = self._return_form_scope()
         text(tenant_id)
@@ -676,14 +719,15 @@ class DingTalkAdapter:
                 'container_id': container,
             })
             rows = query_rows(payload)
+            return tuple(FormRow(Resource('form', tenant_id, container, row['recordId']),
+                                 record_cells(row))
+                         for row in rows)
         except UnknownResultError as exc:
             _closed(exc, Code.UNKNOWN)
         except BusinessErrorResponse as exc:
             _closed(exc, _business_code(exc))
         except DingTalkShapeError as exc:
             _closed(exc)
-        return tuple(Resource('form', tenant_id, container, row['recordId'])
-                     for row in rows)
 
     def read_return(self, source):
         """一行归还提交校验成 :class:`ReturnDraft`；不是归还提交时返回 ``None``。
@@ -701,8 +745,9 @@ class DingTalkAdapter:
         「必填缺」。
         """
         container, fields = self._return_form_scope()
-        require(source.kind == 'form' and source.container_id == container, Code.EVIDENCE)
-        cells = self._record_cells(source)
+        ref = row_ref(source)
+        require(ref.kind == 'form' and ref.container_id == container, Code.EVIDENCE)
+        cells = self._row_cells(source)
         entry = self.entry_fields
         if _is_declared(entry.loan_id) and self._cell_has_text(cells, entry.loan_id):
             return None
@@ -711,13 +756,13 @@ class DingTalkAdapter:
         if not self._return_answers(cells, fields):
             return None
         try:
-            borrower = _identity(cells, fields.borrower, source.tenant_id)
+            borrower = _identity(cells, fields.borrower, ref.tenant_id)
             occurred = read_datetime(cells, fields.occurred_at)
         except ContractError:
             raise
         except (DingTalkShapeError, KeyError) as exc:
             _closed(exc)
-        return ReturnDraft(source, borrower, occurred)
+        return ReturnDraft(ref, borrower, occurred)
 
     def _return_answers(self, cells, fields):
         """归还的两格里填过哪几格；缺键或 ``null`` 表示没填。
@@ -733,12 +778,18 @@ class DingTalkAdapter:
         return tuple(present)
 
     def pending_applications(self, tenant_id):
-        """Row refs of the application collection result table (no cells).
+        """Row refs of the application collection result table, with their cells.
 
         The result table is the application's source of truth; this scan answers
         "which rows exist", never "which rows are new" — the caller owns the
-        idempotency register. Only opaque record ids travel back, so a scan
-        result can be reported without names or business numbers.
+        idempotency register. Only opaque record ids travel into reports, so a
+        scan result can be reported without names or business numbers.
+
+        Like :meth:`pending_returns`, the scan hands back the cells the same
+        ``record query --all`` already returned: discovery classifies a row
+        locally ("before the water mark") without one platform read per row, and
+        any row it acts on is read again through the port with the bare
+        reference.
         """
         require(bool(self.application_container.strip()), Code.CONFIG)
         text(tenant_id)
@@ -748,14 +799,15 @@ class DingTalkAdapter:
                 'container_id': self.application_container,
             })
             rows = query_rows(payload)
+            return tuple(FormRow(Resource('form', tenant_id, self.application_container,
+                                          row['recordId']), record_cells(row))
+                         for row in rows)
         except UnknownResultError as exc:
             _closed(exc, Code.UNKNOWN)
         except BusinessErrorResponse as exc:
             _closed(exc, _business_code(exc))
         except DingTalkShapeError as exc:
             _closed(exc)
-        return tuple(Resource('form', tenant_id, self.application_container, row['recordId'])
-                     for row in rows)
 
     def read_application(self, source):
         """One application row as a validated draft; every gap fails closed.
@@ -769,13 +821,14 @@ class DingTalkAdapter:
         """
         fields = self.apply_fields
         require(fields is not None, Code.CONFIG)
-        require(source.kind == 'form' and source.container_id == self.application_container,
+        ref = row_ref(source)
+        require(ref.kind == 'form' and ref.container_id == self.application_container,
                 Code.EVIDENCE)
         # 归还时间的声明检查保留（#78）：本机已配，缺它就没有「到期」可比。
         self._declared(fields.due_at)
-        cells = self._record_cells(source)
+        cells = self._row_cells(source)
         try:
-            borrower = _identity(cells, fields.borrower, source.tenant_id)
+            borrower = _identity(cells, fields.borrower, ref.tenant_id)
             occurred = read_datetime(cells, fields.occurred_at)
             quantity = _int_count(cells, fields.quantity, zero=False)
             if fields.physical_ids in cells and cells[fields.physical_ids] is not None:
@@ -783,13 +836,13 @@ class DingTalkAdapter:
             else:
                 physical_ids = ()
             due_at = read_datetime(cells, fields.due_at)
-            item = self._application_item(source.tenant_id, cells)
+            item = self._application_item(ref.tenant_id, cells)
         except ContractError:
             raise
         except (DingTalkShapeError, KeyError) as exc:
             _closed(exc)
         return ApplicationDraft(
-            source=source,
+            source=ref,
             item=item,
             borrower=borrower,
             quantity=quantity,
@@ -939,6 +992,7 @@ class DingTalkAdapter:
         """
         self.leases.assert_held(lease)
         container = self._declared(self.loan_container)
+        source = row_ref(source)
         marker = application_marker(source)
         try:
             payload = self.transport.exchange('loan.find_application', {

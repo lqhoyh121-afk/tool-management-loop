@@ -43,7 +43,7 @@ python -m bootstrap --require-ready --runtime 运行目录
 
 重复部署遇到已有 `binding.json` 会拒绝覆盖。若只有 `binding.json.tmp`，视为上次中断，正式配置未写入。
 
-机器排他锁按 `lease_key(scope)=tenant_id::container_key` 落在与运行目录无关的锁根（默认 `%PROGRAMDATA%\tool-management-loop\locks`，测试用 `--lock-root` / `TOOL_LOOP_LOCK_ROOT`）。第二实例、另一运行目录或另一账号抢同一主账都会 `SECOND_INSTANCE_BLOCKED`。崩溃留下的锁目录不会 TTL 抢占，须主控确认后手工删除。
+机器排他锁按 `lease_key(scope)=tenant_id::container_key` 落在与运行目录无关的锁根（默认 `%PROGRAMDATA%\tool-management-loop\locks`，测试用 `--lock-root` / `TOOL_LOOP_LOCK_ROOT`）。第二实例、另一运行目录或另一账号抢同一主账都会 `SECOND_INSTANCE_BLOCKED`。槽里记持有者进程（`holder.json` 的 `pid` / `started_at` / `heartbeat_at`），持有者在每次写入前的闸门检查里前移心跳，所以真在跑的实例不会「心跳变旧」。**被杀、断电留下的锁槽自动接管**，判据两条：心跳比 `TTL_SECONDS`（900 秒）还旧，或判活**确证**那个进程已经不在运行；判不准（没权限打开、pid 读不出）按**活着**处理 —— 只拒绝、不接管，所以需要主控手工确认的只剩「说不清又没过 TTL」这一种。判活是非破坏的：Windows 走 `OpenProcess` / `GetExitCodeProcess`，其余平台 `os.kill(pid, 0)`（signal 0 不投递信号），**任何时候都不给别的进程发信号**。接管与「被占用」在报告里分开说：接管是 `锁接管：…不需要人工清槽。`，被占用是 `本轮跳过：上一轮未结束…`。
 
 业务写入入口调用 `bootstrap.gate.assert_business_allowed`。绕过 BAT 直接 import 该函数同样要绑定和 lease，不看 ready 文件。
 
@@ -179,7 +179,7 @@ T07 端到端还差本地操作流水和把收集表/待办完成接进冻结引
 python -m bootstrap --drive --runtime 运行目录 --lock-root 锁目录
 ```
 
-绑定或 lease 缺失时 fail-closed（`CONFIG_RECONFIRM_REQUIRED` / `SECOND_INSTANCE_BLOCKED`）。第二实例抢同一主账会被拦住。`runtime/ready.json` 不能放行。
+绑定或 lease 缺失时 fail-closed（`CONFIG_RECONFIRM_REQUIRED` / `SECOND_INSTANCE_BLOCKED`）。第二实例抢同一主账会被拦住。`runtime/ready.json` 不能放行。被活着的持有者挡住时这一轮明说 `本轮跳过：上一轮未结束，本轮跳过（机器锁被占用中，本轮不做任何业务写入）。` 并返回退出码 `0`（另一个实例正在推进，跳过不是失败，等下一轮即可）；被杀、断电留下的槽照常自动接管并继续跑，报告写 `锁接管`。死锁残留由 TTL 自愈。
 
 生产还须在 `binding.json` 里**显式**给出 T07 本机已确认的字段，仓库不猜测安装路径：
 

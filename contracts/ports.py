@@ -39,6 +39,41 @@ def lease_key(scope: LedgerScope) -> str:
 
 
 @dataclass(frozen=True)
+class FormRow:
+    """One row a discovery scan returned, with the cells that scan already read.
+
+    A platform ``record query --all`` brings every row of a result table back
+    WITH its cells; discovery used to throw the cells away and re-query each row
+    one by one (13 application rows / 22 return rows = 13/22 platform calls per
+    pass, the bulk of a 60~100 s round). Carrying them lets discovery classify a
+    row locally ("not a submission", "before the water mark") without a call.
+
+    These cells are the scan's own read, never a cache: any row that will be
+    acted on is read again through the port with the bare :class:`Resource`
+    reference, and an adapter that hands back bare references keeps the old
+    per-row behaviour unchanged.
+    """
+
+    ref: Resource
+    cells: dict
+
+    def __post_init__(self):
+        require(self.ref.kind == "form")
+        require(isinstance(self.cells, dict))
+
+    @property
+    def resource_id(self) -> str:
+        return self.ref.resource_id
+
+
+def row_ref(row):
+    """Scan result -> resource reference: a :class:`FormRow` yields its ref, a
+    bare reference yields itself. Never invent a reference for an unknown shape."""
+    ref = getattr(row, "ref", None)
+    return ref if isinstance(ref, Resource) else row
+
+
+@dataclass(frozen=True)
 class RuntimeBinding:
     """Validated deployment snapshot, produced by T04, checked on every write."""
     account: Identity
@@ -212,7 +247,11 @@ class SingleInstance(Protocol):
 
         Second instance raises SECOND_INSTANCE_BLOCKED even with a different runtime
         directory, account or item record view. Lease held for entire running
-        lifetime. No TTL takeover. Different scopes get independent leases.
+        lifetime. The slot records pid + heartbeat and assert_held refreshes it:
+        a holder whose process is provably gone, or whose heartbeat is older than
+        the TTL, is taken over (deadlock residue self-heals without a human
+        deleting the slot); a live, fresh holder keeps exclusivity unchanged.
+        Different scopes get independent leases.
         Startup with unresolved journal: reconcile first. Cross-machine unsupported.
         """
         ...
@@ -222,5 +261,9 @@ class SingleInstance(Protocol):
         ...
 
     def release(self, lease: str) -> None:
-        """Only owner releases after writes stop and recovery records are flushed."""
+        """Only owner releases after writes stop and recovery records are flushed.
+
+        Never delete a slot that is no longer ours (taken over after a TTL): the
+        new holder's lease must survive our exit.
+        """
         ...
