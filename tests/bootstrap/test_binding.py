@@ -95,6 +95,22 @@ class BindingTests(unittest.TestCase):
         self.blocked(Code.CONFIG, lambda: save_binding(self.root, data))
         self.assertFalse((self.root / 'binding.json').exists())
 
+    def test_return_item_key_is_optional_and_absent_means_unbound(self):
+        # #77：归还表单的「归还物品」这一格可以不绑。缺键 = 不绑，不是配置错误。
+        data = binding_document()
+        del data['return_form_fields']['item']
+        _, _, _, _, _, return_form_fields = binding_from_document(data)
+        self.assertEqual(return_form_fields.item, '')
+        self.assertEqual(return_form_fields.borrower,
+                         SYNTHETIC_RETURN_FORM_FIELDS.borrower)
+
+    def test_return_item_key_bound_to_a_non_field_id_is_config(self):
+        # 绑了但值不是字段 ID：不能读成「没绑」，否则静默丢掉物品这一层收窄。
+        data = binding_document()
+        data['return_form_fields']['item'] = 7
+        self.blocked(Code.CONFIG, lambda: save_binding(self.root, data))
+        self.assertFalse((self.root / 'binding.json').exists())
+
     def test_entry_fields_cannot_reuse_ledger_map(self):
         data = binding_document()
         data['entry_fields'] = dict(data['fields'])
