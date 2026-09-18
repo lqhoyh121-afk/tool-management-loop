@@ -26,7 +26,17 @@ from contracts.ports import (LedgerScope, RuntimeBinding, StageRequest,
                              stage_operation_id, verify_stage)
 from integrations.dingtalk.adapter import DingTalkAdapter, stage_title
 from integrations.dingtalk.codec import encode_inventory, encode_loan
-from integrations.dingtalk.dws_transport import (DwsTransport, split_container,
+from integrations.dingtalk.dws_transport import (SCOPE_OTHER, SCOPE_SELF,
+                                                 SCOPE_UNKNOWN,
+                                                 RECOVERY_NOT_ATTEMPTED,
+                                                 RECOVERY_NOT_BUILT,
+                                                 RECOVERY_NEEDS_MANUAL,
+                                                 REASON_EXECUTOR_SCOPE,
+                                                 REASON_LIST_UNREADABLE,
+                                                 REASON_TITLE_AMBIGUOUS,
+                                                 DwsTransport,
+                                                 pending_stage_report,
+                                                 split_container,
                                                  todo_internal_id,
                                                  windows_native_path)
 from integrations.dingtalk.envelope import extract_records, record_cells
@@ -460,6 +470,205 @@ class DwsTransportTests(unittest.TestCase):
         self.assertIn('internal_id', queried['result'])
         self.assertEqual(queried['result']['creation_evidence'], f'todo.task.create:{task_id}')
 
+    def _set_login(self, user_id):
+        state = load_state(self.state_path)
+        state['login_user'] = user_id
+        save_state(self.state_path, state)
+
+    def _todo_list_calls(self):
+        return [call for call in load_state(self.state_path).get('calls', [])
+                if call['verb'] == 'todo task list']
+
+    def test_pending_stage_records_the_actor_versus_login_relation(self):
+        """A pending todo remembers whose todo list may hold it (#72)."""
+        self._set_login(MANAGER.user_id)
+        original = self.transport._todo_detail_for_stage
+        self.transport._todo_detail_for_stage = lambda task_id: None
+        try:
+            payload = self.transport.exchange('todo.create', {
+                'tenant_id': LOAN.tenant_id,
+                'actor': MANAGER.user_id,
+                'action': Action.ISSUE.value,
+                'operation_id': 'SYNTHETIC-op-scope-self',
+                'loan_container': LOAN.container_id,
+                'loan_id': LOAN.resource_id,
+                'config_version': 'synthetic-config-v1',
+            })
+            # Read the pending record while the post-create read is still
+            # unavailable: this is the state the annotation is written for.
+            queried = self.transport.exchange(
+                'stage.query', {'task_id': payload['result']['taskId']})['result']
+        finally:
+            self.transport._todo_detail_for_stage = original
+        self.assertTrue(queried['pending'])
+        self.assertEqual(queried['executor_contact'], MANAGER.user_id)
+        self.assertEqual(queried['login_user_id'], MANAGER.user_id)
+        self.assertEqual(queried['executor_scope'], SCOPE_SELF)
+        self.assertEqual(queried['recovery_state'], RECOVERY_NOT_ATTEMPTED)
+
+    def test_pending_stage_records_a_login_that_is_not_the_actor(self):
+        """actor ≠ login account is written down, not discovered later (#72)."""
+        self._set_login('SYNTHETIC-other-login')
+        original = self.transport._todo_detail_for_stage
+        self.transport._todo_detail_for_stage = lambda task_id: None
+        try:
+            payload = self.transport.exchange('todo.create', {
+                'tenant_id': LOAN.tenant_id,
+                'actor': MANAGER.user_id,
+                'action': Action.ISSUE.value,
+                'operation_id': 'SYNTHETIC-op-scope-other',
+                'loan_container': LOAN.container_id,
+                'loan_id': LOAN.resource_id,
+                'config_version': 'synthetic-config-v1',
+            })
+            queried = self.transport.exchange(
+                'stage.query', {'task_id': payload['result']['taskId']})['result']
+        finally:
+            self.transport._todo_detail_for_stage = original
+        self.assertEqual(queried['executor_scope'], SCOPE_OTHER)
+        self.assertEqual(queried['login_user_id'], 'SYNTHETIC-other-login')
+
+    def test_unobservable_login_state_is_unknown_scope_not_a_guess(self):
+        """An unauthenticated CLI records 'unknown', never 'self' (#72)."""
+        state = load_state(self.state_path)
+        state['auth_unauthenticated'] = True
+        save_state(self.state_path, state)
+        original = self.transport._todo_detail_for_stage
+        self.transport._todo_detail_for_stage = lambda task_id: None
+        try:
+            payload = self.transport.exchange('todo.create', {
+                'tenant_id': LOAN.tenant_id,
+                'actor': MANAGER.user_id,
+                'action': Action.ISSUE.value,
+                'operation_id': 'SYNTHETIC-op-scope-unknown',
+                'loan_container': LOAN.container_id,
+                'loan_id': LOAN.resource_id,
+                'config_version': 'synthetic-config-v1',
+            })
+            quarantined = self.transport.exchange(
+                'stage.query', {'task_id': payload['result']['taskId']})['result']
+        finally:
+            self.transport._todo_detail_for_stage = original
+        self.assertEqual(quarantined['executor_scope'], SCOPE_UNKNOWN)
+        self.assertIsNone(quarantined['login_user_id'])
+
+    def test_todo_recovery_merges_both_completion_statuses(self):
+        """Both ``--status`` predicates are read, so a done todo is still found."""
+        self._set_login(MANAGER.user_id)
+        state = load_state(self.state_path)
+        self._seed_todo(state, 'SYNTHETIC-todo-9001', 'stage:open')
+        self._seed_todo(state, 'SYNTHETIC-todo-9002', 'stage:done')
+        for todo in state['todos'].values():
+            todo['executor_contact'] = MANAGER.user_id
+        state['todos']['SYNTHETIC-todo-9002']['detail']['isDone'] = True
+        save_state(self.state_path, state)
+        pairs = dict((task_id, subject)
+                     for subject, task_id in self.transport._todo_list_pairs())
+        self.assertEqual(pairs['SYNTHETIC-todo-9001'], 'stage:open')
+        self.assertEqual(pairs['SYNTHETIC-todo-9002'], 'stage:done')
+        statuses = [call['status'] for call in self._todo_list_calls()]
+        self.assertEqual(statuses, ['false', 'true'])
+
+    def test_a_todo_completed_after_create_is_still_recovered(self):
+        """The todo may be ticked complete before anyone reads it back (#72)."""
+        request = self._issue_request()
+        self._set_login(MANAGER.user_id)
+        first = self._landed_without_receipt(request)
+        self.assertEqual(first.outcome, Outcome.UNKNOWN)
+        landed = load_state(self.state_path)['todos']
+        task_id, todo = next(iter(landed.items()))
+        state = load_state(self.state_path)
+        state['todos'][task_id]['detail']['isDone'] = True
+        state['calls'] = []
+        save_state(self.state_path, state)
+        again = self.adapter.create_stage(request, self.binding, self.lease)
+        self.assertEqual(again.outcome, Outcome.VERIFIED)
+        self.assertEqual(again.source.resource_id, task_id)
+        self.assertEqual(load_state(self.state_path)['todos'][task_id]['subject'],
+                         todo['subject'])
+        statuses = [call['status'] for call in self._todo_list_calls()]
+        self.assertEqual(statuses, ['false', 'true'])
+
+    def test_todo_recovery_never_leans_on_the_list_status_default(self):
+        """No scan may omit ``--status``: its live default is undocumented."""
+        request = self._issue_request()
+        self._set_login(MANAGER.user_id)
+        self._unreachable_attempt(request)
+        still = self.adapter.create_stage(request, self.binding, self.lease)
+        self.assertEqual(still.outcome, Outcome.UNKNOWN)
+        calls = self._todo_list_calls()
+        self.assertTrue(calls)
+        self.assertNotIn(None, [call['status'] for call in calls])
+        self.assertEqual({call['size'] for call in calls}, {100})
+
+    def test_zero_hits_while_the_actor_is_not_the_login_needs_a_human(self):
+        """A blinded scan must not be read as "the todo was never created" (#72)."""
+        request = self._issue_request()
+        self._set_login('SYNTHETIC-other-login')
+        self._unreachable_attempt(request)
+        retried = self.adapter.create_stage(request, self.binding, self.lease)
+        self.assertEqual(retried.outcome, Outcome.UNKNOWN)
+        indexed = self._indexed(request.operation_id)
+        self.assertTrue(indexed['pending'])
+        self.assertEqual(indexed['recovery_state'], RECOVERY_NEEDS_MANUAL)
+        self.assertTrue(indexed['needs_manual_confirmation'])
+        self.assertEqual(indexed['recovery_reason'], REASON_EXECUTOR_SCOPE)
+        self.assertEqual(indexed['recovery_matches'], 0)
+        self.assertEqual(indexed['recovery_statuses'], ['false', 'true'])
+        self.assertEqual(indexed['recovery_attempts'], 1)
+        self.assertEqual(indexed['executor_scope'], SCOPE_OTHER)
+        self.assertEqual(indexed['login_user_id'], 'SYNTHETIC-other-login')
+        queried = self.transport.exchange(
+            'stage.query', {'operation_id': request.operation_id})['result']
+        self.assertTrue(queried['needs_manual_confirmation'])
+        self.assertEqual(queried['recovery_reason'], REASON_EXECUTOR_SCOPE)
+        rows = pending_stage_report(self.work / 'runtime')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['operation_id'], request.operation_id)
+        self.assertTrue(rows[0]['needs_manual_confirmation'])
+        self.assertEqual(rows[0]['recovery_reason'], REASON_EXECUTOR_SCOPE)
+        self.assertEqual(rows[0]['executor_scope'], SCOPE_OTHER)
+        self.assertEqual(rows[0]['title'], stage_title(request.loan, request.action))
+
+    def test_zero_hits_with_the_actor_as_login_is_confirmed_not_built(self):
+        """The one 0-hit case that may be trusted: actor = login, both statuses."""
+        request = self._issue_request()
+        self._set_login(MANAGER.user_id)
+        self._unreachable_attempt(request)
+        retried = self.adapter.create_stage(request, self.binding, self.lease)
+        self.assertEqual(retried.outcome, Outcome.UNKNOWN)
+        indexed = self._indexed(request.operation_id)
+        self.assertEqual(indexed['recovery_state'], RECOVERY_NOT_BUILT)
+        self.assertFalse(indexed['needs_manual_confirmation'])
+        self.assertIsNone(indexed['recovery_reason'])
+        self.assertEqual(indexed['executor_scope'], SCOPE_SELF)
+        rows = pending_stage_report(self.work / 'runtime')
+        self.assertFalse(rows[0]['needs_manual_confirmation'])
+        self.assertEqual(rows[0]['recovery_state'], RECOVERY_NOT_BUILT)
+
+    def test_an_unreadable_todo_list_is_manual_not_absent(self):
+        """A list we could not read is not a list we read empty (#72)."""
+        request = self._issue_request()
+        self._set_login(MANAGER.user_id)
+        self._unreachable_attempt(request)
+        state = load_state(self.state_path)
+        state['fail']['todo task list'] = 'SYNTHETIC-throttled'
+        save_state(self.state_path, state)
+        retried = self.adapter.create_stage(request, self.binding, self.lease)
+        self.assertEqual(retried.outcome, Outcome.UNKNOWN)
+        indexed = self._indexed(request.operation_id)
+        self.assertEqual(indexed['recovery_state'], RECOVERY_NEEDS_MANUAL)
+        self.assertEqual(indexed['recovery_reason'], REASON_LIST_UNREADABLE)
+        self.assertTrue(indexed['needs_manual_confirmation'])
+        state = load_state(self.state_path)
+        del state['fail']['todo task list']
+        save_state(self.state_path, state)
+        again = self.adapter.create_stage(request, self.binding, self.lease)
+        self.assertEqual(again.outcome, Outcome.UNKNOWN)
+        recovered = self._indexed(request.operation_id)
+        self.assertEqual(recovered['recovery_state'], RECOVERY_NOT_BUILT)
+        self.assertEqual(recovered['recovery_attempts'], 2)
+
     def test_stage_query_by_task_id(self):
         current = loan()
         inventory = stock()
@@ -512,6 +721,10 @@ class DwsTransportTests(unittest.TestCase):
         state = load_state(self.state_path)
         state['late_write'] = ['todo task create']
         save_state(self.state_path, state)
+        # Observe the login account inside the normal timeout: the annotation
+        # written during the tight-timeout attempt must not depend on how fast a
+        # subprocess starts under load.
+        self.transport._login_user_id()
         self.transport.timeout = 0.3
         try:
             return self.adapter.create_stage(request, self.binding, self.lease)
@@ -528,6 +741,9 @@ class DwsTransportTests(unittest.TestCase):
             self._seed_todo(state, task_id, subject)
         state['timeout'] = ['todo task create']
         save_state(self.state_path, state)
+        # Same reason as ``_landed_without_receipt``: read the login account at
+        # the normal timeout, not inside the 0.3s window.
+        self.transport._login_user_id()
         self.transport.timeout = 0.3
         try:
             return self.adapter.create_stage(request, self.binding, self.lease)
@@ -582,6 +798,32 @@ class DwsTransportTests(unittest.TestCase):
         self.assertEqual(retried.outcome, Outcome.UNKNOWN)
         self.assertEqual(sorted(load_state(self.state_path)['todos']),
                          ['SYNTHETIC-todo-9001', 'SYNTHETIC-todo-9002'])
+        indexed = self._indexed(request.operation_id)
+        self.assertEqual(indexed['recovery_matches'], 2)
+        self.assertEqual(indexed['recovery_reason'], REASON_TITLE_AMBIGUOUS)
+        self.assertTrue(indexed['needs_manual_confirmation'])
+
+    def test_fake_dws_pages_like_the_live_list(self):
+        """``--size`` above one page merges without ``hasMore``; at or below it
+        admits more pages, which the recovery read must reject."""
+        state = load_state(self.state_path)
+        self._seed_todo(state, 'SYNTHETIC-todo-9001', 'stage:one')
+        self._seed_todo(state, 'SYNTHETIC-todo-9002', 'stage:two')
+        save_state(self.state_path, state)
+        env = dict(os.environ, FAKE_DWS_STATE=str(self.state_path))
+
+        def list_with(size):
+            argv = [sys.executable, str(FAKE_DWS), 'todo', 'task', 'list',
+                    '--size', str(size), '--status', 'false', '--format', 'json']
+            out = subprocess.run(argv, capture_output=True, text=True, env=env)
+            return json.loads(out.stdout)['result']
+
+        small = list_with(1)
+        self.assertEqual(len(small['todoCards']), 1)
+        self.assertTrue(small['hasMore'])
+        merged = list_with(25)
+        self.assertEqual(len(merged['todoCards']), 2)
+        self.assertNotIn('hasMore', merged)
 
     def test_todo_list_that_admits_more_pages_is_not_a_match(self):
         request = self._issue_request()
