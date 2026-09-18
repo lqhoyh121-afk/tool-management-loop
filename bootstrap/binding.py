@@ -123,8 +123,25 @@ def intake_since_from_document(document):
     没配水位时发现只出报告、不建行（见 ``bootstrap.inbox``）：首次启用时表里已有的
     历史行本机无从辨认，误建一次就会推出早已处理完的审批待办。
     """
+    return _since_from_document(document, 'application_intake')
+
+
+def return_intake_since_from_document(document):
+    """归还自动发现的启用水位（``return_intake.since``），没配时返回 None。
+
+    与申请水位同一口径、同一个键名规则，只是**另起一段**：归还是另一条线，给申请
+    配了水位不等于同意把表里已有的归还行也登记掉（那会立刻推出早已处理完的待归还
+    确认待办）。想同时启用就两段都配。
+
+    没配水位时归还发现只出报告、不登记（见 ``bootstrap.returns``）。配了但读不出来
+    是 CONFIG，不当作没配。
+    """
+    return _since_from_document(document, 'return_intake')
+
+
+def _since_from_document(document, key):
     require(isinstance(document, dict), Code.INVALID)
-    raw = document.get('application_intake')
+    raw = document.get(key)
     if raw is None:
         return None
     require(isinstance(raw, dict), Code.CONFIG)

@@ -12,7 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from t04_binding_doc import binding_document
 
 from bootstrap.binding import (binding_from_document, intake_since_from_document,
-                               load_binding, save_binding)
+                               load_binding, return_intake_since_from_document,
+                               save_binding)
 from contracts.model import Code, ContractError
 from contracts.ports import check_binding
 from integrations.dingtalk.layout import (
@@ -173,3 +174,53 @@ class IntakeWatermarkTests(unittest.TestCase):
         binding, _application, *_rest = binding_from_document(document)
         self.assertEqual(binding.config_version, 'synthetic-config-v1')
         self.assertIsNotNone(intake_since_from_document(document))
+
+
+class ReturnIntakeWatermarkTests(unittest.TestCase):
+    """``return_intake.since``（#87 第 6 条）：与申请水位同一个键名规则、另起一段。
+
+    归还是另一条线：给申请配了水位 **不**等于同意把表里已有的归还行也登记掉，反之亦然。
+    """
+
+    def blocked(self, code, fn):
+        with self.assertRaises(ContractError) as raised:
+            fn()
+        self.assertEqual(raised.exception.code, code)
+
+    def test_absent_watermark_is_no_watermark(self):
+        self.assertIsNone(return_intake_since_from_document({}))
+        self.assertIsNone(return_intake_since_from_document({'return_intake': {}}))
+
+    def test_the_watermark_is_read_back_timezone_aware(self):
+        since = return_intake_since_from_document(
+            binding_document(return_intake={'since': '2029-12-30T08:00:00+08:00'}))
+        self.assertEqual(since,
+                         datetime(2029, 12, 30, 8, 0, tzinfo=timezone(timedelta(hours=8))))
+        self.assertIsNotNone(since.utcoffset())
+
+    def test_a_broken_watermark_is_config_not_silently_unset(self):
+        for document in (
+                {'return_intake': 'now'},
+                {'return_intake': {'since': 'not-a-time'}},
+                {'return_intake': {'since': '2029-12-30T08:00:00'}},
+                {'return_intake': {'since': '  2029-12-30T08:00:00+08:00  '}},
+                {'return_intake': {'since': 123}},
+                {'return_intake': {'since_at': '2029-12-30T08:00:00+08:00'}}):
+            self.blocked(Code.CONFIG,
+                         lambda document=document: return_intake_since_from_document(document))
+
+    def test_the_two_lines_do_not_enable_each_other(self):
+        applications_only = binding_document(
+            application_intake={'since': '2029-12-30T08:00:00+08:00'})
+        self.assertIsNotNone(intake_since_from_document(applications_only))
+        self.assertIsNone(return_intake_since_from_document(applications_only))
+        returns_only = binding_document(
+            return_intake={'since': '2029-12-30T08:00:00+08:00'})
+        self.assertIsNone(intake_since_from_document(returns_only))
+        self.assertIsNotNone(return_intake_since_from_document(returns_only))
+
+    def test_the_binding_document_still_loads_with_the_extra_key(self):
+        document = binding_document(return_intake={'since': '2029-12-30T08:00:00+08:00'})
+        binding, _application, *_rest = binding_from_document(document)
+        self.assertEqual(binding.config_version, 'synthetic-config-v1')
+        self.assertIsNotNone(return_intake_since_from_document(document))

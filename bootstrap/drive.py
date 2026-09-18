@@ -27,12 +27,14 @@ from contracts.ports import StageRequest, check_binding, stage_operation_id
 from workflow.engine import LendingEngine
 
 from .binding import (binding_from_document, field_maps_from_document,
-                      intake_since_from_document, read_binding_document, require_complete)
+                      intake_since_from_document, read_binding_document,
+                      require_complete, return_intake_since_from_document)
 from .gate import assert_business_allowed
 from .inbox import (REGISTER_NAME, ApplicationIntake, IntakeReport, IntakeSkip,
                     format_intake_lines)
 from .instance import MachineLock
 from .journal import FileJournal, is_resolved
+from .returns import ReturnIntake, failed_return_report, format_return_lines
 from .snapshot import decode_resource, encode_resource
 
 _NEXT_STAGE = {
@@ -142,6 +144,12 @@ class DriveReport:
     registered and skipped. A discovery that blew up is reported inside that
     account (``scan_code``), never as a failed pass: the recovery and the stage
     reconcile below still run on the work the queue already holds.
+
+    ``returns`` is the same account for return-form rows (issue #87), kept
+    **apart** from ``intake`` on purpose: the two lines scan two different
+    tables, carry their own water marks and their own skips, and one line's
+    counts must never overwrite the other's. Both feed the same queue, so a
+    registered return travels the same path as a hand-registered one.
     """
 
     recovered: tuple
@@ -152,6 +160,7 @@ class DriveReport:
     stage_created: tuple = ()
     healed: tuple = ()
     intake: object = None
+    returns: object = None
 
 
 def _failed_intake(code, note='发现扫描抛异常，本轮未登记'):
@@ -280,6 +289,9 @@ def format_drive_lines(report):
         )
     if report.intake is not None:
         lines.extend(format_intake_lines(report.intake))
+    if getattr(report, 'returns', None) is not None:
+        # 归还发现另起一行：两条线的扫描/水位/登记/跳过各自算账，谁都不冲掉谁。
+        lines.extend(format_return_lines(report.returns))
     for label, outcomes in (('跳过', report.skipped), ('挂起', report.blocked)):
         for outcome in outcomes:
             line = (f'  {label} {outcome.kind} loan={outcome.loan_id} '
@@ -305,7 +317,8 @@ def drive_exit_code(report):
       稳态；其余（``EVIDENCE_REQUIRED``、``CONFIG_RECONFIRM_REQUIRED``、
       ``READBACK_MISMATCH``、``WRONG_PERSON``、``QUANTITY_MISMATCH`` …）都算
       失败，要人看；
-    * 发现扫描本身没结论（``scan_code``）—— 缺表不等于空表，同样是失败。
+    * 发现扫描本身没结论（``scan_code``）—— 缺表不等于空表，同样是失败。申请发现与
+      归还发现两条线各自算：任一条没结论都算要人看。
 
     单个失败照旧只记一行、不中断整轮：退出码是这一轮跑完后的汇总，不是中断信号。
     """
@@ -314,6 +327,8 @@ def drive_exit_code(report):
     if any(outcome.code not in BENIGN_SKIP_CODES for outcome in report.skipped):
         return 1
     if getattr(report.intake, 'scan_code', ''):
+        return 1
+    if getattr(getattr(report, 'returns', None), 'scan_code', ''):
         return 1
     return 0
 
@@ -376,12 +391,13 @@ class StaticSources:
 class DriveLoop:
     """One non-interactive pass. Restart always reconciles unresolved ops first."""
 
-    def __init__(self, engine, sources, store, locks, intake=None):
+    def __init__(self, engine, sources, store, locks, intake=None, returns=None):
         self.engine = engine
         self.sources = sources
         self.store = store
         self.locks = locks
         self.intake = intake
+        self.returns = returns
 
     def run(self):
         """One pass, with ``blocked_loans`` limited to genuinely unresolved writes.
@@ -406,8 +422,12 @@ class DriveLoop:
         # 申请发现先于队列消费：真人新提交的行必须在**同一轮**里变成审批入口，
         # 而不是等操作员登记。发现本身也只写本机队列与台账行，闸门照旧。
         reported = self._run_intake()
+        # 归还发现紧随其后，同样先于队列消费：真人填完归还表单那一行也要在同一轮里
+        # 变成待归还确认，而不是等操作员手工往队列里加一条引用（#87）。
+        returned = self._run_return_intake()
         discovered = tuple(WorkItem(finding.kind, finding.loan_ref, finding.source)
-                           for finding in getattr(reported, 'findings', ()))
+                           for finding in (getattr(reported, 'findings', ())
+                                           + getattr(returned, 'findings', ())))
         healed = []
         recovered, hangs = self._recover()
         stage_checked, stages_created, stage_skips = self._reconcile_stages(discovered)
@@ -438,7 +458,7 @@ class DriveLoop:
                 healed.append(_drive_outcome(item, explanation.value))
         return DriveReport(tuple(recovered), tuple(processed), tuple(skipped), tuple(blocked),
                            tuple(stage_checked), tuple(stages_created),
-                           tuple(healed), reported)
+                           tuple(healed), reported, returned)
 
     def _run_intake(self):
         """这一轮的申请发现账目；没接发现就是 None。
@@ -457,6 +477,24 @@ class DriveLoop:
             return _failed_intake(exc.code.value, note='发现扫描未完成，本轮未登记')
         except Exception:
             return _failed_intake(Code.UNKNOWN.value)
+
+    def _run_return_intake(self):
+        """这一轮的归还发现账目；没接归还发现就是 None。
+
+        与申请发现同一口径：发现是**便利**，不是这一轮本身 —— 只有实例闸门
+        （``SECOND_INSTANCE_BLOCKED``）才允许带着整轮一起停，其余任何异常都记进归还
+        发现账目（``scan_code``）并按「本轮未登记」继续。
+        """
+        if self.returns is None:
+            return None
+        try:
+            return self.returns.run()
+        except ContractError as exc:
+            if exc.code == Code.INSTANCE:
+                raise
+            return failed_return_report(exc.code.value, note='归还发现扫描未完成，本轮未登记')
+        except Exception:
+            return failed_return_report(Code.UNKNOWN.value)
 
     def _recover(self):
         """回查未决流水：只有真的结清的才算「回查」，查不出结论的落成挂起。
@@ -864,6 +902,24 @@ def application_intake(engine, reader, sources, store, locks, runtime, document=
                              since=intake_since_from_document(document or {}))
 
 
+def return_intake(engine, reader, sources, store, locks, document=None):
+    """归还发现的端口：注入的读侧能扫归还表时才接上，否则 None（照旧）。
+
+    与 ``application_intake`` 同一做法，两处刻意的保守选择：
+
+    * **特性探测**：没有归还读侧的端口（只读查询替身、镜像读侧、没声明归还表单的旧实例）
+      保持驱动原样。真机适配器两半都有，且要求的 ``entry_container`` 在活绑定里是必填。
+    * **水位**：取绑定里的 ``return_intake.since``；未配时发现只出报告、不登记一行。
+    """
+    if not (hasattr(reader, 'pending_returns') and hasattr(reader, 'read_return')
+            and hasattr(reader, 'resolve_return_form_loan')):
+        return None
+    if not getattr(reader, 'entry_container', ''):
+        return None
+    return ReturnIntake(engine, reader, sources, store, locks,
+                        since=return_intake_since_from_document(document or {}))
+
+
 def run_bound_drive(runtime, lock_root, reader=None, writer=None, stages=None,
                     sources=None, locks=None, store=None):
     runtime = Path(runtime)
@@ -886,7 +942,9 @@ def run_bound_drive(runtime, lock_root, reader=None, writer=None, stages=None,
     try:
         return DriveLoop(engine, sources, store, locks,
                          intake=application_intake(engine, reader, sources, store, locks,
-                                                   runtime, document)).run()
+                                                   runtime, document),
+                         returns=return_intake(engine, reader, sources, store, locks,
+                                               document)).run()
     finally:
         engine.stop()
 
