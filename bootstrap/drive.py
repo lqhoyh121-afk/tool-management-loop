@@ -9,9 +9,16 @@ A crash between the approval write and the system reservation leaves the loan
 in `reservation_pending` with the approval event already consumed, so every
 later pass used to report nothing but DUPLICATE_EVENT. See
 `_finish_pending_reservation`.
+
+Anything this module cannot prove is reported as a 挂起 (``Hang`` code plus a
+readable Chinese reason), never as a silent success: an unresolved write that
+the requery could not settle counts as a hang, not as a recovered pass.
+`drive_exit_code` turns a pass that has hangs (or skips a human has to look at)
+into a non-zero exit code for the scheduler, without ever aborting the pass.
 """
 import json
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from pathlib import Path
 
 from contracts.flow import Outcome
@@ -25,7 +32,7 @@ from .gate import assert_business_allowed
 from .inbox import (REGISTER_NAME, ApplicationIntake, IntakeReport, IntakeSkip,
                     format_intake_lines)
 from .instance import MachineLock
-from .journal import FileJournal
+from .journal import FileJournal, is_resolved
 from .snapshot import decode_resource, encode_resource
 
 _NEXT_STAGE = {
@@ -36,6 +43,37 @@ _NEXT_STAGE = {
 }
 
 
+class Hang(StrEnum):
+    """Why this pass gave up on a loan: a driver-side reason, not a contract code.
+
+    挂起项的码要说得出「为什么挂」。合同拒绝码（``Code``）不够用：同一个
+    ``INVALID_STATE`` 会盖住「翻不到审批证据」「单已经被别人推进」「库存快照对不上」
+    三件完全不同的事，报告里看不出该找谁、该做什么。所以驱动侧的挂起一律用这里的码，
+    再配一句人话（``HANG_NOTES``），摘要、明细行与「待人工」提示都会带上它。
+    """
+
+    APPROVAL_UNPROVEN = 'HANG_APPROVAL_UNPROVEN'
+    APPROVAL_AMBIGUOUS = 'HANG_APPROVAL_AMBIGUOUS'
+    SNAPSHOT_MISSING = 'HANG_SNAPSHOT_MISSING'
+    STOCK_MOVED = 'HANG_STOCK_MOVED'
+    LOAN_MOVED = 'HANG_LOAN_MOVED'
+    UNRESOLVED_WRITE = 'HANG_UNRESOLVED_WRITE'
+
+
+HANG_NOTES = {
+    Hang.APPROVAL_UNPROVEN: '审批已写、预留未写，本机翻不到那条已落库且被日志消费的审批证据'
+                            '（应在写审批的那台机器上跑一轮，或人工补预留）',
+    Hang.APPROVAL_AMBIGUOUS: '同一单翻到多条候选审批，不挑一条（挑哪条都会换掉操作号），'
+                             '需人工清理重复审批行',
+    Hang.SNAPSHOT_MISSING: '审批回执没记库存快照，预留该按哪个基线比对无从证明，需人工确认',
+    Hang.STOCK_MOVED: '库存行与审批回执记录的快照对不上（被并发动用或手改过），'
+                      '这份预留到没到账无从证明，别照着猜再迁一次',
+    Hang.LOAN_MOVED: '这一行落到待预留补齐，但单已经不在待预留状态（已被推进或改表），'
+                     '这一行的证据不是判据',
+    Hang.UNRESOLVED_WRITE: '日志里这次写回查后仍没有结论，待人工上平台查这次写到底落没落',
+}
+
+
 class _Pending(ContractError):
     """Half-finished transition the driver must neither retry nor hide.
 
@@ -43,7 +81,15 @@ class _Pending(ContractError):
     cannot prove enough to finish the step. run() reports it in `blocked`, so
     the loan stays visible to a human instead of looking like a plain
     duplicate event on every pass.
+
+    ``code`` 是驱动侧的挂起原因码（``Hang``）：同一个合同码盖住多种原因时，报告里
+    看不出为什么挂。``note`` 是给操作员看的那句话，缺省取 ``HANG_NOTES`` 里该码的
+    说明，摘要与明细行都会带上。
     """
+
+    def __init__(self, code, note=None):
+        super().__init__(code)
+        self.note = HANG_NOTES.get(code.value, '') if note is None else note
 
 
 @dataclass(frozen=True)
@@ -64,17 +110,26 @@ class DriveOutcome:
     source_kind: str
     source_id: str
     code: str
+    note: str = ''
 
 
 @dataclass(frozen=True)
 class DriveReport:
     """One pass, with stage reconciliation kept in its own account.
 
-    ``recovered`` is only the unresolved-journal recovery; the entry points the
-    reconcile created are writes, so they are reported by ``stage_created``
-    (operation ids) and never mixed into the recovery count. ``stage_checked``
-    holds the known loan refs the reconcile examined. Reconcile skips travel in
-    ``skipped`` like every other skip, tagged ``kind='stage'``.
+    ``recovered`` is only the unresolved-journal recovery, and only the
+    operations that really settled (``is_resolved``): the unresolved-journal
+    count must never include an operation the requery could not conclude, and
+    the entry points the reconcile created are writes, so they are reported by
+    ``stage_created`` (operation ids) and never mixed into the recovery count.
+    ``stage_checked`` holds the known loan refs the reconcile examined.
+    Reconcile skips travel in ``skipped`` like every other skip, tagged
+    ``kind='stage'``.
+
+    A requery that came back without a conclusion is a 挂起: it lands in
+    ``blocked`` as ``Hang.UNRESOLVED_WRITE`` with the loan and source it
+    concerns, so the report never says "已回查" and "挂起" about the same
+    operation at once.
 
     ``healed`` is not a fourth bucket: every healed loan also appears in
     ``processed``, because the pass really did write its reservation. The entry
@@ -108,13 +163,14 @@ def _failed_intake(code, note='发现扫描抛异常，本轮未登记'):
                         skipped=(IntakeSkip('-', code),))
 
 
-def _drive_outcome(item, code):
+def _drive_outcome(item, code, note=''):
     return DriveOutcome(
         kind=item.kind,
         loan_id=item.loan_ref.resource_id,
         source_kind=item.source.kind,
         source_id=item.source.resource_id,
         code=code,
+        note=note,
     )
 
 
@@ -142,7 +198,7 @@ def format_outcome_summary(outcomes):
     return f'{len(outcomes)}（{"，".join(parts)}）'
 
 
-def _waiting_on_human(outcomes):
+def _open_stage_todos(outcomes):
     """Skips that really mean "the human has not acted yet".
 
     An open stage todo reads as ``STATE`` from the todo channel (no completion
@@ -155,13 +211,52 @@ def _waiting_on_human(outcomes):
                  if o.code == Code.STATE.value and o.source_kind == 'todo')
 
 
+def _waiting_on_human(report):
+    """这一轮卡在「等人」上的两类条目：开着的阶段待办 + 挂起。
+
+    旧口径只看 ``skipped``，最需要人的挂起（半写、证据不足、写入未决）反而不在
+    「待人工」清单里。两类仍然分开列，因为处置不同：阶段待办没完成是**正常等待**
+    （人去点一下），挂起是**要人查/补**（上面的 reason code 与说明已经写明是哪一种），
+    混成一句话就分不出故障。
+    """
+    return _open_stage_todos(report.skipped), tuple(report.blocked)
+
+
+def _hang_note_parts(hangs):
+    """挂起按原因码分组：``码×条数（为什么挂）``，同一码只写一次说明。"""
+    grouped = {}
+    for outcome in hangs:
+        grouped.setdefault(outcome.code, []).append(outcome)
+    parts = []
+    for code, items in sorted(grouped.items()):
+        note = items[0].note or HANG_NOTES.get(code, '')
+        parts.append(f'{code}×{len(items)}' + (f'（{note}）' if note else ''))
+    return parts
+
+
+def _waiting_line(report):
+    """「待人工」一行：阶段待办未完成 + 挂起，两类都点名。"""
+    todos, hangs = _waiting_on_human(report)
+    if not todos and not hangs:
+        return None
+    parts = []
+    if todos:
+        parts.append('阶段待办未完成 {count} 条（{ids}）'.format(
+            count=len(todos), ids='，'.join(o.source_id for o in todos)))
+    if hangs:
+        parts.append('挂起 {count} 条（要人查/补，明细见下面挂起行：{why}）'.format(
+            count=len(hangs), why='；'.join(_hang_note_parts(hangs))))
+    return '  待人工 {total} 条：{parts}'.format(total=len(todos) + len(hangs),
+                                                parts='；'.join(parts))
+
+
 def _stage_skips(outcomes):
     """Reconcile skips share the skip tuple with queue skips, tagged by kind."""
     return tuple(o for o in outcomes if o.kind == 'stage')
 
 
 def format_drive_lines(report):
-    waiting = _waiting_on_human(report.skipped)
+    waiting = _waiting_line(report)
     lines = [
         '驱动完成。回查 {recovered}，处理 {processed}，跳过 {skipped}，'
         '挂起 {blocked}。未盲重发。'.format(
@@ -177,8 +272,7 @@ def format_drive_lines(report):
         ),
     ]
     if waiting:
-        ids = '，'.join(o.source_id for o in waiting)
-        lines.append(f'  其中待人工 {len(waiting)} 条（阶段待办尚未完成，不是证据不足）：{ids}')
+        lines.append(waiting)
     if report.healed:
         lines.append(
             '  自愈补齐 {summary}，按已落库审批补写预留'.format(
@@ -188,11 +282,40 @@ def format_drive_lines(report):
         lines.extend(format_intake_lines(report.intake))
     for label, outcomes in (('跳过', report.skipped), ('挂起', report.blocked)):
         for outcome in outcomes:
-            lines.append(
-                f'  {label} {outcome.kind} loan={outcome.loan_id} '
-                f'{outcome.source_kind}={outcome.source_id} {outcome.code}'
-            )
+            line = (f'  {label} {outcome.kind} loan={outcome.loan_id} '
+                    f'{outcome.source_kind}={outcome.source_id} {outcome.code}')
+            if outcome.note:
+                line += f' {outcome.note}'
+            lines.append(line)
     return lines
+
+
+BENIGN_SKIP_CODES = frozenset({Code.DUPLICATE.value, Code.STATE.value})
+
+
+def drive_exit_code(report):
+    """这一轮有没有需要人接手的东西：0 = 没有，1 = 有。
+
+    调度层（定时脚本）只看得见退出码，旧实现恒返回 0，挂起再多也不报警。口径与报告
+    一致，只回答「要不要人看」，不改变这一轮的处置：
+
+    * ``blocked`` 非空 —— 挂起（半写、证据不足、写入未决）都只能由人推进；
+    * ``skipped`` 里出现非稳态的码 —— ``DUPLICATE_EVENT``（这行早就被消费过）与
+      ``INVALID_STATE``（当前状态没有下一步人工动作，或阶段待办还没人点）算日常
+      稳态；其余（``EVIDENCE_REQUIRED``、``CONFIG_RECONFIRM_REQUIRED``、
+      ``READBACK_MISMATCH``、``WRONG_PERSON``、``QUANTITY_MISMATCH`` …）都算
+      失败，要人看；
+    * 发现扫描本身没结论（``scan_code``）—— 缺表不等于空表，同样是失败。
+
+    单个失败照旧只记一行、不中断整轮：退出码是这一轮跑完后的汇总，不是中断信号。
+    """
+    if report.blocked:
+        return 1
+    if any(outcome.code not in BENIGN_SKIP_CODES for outcome in report.skipped):
+        return 1
+    if getattr(report.intake, 'scan_code', ''):
+        return 1
+    return 0
 
 
 class FileSources:
@@ -271,6 +394,10 @@ class DriveLoop:
         spread: the sibling entries of that loan are still evaluated against
         their own fresh read, otherwise one bad row starves the entry that can
         finish the transition and reports every sibling under a code that lies.
+
+        ``blocked`` also carries the requery hangs from ``_recover``: an
+        unresolved write that this pass could not settle is a human's problem,
+        not a recovered operation.
         """
         assert_business_allowed(self.engine.binding, self.engine.lease, self.locks)
         processed = []
@@ -282,9 +409,11 @@ class DriveLoop:
         discovered = tuple(WorkItem(finding.kind, finding.loan_ref, finding.source)
                            for finding in getattr(reported, 'findings', ()))
         healed = []
-        recovered = self._recover()
+        recovered, hangs = self._recover()
         stage_checked, stages_created, stage_skips = self._reconcile_stages(discovered)
         skipped.extend(stage_skips)
+        # 回查没结清的排在最前：它们是这一轮最先被看见的问题，明细行自带原因说明。
+        blocked.extend(hangs)
         blocked_loans = set(self._unresolved_loans())
         for item in self._work(discovered):
             if item.loan_ref in blocked_loans:
@@ -293,7 +422,7 @@ class DriveLoop:
             try:
                 explanation = self._handle(item)
             except _Pending as exc:
-                blocked.append(_drive_outcome(item, exc.code.value))
+                blocked.append(_drive_outcome(item, exc.code.value, exc.note))
                 continue
             except ContractError as exc:
                 if exc.code == Code.INSTANCE:
@@ -330,12 +459,43 @@ class DriveLoop:
             return _failed_intake(Code.UNKNOWN.value)
 
     def _recover(self):
+        """回查未决流水：只有真的结清的才算「回查」，查不出结论的落成挂起。
+
+        ``resolve`` 无论查没查出结论都会返回，旧行为把每条都记进 ``recovered``，
+        半写场景于是同一张单同时印成「回查 1」和「挂起 1」（那张单其实永远结不清）。
+        这里只看一件事：这一轮过后，这条流水还在不在未决清单里 —— 判据与
+        ``FileJournal.unresolved_ids`` 同源（``is_resolved``）。还在的就是挂起，
+        带上它是哪张单、哪个来源，以及回查给了什么答复。
+        """
         recovered = []
+        stuck = []
         for operation_id in self.store.unresolved_ids():
             assert_business_allowed(self.engine.binding, self.engine.lease, self.locks)
-            self.engine.resolve(operation_id)
-            recovered.append(operation_id)
-        return recovered
+            resolution = self.engine.resolve(operation_id)
+            _, receipt = self.store.load(operation_id)
+            if is_resolved(receipt):
+                recovered.append(operation_id)
+            else:
+                stuck.append(self._stuck_outcome(operation_id, resolution))
+        return tuple(recovered), tuple(stuck)
+
+    def _stuck_outcome(self, operation_id, resolution):
+        """没结清的那条流水在报告里长什么样：单 + 来源 + 回查的答复。"""
+        intent, _ = self.store.load(operation_id)
+        if isinstance(intent, StageRequest):
+            loan_id = intent.loan.ref.resource_id
+            source_kind, source_id = 'stage', operation_id
+        else:
+            loan_id = intent.before.ref.resource_id
+            source_kind = intent.event.source.kind
+            source_id = intent.event.source.resource_id
+        outcome = getattr(resolution, 'outcome', Outcome.UNKNOWN)
+        error = getattr(resolution, 'error', None) or Code.UNKNOWN
+        note = ('回查没有结论（回执 {outcome}，答复码 {code}），流水 {operation_id} 不算已回查：'
+                '下一轮继续查；长期如此需人工上平台查这次写到底落没落').format(
+                    outcome=outcome, code=error, operation_id=operation_id)
+        return DriveOutcome('recover', loan_id, source_kind, source_id,
+                            Hang.UNRESOLVED_WRITE.value, note)
 
     def _unresolved_loans(self):
         refs = []
@@ -466,21 +626,25 @@ class DriveLoop:
 
         Unprovable evidence is reported as a blocked item, never retried, and
         never guessed at.
+
+        挂起的码要说得出为什么挂：翻不到审批证据、多条候选、没有快照、库存已被动过、
+        单已经不是待预留，各用一个驱动侧的 ``Hang`` 码，报告里一眼能分辨（旧行为一律
+        ``INVALID_STATE``）。
         """
         current = self.engine.reader.read_loan(loan.ref)
         if current.state != State.RESERVATION_PENDING:
-            raise _Pending(Code.STATE)
-        record = self._recorded_approval(current)
+            raise _Pending(Hang.LOAN_MOVED)
+        record, reason = self._recorded_approval(current)
         if record is None:
-            raise _Pending(Code.STATE)
+            raise _Pending(reason)
         event, snapshot = record
         if snapshot is None:
-            raise _Pending(Code.STATE)
+            raise _Pending(Hang.SNAPSHOT_MISSING)
         fresh = self.engine.reader.read_inventory(current.item)
         if replace(fresh, revision=snapshot.revision) != snapshot:
             # 库存行和审批回执记录的快照对不上：已经有人动过这张表，这一份预留
             # 到没到账无从证明，交给人工，别照着猜再迁一次。
-            raise _Pending(Code.CONFLICT)
+            raise _Pending(Hang.STOCK_MOVED)
         return self._reserve(current, event, original)
 
     def _recorded_approval(self, loan):
@@ -492,7 +656,8 @@ class DriveLoop:
         hand-edited or re-typed row must not be able to hide the approval write
         that did land, and the loan ref + ``action == APPROVE`` + consumed +
         ``VERIFIED`` + exactly-one-candidate conditions already make the match
-        unique. Returns ``(event, snapshot)`` or ``None``.
+        unique. Returns ``(event, snapshot)`` or ``(None, hang_code)`` —— 没翻到
+        与翻到多条是两件不同的事，挂起码分开，免得报告把「证据不足」说成一种。
         """
         found = []
         for operation_id in self.store.ids():
@@ -506,7 +671,9 @@ class DriveLoop:
             if intent.event.event_id not in loan.consumed_events:
                 continue
             found.append((intent.event, receipt.inventory))
-        return found[0] if len(found) == 1 else None
+        if len(found) == 1:
+            return found[0], None
+        return None, (Hang.APPROVAL_AMBIGUOUS if found else Hang.APPROVAL_UNPROVEN)
 
     def _known_loans(self, extra=()):
         """Loan refs the queue or the journal already mentions, first-seen order.

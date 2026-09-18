@@ -14,8 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from t04_binding_doc import binding_document
 
 from bootstrap.binding import save_binding
-from bootstrap.drive import (DriveLoop, FileSources, StaticSources, WorkItem,
-                             dump_sources, format_drive_lines, run_bound_drive)
+from bootstrap.drive import (HANG_NOTES, DriveLoop, FileSources, Hang, StaticSources,
+                             WorkItem, drive_exit_code, dump_sources, format_drive_lines,
+                             run_bound_drive)
 from bootstrap.instance import MachineLock
 from bootstrap.journal import FileJournal
 from bootstrap.wizard import main
@@ -489,11 +490,22 @@ class DriveTests(unittest.TestCase):
             self.assertEqual([(o.kind, o.code) for o in report.skipped],
                              [('stage', Code.STATE.value)])
             self.assertEqual(len(report.blocked), 1)
-            self.assertEqual(report.blocked[0].code, Code.STATE.value)
+            # 挂起码自描述：报告里直接读得出「翻不到审批证据」，不是笼统的 INVALID_STATE。
+            # 这里钉的是台账/日志里实际出现的字面码，不是枚举成员本身。
+            self.assertEqual(report.blocked[0].code, 'HANG_APPROVAL_UNPROVEN')
+            self.assertNotIn(Code.STATE.value, [o.code for o in report.blocked])
+            self.assertEqual(report.blocked[0].note, HANG_NOTES[Hang.APPROVAL_UNPROVEN])
+            lines = '\n'.join(format_drive_lines(report))
             self.assertIn(
-                '挂起 event loan=synthetic-loan form=synthetic-form INVALID_STATE',
-                '\n'.join(format_drive_lines(report)),
+                f'挂起 event loan=synthetic-loan form=synthetic-form '
+                f'{Hang.APPROVAL_UNPROVEN.value} 审批已写、预留未写',
+                lines,
             )
+            # 摘要一眼分得开：挂起是挂起，「待人工」里点名它并带上为什么挂。
+            self.assertIn(f'挂起 1（{Hang.APPROVAL_UNPROVEN.value}×1）', lines)
+            self.assertIn('待人工 1 条', lines)
+            self.assertIn('要人查/补', lines)
+            self.assertEqual(drive_exit_code(report), 1)
             self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state,
                              State.RESERVATION_PENDING)
             self.assertEqual(harness.writer.ledger_stock.available, 5)
@@ -566,17 +578,89 @@ class DriveTests(unittest.TestCase):
             harness.engine.lease = None
 
     def test_summary_separates_waiting_on_human_from_missing_evidence(self):
+        """摘要要能一眼分清：正常等人（阶段待办没完成）vs 挂起（证据不足/未决写）。"""
         from bootstrap.drive import DriveOutcome, DriveReport, format_drive_lines
 
         waiting = DriveOutcome('event', 'recLoan', 'todo', 'task-1', Code.STATE.value)
         broken = DriveOutcome('event', 'recLoan', 'form', 'row-1', 'EVIDENCE_REQUIRED')
-        lines = '\n'.join(format_drive_lines(DriveReport((), (), (waiting, broken), ())))
+        hang = DriveOutcome('event', 'recLoan', 'form', 'row-2', Hang.APPROVAL_UNPROVEN.value,
+                            HANG_NOTES[Hang.APPROVAL_UNPROVEN])
+        lines = '\n'.join(format_drive_lines(DriveReport((), (), (waiting, broken), (hang,))))
 
-        self.assertIn('待人工 1 条', lines)
-        self.assertIn('不是证据不足', lines)
+        # 挂起进「待人工」总数，但与阶段待办分开列：一个是等人点，一个是要人查/补。
+        self.assertIn('待人工 2 条', lines)
+        self.assertIn('阶段待办未完成 1 条（task-1）', lines)
+        self.assertIn(f'挂起 1 条（要人查/补', lines)
+        self.assertIn(f'{Hang.APPROVAL_UNPROVEN.value}×1（审批已写、预留未写', lines)
         self.assertIn('task-1', lines)
         self.assertIn('EVIDENCE_REQUIRED×1', lines)
         self.assertIn(f'{Code.STATE.value}×1', lines)
+        self.assertIn('row-2', lines)
+
+    def test_exit_code_flags_hangs_and_real_failures_but_not_steady_state(self):
+        """退出码回答「要不要人看」：稳态（等人点待办 / 早就消费过）不当失败。"""
+        from bootstrap.drive import DriveOutcome, DriveReport, drive_exit_code
+        from bootstrap.inbox import IntakeReport
+
+        def report(skipped=(), blocked=(), intake=None):
+            return DriveReport((), (), tuple(skipped), tuple(blocked), intake=intake)
+
+        def outcome(kind, source_kind, code):
+            return DriveOutcome(kind, 'recLoan', source_kind, 'src-1', code)
+
+        self.assertEqual(drive_exit_code(report()), 0)
+        self.assertEqual(drive_exit_code(
+            report(skipped=(outcome('event', 'todo', Code.STATE.value),))), 0)
+        self.assertEqual(drive_exit_code(
+            report(skipped=(outcome('event', 'form', Code.DUPLICATE.value),))), 0)
+        # 非稳态的跳过与挂起都要人看。
+        self.assertEqual(drive_exit_code(
+            report(skipped=(outcome('event', 'form', Code.EVIDENCE.value),))), 1)
+        self.assertEqual(drive_exit_code(
+            report(skipped=(outcome('event', 'form', Code.READBACK.value),))), 1)
+        self.assertEqual(drive_exit_code(
+            report(blocked=(outcome('recover', 'form', Hang.UNRESOLVED_WRITE.value),))), 1)
+        # 发现扫描本身没结论：缺表不等于空表。
+        self.assertEqual(drive_exit_code(report(intake=IntakeReport(scan_code=Code.UNKNOWN.value))), 1)
+        # 发现只出报告（dry-run）不是失败：逐行 CONFIG 记在发现账目里，scan_code 为空。
+        self.assertEqual(drive_exit_code(report(intake=IntakeReport(scanned=0))), 0)
+
+    def test_cli_drive_returns_non_zero_when_the_pass_hangs(self):
+        """CLI 退出码要反映挂起：旧行为恒 0，调度层感知不到半写的单。"""
+        harness = DriveHarness(self.runtime, self.locks)
+        harness.stop()
+        approve = harness.event(Action.APPROVE)
+        loan, stock = fixtures.settled(fixtures.loan(), approve, fixtures.stock())
+        harness.reader.set_loan(loan)
+        harness.writer.ledger_stock = stock
+        harness.reader.set_event(fixtures.LOAN, fixtures.FORM, approve)
+        dump_sources(self.runtime / 'sources.json', (
+            WorkItem('event', fixtures.LOAN, fixtures.FORM),
+        ))
+        stdout = io.StringIO()
+        code = main(
+            ['--drive', '--runtime', str(self.runtime), '--lock-root', str(self.locks)],
+            stdin=io.StringIO(''),
+            stdout=stdout,
+            wait_on_error=False,
+            environ_kwargs=dict(ENV, runtime_dir=str(self.runtime)),
+            ports={
+                'reader': harness.reader,
+                'writer': harness.writer,
+                'stages': harness.stages,
+                'sources': FileSources(self.runtime / 'sources.json'),
+                'locks': harness.locks,
+                'store': harness.journal,
+            },
+        )
+        text = stdout.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn(f'挂起 1（{Hang.APPROVAL_UNPROVEN.value}×1）', text)
+        self.assertIn('待人工 1 条', text)
+        self.assertIn('退出码 1', text)
+        # 退出码只是汇总：这一轮的处置没变，仍然一张单都没动。
+        self.assertEqual(harness.writer.writes, 0)
+        self.assertEqual(harness.writer.ledger_stock.available, 5)
 
     def test_missing_binding_fails_closed(self):
         empty = self.root / 'empty-runtime'
@@ -712,7 +796,7 @@ class DriveTests(unittest.TestCase):
             report = DriveLoop(harness.engine, sources, harness.journal, harness.locks).run()
 
             self.assertEqual(report.processed, ())
-            self.assertEqual([o.code for o in report.blocked], [Code.CONFLICT.value])
+            self.assertEqual([o.code for o in report.blocked], [Hang.STOCK_MOVED.value])
             self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state,
                              State.RESERVATION_PENDING)
             # 关键断言：库存一步没动（旧行为会再迁一次 → (1,4,0)）。
@@ -725,7 +809,7 @@ class DriveTests(unittest.TestCase):
 
             # 再跑一轮：顺序不变也不会自己动起来。
             again = DriveLoop(harness.engine, sources, harness.journal, harness.locks).run()
-            self.assertEqual([o.code for o in again.blocked], [Code.CONFLICT.value])
+            self.assertEqual([o.code for o in again.blocked], [Hang.STOCK_MOVED.value])
             self.assertEqual(
                 (harness.writer.ledger_stock.available, harness.writer.ledger_stock.reserved,
                  harness.writer.ledger_stock.borrowed),
@@ -757,7 +841,7 @@ class DriveTests(unittest.TestCase):
                 harness.journal, harness.locks).run()
 
             self.assertEqual(report.processed, ())
-            self.assertEqual([o.code for o in report.blocked], [Code.STATE.value])
+            self.assertEqual([o.code for o in report.blocked], [Hang.APPROVAL_UNPROVEN.value])
             self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state,
                              State.RESERVATION_PENDING)
             # 关键断言：按未落地的审批发放是不允许的，库存不动。
@@ -792,7 +876,7 @@ class DriveTests(unittest.TestCase):
                 harness.journal, harness.locks).run()
 
             self.assertEqual(report.processed, ())
-            self.assertEqual([o.code for o in report.blocked], [Code.STATE.value])
+            self.assertEqual([o.code for o in report.blocked], [Hang.APPROVAL_AMBIGUOUS.value])
             self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state,
                              State.RESERVATION_PENDING)
             # 关键断言：多候选必须拒绝，库存不动。
@@ -802,14 +886,17 @@ class DriveTests(unittest.TestCase):
                 (5, 0, 0),
             )
             self.assertEqual(harness.writer.writes, 2)
+            # 挂起码自描述：多条候选与「一条都没翻到」不是同一件事，报告里分得开。
+            self.assertIn(f'挂起 1（{Hang.APPROVAL_AMBIGUOUS.value}×1）',
+                          '\n'.join(format_drive_lines(report)))
         finally:
             harness.stop()
 
     def test_blocked_sibling_entry_is_not_reported_as_an_unresolved_write(self):
         """同单另一条条目不得被牵连成「写入未决」：那是假话，还会把自愈饿死。
 
-        审批回执是 verified，机器上没有任何未决写；同单第一条挂起不该让第二条
-        改口成 WRITE_UNKNOWN_QUERY_FIRST。
+        审批回执是 verified，机器上没有任何未决写；同单第一条挂起不该让第二、第三条
+        改口成 WRITE_UNKNOWN_QUERY_FIRST（旧口径会把三条同单条目数成「未决×2」）。
         """
         harness = DriveHarness(self.runtime, self.locks)
         try:
@@ -819,18 +906,25 @@ class DriveTests(unittest.TestCase):
             harness.writer.ledger_stock = stock
             harness.reader.set_event(fixtures.LOAN, fixtures.FORM, approve)
             harness.reader.set_event(fixtures.LOAN, fixtures.APPLY_FORM, approve)
+            harness.reader.set_event(fixtures.LOAN, ISSUE_TASK, approve)
 
             report = DriveLoop(
                 harness.engine,
                 StaticSources((
                     WorkItem('event', fixtures.LOAN, fixtures.FORM),
                     WorkItem('event', fixtures.LOAN, fixtures.APPLY_FORM),
+                    WorkItem('event', fixtures.LOAN, ISSUE_TASK),
                 )),
                 harness.journal, harness.locks).run()
 
             self.assertEqual([o.code for o in report.blocked],
-                             [Code.STATE.value, Code.STATE.value])
+                             [Hang.APPROVAL_UNPROVEN.value] * 3)
             self.assertNotIn(Code.UNKNOWN.value, [o.code for o in report.blocked])
+            lines = '\n'.join(format_drive_lines(report))
+            self.assertIn(f'挂起 3（{Hang.APPROVAL_UNPROVEN.value}×3）', lines)
+            self.assertNotIn('WRITE_UNKNOWN_QUERY_FIRST', lines)
+            self.assertIn('待人工 3 条', lines)
+            self.assertEqual(drive_exit_code(report), 1)
             self.assertEqual(harness.writer.writes, 0)
             self.assertEqual(harness.writer.ledger_stock.available, 5)
         finally:
@@ -950,6 +1044,236 @@ class DriveTests(unittest.TestCase):
             self.assertEqual(harness.writer.ledger_stock.reserved, 0)
         finally:
             harness.stop()
+
+    def test_an_unconsumed_approval_receipt_must_not_heal_the_reservation(self):
+        """审批回执在日志里，但台账没有把它记成已消费：不得据此补预留。
+
+        这条守卫是「审批事件必须在 consumed_events」那一句：没有它，一张回执就能
+        让驱动在没有真实审批的情况下推着库存走。
+        """
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            self.approval_written(harness)
+            # 台账那本账没把这次审批记成已消费（手改/并写），本机镜像里也没有。
+            harness.reader.set_loan(replace(harness.reader.read_loan(fixtures.LOAN),
+                                           consumed_events=()))
+
+            report = DriveLoop(
+                harness.engine, StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),)),
+                harness.journal, harness.locks).run()
+
+            self.assertEqual(report.processed, ())
+            self.assertEqual([o.code for o in report.blocked], [Hang.APPROVAL_UNPROVEN.value])
+            self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state,
+                             State.RESERVATION_PENDING)
+            self.assertEqual(
+                (harness.writer.ledger_stock.available, harness.writer.ledger_stock.reserved,
+                 harness.writer.ledger_stock.borrowed),
+                (5, 0, 0),
+            )
+            # 只有那次审批写；预留一次都没写。
+            self.assertEqual(harness.writer.writes, 1)
+            self.assertEqual(drive_exit_code(report), 1)
+            lines = '\n'.join(format_drive_lines(report))
+            self.assertIn(f'挂起 1（{Hang.APPROVAL_UNPROVEN.value}×1）', lines)
+            self.assertIn('待人工 1 条', lines)
+        finally:
+            harness.stop()
+
+    def test_another_loans_approval_cannot_heal_this_loan(self):
+        """别人的审批回执（同一事件 id 被抄进本单）不得拿来补本单的预留。
+
+        这是「来源匹配」那句守卫：候选审批必须以 **本单** 的台账行为来源。没有它，
+        一张被抄了别人审批 id 的行就能推着本单库存走。
+        """
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            other_ref = Resource('record', 'synthetic-org', 'synthetic-loans',
+                                 'synthetic-other-loan')
+            other = replace(fixtures.loan(), ref=other_ref)
+            harness.reader.set_loan(other)
+            harness.engine.ensure_stage(other, Action.APPROVE)
+            other_approve = replace(harness.event(Action.APPROVE), loan_ref=other_ref)
+            harness.reader.set_event(other_ref, fixtures.FORM, other_approve)
+            self.assertEqual(harness.engine.execute(other_ref, fixtures.FORM).outcome,
+                             Outcome.VERIFIED)
+            self.assertEqual(harness.writer.writes, 1)
+
+            # 本单停在待预留：台账行里被抄上了**别人的**审批事件 id。
+            harness.reader.set_loan(replace(fixtures.loan(), state=State.RESERVATION_PENDING,
+                                           consumed_events=(other_approve.event_id,)))
+            harness.reader.set_event(fixtures.LOAN, fixtures.FORM, other_approve)
+
+            report = DriveLoop(
+                harness.engine, StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),)),
+                harness.journal, harness.locks).run()
+
+            self.assertEqual([o.loan_id for o in report.blocked], ['synthetic-loan'])
+            self.assertEqual([o.code for o in report.blocked], [Hang.APPROVAL_UNPROVEN.value])
+            # 这一轮只补了别人那张单的预留（它自己的审批确实在日志里）。
+            self.assertEqual([o.loan_ref for o in report.processed], [other_ref])
+            self.assertEqual(
+                (harness.writer.ledger_stock.available, harness.writer.ledger_stock.reserved,
+                 harness.writer.ledger_stock.borrowed),
+                (3, 2, 0),
+            )
+            self.assertEqual(harness.writer.writes, 2)  # 别人的审批 + 别人的预留，就这两次
+            self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state,
+                             State.RESERVATION_PENDING)
+        finally:
+            harness.stop()
+
+    def test_a_healed_loan_does_not_write_again_on_the_next_two_passes(self):
+        """自愈不是每轮重写：补齐后连跑两轮，写入数与库存都不再变。"""
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            self.approval_written(harness)
+            sources = StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),))
+            first = DriveLoop(harness.engine, sources, harness.journal, harness.locks).run()
+            self.assertEqual(harness.writer.writes, 2)
+            self.assertEqual(first.blocked, ())
+            self.assertEqual(drive_exit_code(first), 0)
+
+            # 自愈补出的是「待领用确认」待办，还没人点：读侧口径就是 STATE（待人工），
+            # 不是证据不足 —— 这一点也必须留在「待人工」里，并且不算失败。
+            original_read_event = harness.reader.read_event
+
+            def open_todo(loan, source):
+                if source == ISSUE_TASK:
+                    raise ContractError(Code.STATE)
+                return original_read_event(loan, source)
+
+            harness.reader.read_event = open_todo
+            for _ in range(2):
+                again = DriveLoop(harness.engine, sources, harness.journal, harness.locks).run()
+                self.assertEqual(again.recovered, ())
+                self.assertEqual(again.blocked, ())
+                self.assertEqual([o.code for o in again.skipped],
+                                 [Code.DUPLICATE.value, Code.STATE.value])
+                lines = '\n'.join(format_drive_lines(again))
+                self.assertIn('待人工 1 条：阶段待办未完成 1 条（synthetic-issue-todo）', lines)
+                # 稳态不报警：重复事件与开着的阶段待办都不是「要人看」。
+                self.assertEqual(drive_exit_code(again), 0)
+                self.assertEqual(harness.writer.writes, 2)
+                self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state,
+                                 State.AWAITING_ISSUE)
+                self.assertEqual(
+                    (harness.writer.ledger_stock.available,
+                     harness.writer.ledger_stock.reserved,
+                     harness.writer.ledger_stock.borrowed),
+                    (3, 2, 0),
+                )
+        finally:
+            harness.stop()
+
+    def test_a_stale_queue_row_does_not_starve_the_heal(self):
+        """队列里残留一条读不通的单：只记一条跳过，同轮该补的预留照样补上。"""
+        harness = DriveHarness(self.runtime, self.locks)
+        try:
+            self.approval_written(harness)
+            stale_ref = Resource('record', 'synthetic-org', 'synthetic-loans',
+                                 'synthetic-stale-loan')
+            stale = replace(fixtures.loan(), ref=stale_ref, config_version='stale-config')
+            harness.reader.set_loan(stale)
+            harness.writer.register(stale)
+            harness.reader.set_event(stale_ref, fixtures.FORM,
+                                     harness.event(Action.APPROVE))
+
+            report = DriveLoop(
+                harness.engine,
+                StaticSources((
+                    WorkItem('event', stale_ref, fixtures.FORM),
+                    WorkItem('event', fixtures.LOAN, fixtures.FORM),
+                )),
+                harness.journal, harness.locks).run()
+
+            # 残留条目按 CONFIG 记跳过（不是挂起），自愈没被它饿死。
+            self.assertEqual([o.code for o in report.skipped if o.loan_id == 'synthetic-stale-loan'],
+                             [Code.CONFIG.value] * 2)
+            self.assertEqual([o.code for o in report.blocked], [])
+            self.assertEqual(harness.reader.read_loan(fixtures.LOAN).state, State.AWAITING_ISSUE)
+            self.assertEqual(
+                (harness.writer.ledger_stock.available, harness.writer.ledger_stock.reserved,
+                 harness.writer.ledger_stock.borrowed),
+                (3, 2, 0),
+            )
+            # CONFIG 不是稳态：退出码要人看。
+            self.assertEqual(drive_exit_code(report), 1)
+        finally:
+            harness.stop()
+
+    def test_requery_without_a_conclusion_is_a_hang_never_a_recovery(self):
+        """回查查不出结论：不算「已回查」，落成自描述挂起（旧行为同一个 op 两头都算）。"""
+        harness = DriveHarness(self.runtime, self.locks)
+        harness.writer.lose_response = True
+        harness.reader.set_event(fixtures.LOAN, fixtures.FORM, harness.event(Action.APPROVE))
+        first = DriveLoop(
+            harness.engine, StaticSources((WorkItem('event', fixtures.LOAN, fixtures.FORM),)),
+            harness.journal, harness.locks).run()
+        self.assertEqual([o.code for o in first.blocked], [Code.UNKNOWN.value])
+        self.assertEqual(harness.writer.writes, 1)
+        operation_id = harness.journal.unresolved_ids()[0]
+
+        def carry_over(target):
+            target.writer.loan_states = dict(harness.writer.loan_states)
+            target.writer.current = harness.writer.current
+            target.writer.inventory = harness.writer.inventory
+            target.writer.ledger_stock = harness.writer.ledger_stock
+            target.writer.writes = harness.writer.writes
+            target.reader.seed_loans = dict(harness.reader.seed_loans)
+            target.reader.events = dict(harness.reader.events)
+        harness.stop()
+
+        # 平台回查仍然说不清（真机形态：query 回未知，不猜落没落）。
+        stuck = DriveHarness(self.runtime, self.locks)
+        carry_over(stuck)
+        stuck.writer.query = lambda intent: Receipt(intent.operation_id, Outcome.UNKNOWN)
+        try:
+            report = DriveLoop(stuck.engine, StaticSources(()), stuck.journal, stuck.locks).run()
+
+            self.assertEqual(report.recovered, ())
+            hangs = [o for o in report.blocked if o.kind == 'recover']
+            self.assertEqual(len(hangs), 1)
+            self.assertEqual(hangs[0].code, Hang.UNRESOLVED_WRITE.value)
+            self.assertEqual(hangs[0].loan_id, fixtures.LOAN.resource_id)
+            self.assertEqual(hangs[0].source_kind, fixtures.FORM.kind)
+            # 明细行要说得出是哪条流水没结清（运维要拿它去 runtime/operations 里查）。
+            self.assertIn(operation_id, hangs[0].note)
+            lines = '\n'.join(format_drive_lines(report))
+            self.assertIn('回查 0，', lines)
+            self.assertIn(f'挂起 2（{Hang.UNRESOLVED_WRITE.value}×1，'
+                          f'{Code.UNKNOWN.value}×1）', lines)
+            self.assertIn('不算已回查', lines)
+            self.assertIn('待人工 2 条', lines)
+            # 同单那条队列条目被拦下的理由是「这张单有未决写」—— 这条理由这时是真话。
+            self.assertIn('挂起 event loan=synthetic-loan form=synthetic-form '
+                          f'{Code.UNKNOWN.value}', lines)
+            self.assertEqual(drive_exit_code(report), 1)
+            self.assertEqual(stuck.writer.writes, 1)
+            self.assertEqual(stuck.journal.unresolved_ids(), (operation_id,))
+        finally:
+            stuck.stop()
+
+        # 平台回查说得清了：这一轮才算「回查 1」，挂起消失。
+        back = DriveHarness(self.runtime, self.locks)
+        carry_over(back)
+        try:
+            healed = DriveLoop(back.engine, StaticSources(()), back.journal, back.locks).run()
+            self.assertEqual(healed.recovered, (operation_id,))
+            self.assertEqual(healed.blocked, ())
+            lines = '\n'.join(format_drive_lines(healed))
+            self.assertIn('回查 1，', lines)
+            self.assertIn('挂起 0。', lines)
+            # 结清之后这一轮照常按已落库的审批把预留补齐：回查只解掉「说不清」，
+            # 不代替业务动作。
+            self.assertEqual(back.writer.writes, 2)
+            self.assertEqual(back.reader.read_loan(fixtures.LOAN).state, State.AWAITING_ISSUE)
+            self.assertEqual(
+                (back.writer.ledger_stock.available, back.writer.ledger_stock.reserved),
+                (3, 2),
+            )
+        finally:
+            back.stop()
 
 
 if __name__ == '__main__':

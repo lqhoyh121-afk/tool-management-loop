@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from bootstrap.binding import document_from_files, load_binding, require_complete, save_binding
-from bootstrap.drive import format_drive_lines, run_bound_drive
+from bootstrap.drive import drive_exit_code, format_drive_lines, run_bound_drive
 from bootstrap.env_check import check_environment, format_report, has_gate_failure
 from bootstrap.file_preview import PreviewError, format_preview, preview_workbook
 from bootstrap.gate import assert_business_allowed
@@ -109,7 +109,12 @@ def _drive(runtime, locks_dir, out_stream, ports):
     report = run_bound_drive(runtime, locks_dir, **kwargs)
     for line in format_drive_lines(report):
         _write(out_stream, line)
-    return 0
+    code = drive_exit_code(report)
+    if code:
+        # 退出码只汇总「要不要人看」，不影响处置：挂起与需要看的跳过都逐行报过，
+        # 下一轮照常重试。调度层（定时脚本）看退出码也好、看这行也好，都拿得到。
+        _write(out_stream, '本轮有需要人接手的事项（挂起 / 需要看的跳过），退出码 1。')
+    return code
 
 
 def _parse_args(args):
