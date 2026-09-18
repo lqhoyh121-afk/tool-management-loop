@@ -14,7 +14,12 @@ def _intent_refs(intent):
     return intent.before.ref, intent.before.item
 
 
-def _resolved(receipt):
+def is_resolved(receipt):
+    """这条本地流水是否已经有终态结论（verified / not_applied / not_sent）。
+
+    回查口径的唯一来源：``unresolved_ids`` 用它筛未决，驱动侧也用它判断一次回查到底
+    有没有结清 —— 两处必须同一口径，否则同一张单会同时被算成「已回查」和「挂起」。
+    """
     return receipt is not None and receipt.outcome in (
         Outcome.VERIFIED, Outcome.NOT_APPLIED, Outcome.NOT_SENT)
 
@@ -37,7 +42,7 @@ class FileJournal:
             shares_target = (old_loan_ref == new_loan_ref
                              or (new_item_ref is not None and old_item_ref == new_item_ref))
             if shares_target:
-                require(_resolved(receipt), Code.UNKNOWN)
+                require(is_resolved(receipt), Code.UNKNOWN)
         self._write(intent.operation_id, intent, None)
 
     def load(self, operation_id):
@@ -57,7 +62,7 @@ class FileJournal:
         pending = []
         for operation_id in self.ids():
             _, receipt = self.load(operation_id)
-            if not _resolved(receipt):
+            if not is_resolved(receipt):
                 pending.append(operation_id)
         return tuple(pending)
 
