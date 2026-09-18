@@ -95,10 +95,26 @@ class _Pending(ContractError):
 
 
 @dataclass(frozen=True)
+class _Handled:
+    """一次处理的产物：自愈说明 + 点名证据（#93）。
+
+    ``explanation`` 只在「台账停在待预留、这一轮用日志补齐」时非空（旧行为原样返回那个
+    读失败码）；``evidence`` 是 ``processed`` 里这一条的可读账 —— 有它才答得出「引擎到底
+    有没有看见我点的那条待办」，没有它「处理 N」只是一句计数。
+    """
+
+    explanation: object = None
+    evidence: object = None
+
+
+@dataclass(frozen=True)
 class WorkItem:
     kind: str
     loan_ref: object
     source: object
+    # 阶段条目带上它对应的人工动作（`confirm_issue` / `confirm_return` …），只为在报告里
+    # 把「处理」这一条说成人话；队列条目没有动作，留空。
+    action: str = ''
 
     def __post_init__(self):
         if self.kind not in ('apply', 'event'):
@@ -113,6 +129,26 @@ class DriveOutcome:
     source_id: str
     code: str
     note: str = ''
+
+
+@dataclass(frozen=True)
+class ProcessedEvidence:
+    """一条「处理」的点名证据：处理的是哪一条、把哪张单从什么状态推到了什么状态。
+
+    ``processed`` 只回答「处理了几条」，答不出「引擎到底有没有看见我刚点的那条待办」。
+    真机实测（#93）：一条已完成的【待领用确认】待办被消费、台账从 `awaiting_issue_confirmation`
+    推到 `borrowed`，而报告里除了一行「处理 1」之外**一个字都没有** —— 「漏消费」与
+    「消费了」在日志上长得一模一样（跳过行只印跳过的），操作员据此把一次正常推进报成了
+    硬阻断。所以每一条 `processed` 都要在报告里点得出名字与迁移。
+    """
+
+    kind: str
+    loan_id: str
+    source_kind: str
+    source_id: str
+    before_state: str
+    after_state: str
+    action: str = ''
 
 
 @dataclass(frozen=True)
@@ -150,6 +186,13 @@ class DriveReport:
     tables, carry their own water marks and their own skips, and one line's
     counts must never overwrite the other's. Both feed the same queue, so a
     registered return travels the same path as a hand-registered one.
+
+    ``evidence`` names every processed item (issue #93): one
+    ``ProcessedEvidence`` per entry in ``processed``, carrying the loan and the
+    source as well as the state the pass moved it from and to. ``processed``
+    answers "how many"; ``evidence`` answers "which ones, and what did they do" —
+    without it a consumed stage-todo completion is invisible in the log, which
+    is exactly how a working pass got reported as "the engine never scanned it".
     """
 
     recovered: tuple
@@ -161,6 +204,7 @@ class DriveReport:
     healed: tuple = ()
     intake: object = None
     returns: object = None
+    evidence: tuple = ()
 
 
 def _failed_intake(code, note='发现扫描抛异常，本轮未登记'):
@@ -264,6 +308,21 @@ def _stage_skips(outcomes):
     return tuple(o for o in outcomes if o.kind == 'stage')
 
 
+def _evidence_line(entry):
+    """一条「处理」明细行：处理的是哪一条、把单从什么状态推到了什么状态。
+
+    与跳过/挂起行同形（``处理 <kind> loan=… <source_kind>=…``），多给一个迁移。状态没变
+    （受理一类的动作）就只印一次，不印 ``x→x``。
+    """
+    step = (f'{entry.before_state}→{entry.after_state}'
+            if entry.before_state != entry.after_state else entry.after_state)
+    line = (f'  处理 {entry.kind} loan={entry.loan_id} '
+            f'{entry.source_kind}={entry.source_id}')
+    if entry.action:
+        line += f' {entry.action}'
+    return f'{line} {step}'
+
+
 def format_drive_lines(report):
     waiting = _waiting_line(report)
     lines = [
@@ -282,6 +341,10 @@ def format_drive_lines(report):
     ]
     if waiting:
         lines.append(waiting)
+    # 「处理」也逐条点名（#93）：摘要里的「处理 N」与下面的处理行条数同源，一条不少。
+    # 已消费的阶段待办完成事件就在这一桶里，它是「点待办即证据」唯一的正向记录。
+    for entry in report.evidence:
+        lines.append(_evidence_line(entry))
     if report.healed:
         lines.append(
             '  自愈补齐 {summary}，按已落库审批补写预留'.format(
@@ -419,6 +482,7 @@ class DriveLoop:
         processed = []
         skipped = []
         blocked = []
+        evidence = []
         # 申请发现先于队列消费：真人新提交的行必须在**同一轮**里变成审批入口，
         # 而不是等操作员登记。发现本身也只写本机队列与台账行，闸门照旧。
         reported = self._run_intake()
@@ -440,7 +504,7 @@ class DriveLoop:
                 blocked.append(_drive_outcome(item, Code.UNKNOWN.value))
                 continue
             try:
-                explanation = self._handle(item)
+                handled = self._handle(item)
             except _Pending as exc:
                 blocked.append(_drive_outcome(item, exc.code.value, exc.note))
                 continue
@@ -454,11 +518,13 @@ class DriveLoop:
                 skipped.append(_drive_outcome(item, exc.code.value))
                 continue
             processed.append(item)
-            if explanation is not None:
-                healed.append(_drive_outcome(item, explanation.value))
+            if handled.evidence is not None:
+                evidence.append(handled.evidence)
+            if handled.explanation is not None:
+                healed.append(_drive_outcome(item, handled.explanation.value))
         return DriveReport(tuple(recovered), tuple(processed), tuple(skipped), tuple(blocked),
                            tuple(stage_checked), tuple(stages_created),
-                           tuple(healed), reported, returned)
+                           tuple(healed), reported, returned, tuple(evidence))
 
     def _run_intake(self):
         """这一轮的申请发现账目；没接发现就是 None。
@@ -564,7 +630,8 @@ class DriveLoop:
                 continue
             if receipt is None or receipt.outcome != Outcome.VERIFIED or receipt.source is None:
                 continue
-            items.append(WorkItem('event', intent.loan.ref, receipt.source))
+            items.append(WorkItem('event', intent.loan.ref, receipt.source,
+                                  intent.action.value))
         return tuple(items)
 
     def _resolve_loan_ref(self, item):
@@ -577,13 +644,16 @@ class DriveLoop:
         return matched
 
     def _handle(self, item):
-        """One queue item; returns the read failure a heal had to work around.
+        """One queue item; returns what this pass made of it.
 
         An item normally drives the transition its own row carries. The
         exception is a loan whose row still reads ``reservation_pending``: there
         this row's evidence is not the judge — see
         `_finish_pending_reservation` — and the original failure travels back to
         the report as an explanation, never as the decision.
+
+        返回 ``_Handled``：``explanation`` 是自愈要绕过的那个读失败（没有就是 ``None``），
+        ``evidence`` 是这一条的点名证据 —— 哪张单从什么状态推到了什么状态（#93）。
         """
         loan_ref = self._resolve_loan_ref(item)
         loan = self.engine.reader.read_loan(loan_ref)
@@ -593,7 +663,7 @@ class DriveLoop:
             self.engine.admit_application(loan_ref, item.source)
             current = self.engine.reader.read_loan(loan_ref)
             self._ensure_current_stage(current)
-            return None
+            return _Handled(evidence=self._evidence(item, loan, current))
         try:
             execution = self.engine.execute(loan_ref, item.source)
         except ContractError as exc:
@@ -601,7 +671,7 @@ class DriveLoop:
                 raise
             if loan.state != State.RESERVATION_PENDING:
                 raise
-            return self._finish_pending_reservation(loan, exc.code)
+            return self._finish_pending_reservation(item, loan, exc.code)
         if execution.outcome == Outcome.UNKNOWN:
             raise ContractError(Code.UNKNOWN)
         if execution.outcome != Outcome.VERIFIED:
@@ -611,11 +681,21 @@ class DriveLoop:
         current = execution.loan
         if current.state == State.RESERVATION_PENDING:
             event = self.engine.reader.read_event(current, item.source)
-            return self._reserve(current, event)
+            return self._reserve(item, current, event, loan)
         self._ensure_current_stage(current)
-        return None
+        return _Handled(evidence=self._evidence(item, loan, current))
 
-    def _reserve(self, loan, event, original=None):
+    def _evidence(self, item, before, after):
+        """点名这一条「处理」把哪张单从什么状态推到了什么状态（#93）。
+
+        ``before`` 是本条进 `_handle` 时读到的单，``after`` 是这一条推完之后的单：中间
+        可能落了两笔写（受理 → 预留），报告只报**净效果**，免得把一次人工动作拆成两行。
+        """
+        return ProcessedEvidence(item.kind, item.loan_ref.resource_id,
+                                 item.source.kind, item.source.resource_id,
+                                 before.state.value, after.state.value, item.action)
+
+    def _reserve(self, item, loan, event, before, original=None):
         """Run the system reservation, then expose the next human stage.
 
         Returns the read failure the caller was working around (``original``),
@@ -629,11 +709,12 @@ class DriveLoop:
             # 预留没落地：跳过并留给下一轮，别报告成功。
             raise ContractError(Code.READBACK)
         if reserved.outcome != Outcome.VERIFIED:
-            return original
+            return _Handled(explanation=original)
         self._ensure_current_stage(reserved.loan)
-        return original
+        return _Handled(explanation=original,
+                        evidence=self._evidence(item, before, reserved.loan))
 
-    def _finish_pending_reservation(self, loan, original=None):
+    def _finish_pending_reservation(self, item, loan, original=None):
         """借出行停在 reservation_pending：从日志补齐这一跳，而不是每轮只报重复事件。
 
         The approval event is already in the loan's `consumed_events`, so the
@@ -683,7 +764,7 @@ class DriveLoop:
             # 库存行和审批回执记录的快照对不上：已经有人动过这张表，这一份预留
             # 到没到账无从证明，交给人工，别照着猜再迁一次。
             raise _Pending(Hang.STOCK_MOVED)
-        return self._reserve(current, event, original)
+        return self._reserve(item, current, event, loan, original)
 
     def _recorded_approval(self, loan):
         """The applied approval for this loan plus its recorded stock snapshot.
