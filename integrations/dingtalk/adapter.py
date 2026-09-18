@@ -309,19 +309,41 @@ class DingTalkAdapter:
         config = self.title_display
         if config is None or not config.names_enabled:
             return DisplayNames()
+        return _display_names_from(self._title_names(
+            loan, config.item_name_field.strip(), config.borrower_names))
+
+    def _item_display_name(self, loan):
+        """库存行里那一列物品名称；没绑定 / 读不到 / 形态不认都是空串。
+
+        归还表单的「归还物品」答案（#77 之后）多认一个物品名称，读的就是这里这一列：
+        钉钉那格是单选，选项写的是名字，人填不出记录 ID。空串只表示「这次拿不到这个
+        物品的名字」，调用方据此拦下，**不许**当成「名字不等于答案」用（见
+        ``_matching_borrowed_loans``：那会把「按物品比」悄悄降级成「按借用人比」）。
+        """
+        config = self.title_display
+        if config is None or not config.item_name_field.strip():
+            return ''
+        return _display_names_from(
+            self._title_names(loan, config.item_name_field.strip(), False)).item
+
+    def _title_names(self, loan, item_name_field, borrower_names):
+        """``title.names`` 的一次读；读不到就是 ``None``（调用方一律当没查到）。
+
+        传输层把可用/失败都收成一个报文，所以这里唯一的职责是把传输层的异常也收成
+        同一个「没查到」：形状不认、超时、业务报错都不改变调用方的结论。
+        """
         try:
-            payload = self.transport.exchange('title.names', {
+            return self.transport.exchange('title.names', {
                 'tenant_id': loan.ref.tenant_id,
                 'item_container': loan.item.container_id,
                 'item_id': loan.item.resource_id,
                 'borrower': loan.borrower.user_id,
-                'item_name_field': config.item_name_field.strip(),
-                'borrower_names': config.borrower_names,
+                'item_name_field': item_name_field,
+                'borrower_names': bool(borrower_names),
             })
         except (UnknownResultError, DingTalkShapeError, ContractError,
                 KeyError, TypeError, ValueError):
-            return DisplayNames()
-        return _display_names_from(payload)
+            return None
 
     def _stage_arguments(self, request: StageRequest, operation_id, actor,
                          display=None):
@@ -468,8 +490,9 @@ class DingTalkAdapter:
 
         ``#77``: when the row also carries the optional「归还物品」answer, the
         match narrows from "this borrower's only open loan" to "this borrower's
-        only open loan of that item". Only the borrower knows which tool comes
-        back, so the answer is read, never guessed.
+        only open loan of that item" — by the item's record id or, since the
+        question is a name-only dropdown, by its inventory name. Only the borrower
+        knows which tool comes back, so the answer is read, never guessed.
         """
         if source.kind != 'form' or self.return_form_fields is None:
             return None
@@ -489,9 +512,23 @@ class DingTalkAdapter:
         """Open loans of one borrower, narrowed by the「归还物品」answer when given.
 
         No usable answer: exactly the pre-#77 borrower-only list. With one, only
-        loans whose item is that item survive, and the caller still demands a
-        single match — two loans of the *same* item stay blocked, they are not a
-        tie we may break.
+        loans of that item survive, and the caller still demands a single match —
+        two loans of the *same* item stay blocked, they are not a tie we may break.
+
+        The answer is read as an item **record id** first, and that alone decides
+        when it hits: an id is what #77 shipped, so that path is untouched (and it
+        never consults the name lookup at all). Only an answer that matches no
+        record id is read as an item **name** — which is what the live form can
+        actually produce, since「归还物品」is a single-select whose options are the
+        inventory names (``SYN-万用表``), and nobody types a record id into a
+        dropdown.
+
+        In the name pass *every* candidate's name has to be readable: an
+        unreadable name is an unverified candidate, and dropping it would let two
+        same-named items pass as a confident single match. So a name that cannot
+        be read is ``EVIDENCE``, never a fallback to the borrower-only list — the
+        item answer was the human's only chance to disambiguate, and guessing past
+        it is exactly what #77 removed.
 
         Candidates are re-read one by one rather than filtered platform-side so
         that a row we cannot read fails closed (``EVIDENCE``). Silently dropping
@@ -502,10 +539,22 @@ class DingTalkAdapter:
         wanted = self._return_item_value(cells)
         if not wanted:
             return loan_ids
-        matched = []
+        by_id = []
+        by_name = []
         for loan_id in loan_ids:
             ref = Resource('record', tenant_id, loan_container, loan_id)
-            if self.read_loan(ref).item.resource_id == wanted:
+            current = self.read_loan(ref)
+            if current.item.resource_id == wanted:
+                by_id.append((loan_id, current))
+            else:
+                by_name.append((loan_id, current))
+        if by_id:
+            return [loan_id for loan_id, _loan in by_id]
+        matched = []
+        for loan_id, current in by_name:
+            name = self._item_display_name(current)
+            require(bool(name), Code.EVIDENCE)
+            if name == wanted:
                 matched.append(loan_id)
         return matched
 

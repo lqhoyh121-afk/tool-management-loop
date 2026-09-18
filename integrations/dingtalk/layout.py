@@ -79,9 +79,16 @@ class ReturnFormFieldMap:
 
     ``item`` is the optional「归还物品」question (#77). Bound *and* filled on the
     row, it narrows matching from "this borrower's only open loan" to "this
-    borrower's only open loan of that item". Unbound, or bound but empty on the
-    row, keeps the pre-#77 borrower-only match. Name it after the field the
-    operator adds on the live form view; there is no default field id.
+    borrower's only open loan of that item" — the answer being either the item's
+    record id or the item's name as the inventory row spells it (the live question
+    is a single-select over those names). Unbound, or bound but empty on the row,
+    keeps the pre-#77 borrower-only match. Name it after the field the operator
+    adds on the live form view; there is no default field id.
+
+    Matching by name needs the inventory name column, i.e. a
+    ``title_display.item_name_field`` in the same binding (#76): without it an
+    answer that is not a record id cannot be read as a name at all, and the row is
+    blocked rather than matched on the borrower alone.
     """
     borrower: str
     occurred_at: str

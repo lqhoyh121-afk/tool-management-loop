@@ -24,7 +24,7 @@ from contracts.model import (Action, Code, ContractError, Identity, Outcome,
                              Resource, State)
 from contracts.ports import (LedgerScope, RuntimeBinding, StageRequest,
                              stage_operation_id, verify_stage)
-from integrations.dingtalk.adapter import DingTalkAdapter, stage_title
+from integrations.dingtalk.adapter import DingTalkAdapter, TitleDisplay, stage_title
 from integrations.dingtalk.codec import (_put_identity, encode_inventory,
                                          encode_loan)
 from integrations.dingtalk.dws_transport import (SCOPE_OTHER, SCOPE_SELF,
@@ -955,10 +955,17 @@ class ReturnItemRoutingOverDwsTests(unittest.TestCase):
     The item question is a single-select: the fake stores the option name and the
     read materializes ``{id, name}`` exactly as live aitable does, so this proves
     the adapter matches on the *option name* shape and not on a double-only one.
+
+    那格的选项就是物品名称，所以答案也要能按名称认：名称从库存行的名称列读（#76 的
+    ``title_display.item_name_field``），一格一读，读不到就拦下。
     """
 
     OTHER = Resource('record', LOAN.tenant_id, LOAN.container_id, 'recOther')
     OTHER_ITEM = Resource('record', LOAN.tenant_id, 'baseStock/tblStock', 'recItem2')
+    # 库存表里的物品名称列；真机是一个文本列，读回来就是纯字符串。
+    ITEM_NAME_FIELD = 'fldSYN-item-name'
+    ITEM_NAME = 'SYN-万用表'
+    OTHER_NAME = 'SYN-绝缘手套'
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -987,7 +994,8 @@ class ReturnItemRoutingOverDwsTests(unittest.TestCase):
         self.adapter = DingTalkAdapter(
             self.transport, self.journal, self.leases, self.fields, self.entry_fields,
             return_form_fields=self.return_form_fields,
-            loan_container=LOAN.container_id)
+            loan_container=LOAN.container_id,
+            title_display=TitleDisplay(self.ITEM_NAME_FIELD))
 
     def tearDown(self):
         self.temp.cleanup()
@@ -997,13 +1005,15 @@ class ReturnItemRoutingOverDwsTests(unittest.TestCase):
             fn()
         self.assertEqual(raised.exception.code, code)
 
-    def _seed_loan(self, ref, item):
+    def _seed_loan(self, ref, item, item_name=None):
         current = replace(loan(), ref=ref, item=item, state=State.BORROWED)
         state = load_state(self.state_path)
         state['records'][f'{ref.container_id}/{ref.resource_id}'] = encode_loan(
             current, self.fields)
-        state['records'][f'{item.container_id}/{item.resource_id}'] = encode_inventory(
-            replace(stock(), ref=item), self.fields)
+        cells = encode_inventory(replace(stock(), ref=item), self.fields)
+        if item_name is not None:
+            cells[self.ITEM_NAME_FIELD] = item_name
+        state['records'][f'{item.container_id}/{item.resource_id}'] = cells
         save_state(self.state_path, state)
         return current
 
@@ -1044,6 +1054,50 @@ class ReturnItemRoutingOverDwsTests(unittest.TestCase):
         source = self._seed_return_row()
         self.blocked(Code.EVIDENCE,
                      lambda: self.adapter.resolve_return_form_loan(source, first.ref))
+
+    def test_item_name_answer_routes_by_the_inventory_name_column(self):
+        """答案是物品名称（人就只能填这个）：按库存行的名称列定性，一格一读。"""
+        first = self._seed_loan(LOAN, ITEM, item_name=self.ITEM_NAME)
+        second = self._seed_loan(self.OTHER, self.OTHER_ITEM, item_name=self.OTHER_NAME)
+        source = self._seed_return_row(self.OTHER_NAME)
+        self.assertEqual(self._row_cells(source)[self.return_form_fields.item]['name'],
+                         self.OTHER_NAME)
+        self.assertEqual(
+            self.adapter.resolve_return_form_loan(source, first.ref), second.ref)
+        self.assertEqual(self.adapter.read_event(second, source).action,
+                         Action.REQUEST_RETURN)
+        self.blocked(Code.WRONG_LOAN, lambda: self.adapter.read_event(first, source))
+
+    def test_two_items_sharing_the_answered_name_still_block(self):
+        """两个物品同名 → 答案落两张单，继续 fail-closed。"""
+        first = self._seed_loan(LOAN, ITEM, item_name=self.ITEM_NAME)
+        self._seed_loan(self.OTHER, self.OTHER_ITEM, item_name=self.ITEM_NAME)
+        source = self._seed_return_row(self.ITEM_NAME)
+        self.blocked(Code.EVIDENCE,
+                     lambda: self.adapter.resolve_return_form_loan(source, first.ref))
+
+    def test_an_unreadable_item_name_blocks_the_name_pass(self):
+        """一张读得到名字、另一张的库存行里没有名称列 → 拦下，不是「那张不匹配」。
+
+        读不到 = 没查过那张单；拿它当「不匹配」就会把两张同名工具变成一次自信的
+        单张定性 —— 这正是 #77 要堵的口子。
+        """
+        first = self._seed_loan(LOAN, ITEM, item_name=self.ITEM_NAME)
+        self._seed_loan(self.OTHER, self.OTHER_ITEM)  # 没有名称列
+        source = self._seed_return_row(self.ITEM_NAME)
+        self.blocked(Code.EVIDENCE,
+                     lambda: self.adapter.resolve_return_form_loan(source, first.ref))
+
+    def test_item_name_answer_without_the_name_column_blocks(self):
+        """没绑名称列 → 名称这条路走不通：拦下，不是按借用人定性。"""
+        adapter = DingTalkAdapter(
+            self.transport, self.journal, self.leases, self.fields, self.entry_fields,
+            return_form_fields=self.return_form_fields,
+            loan_container=LOAN.container_id)
+        first = self._seed_loan(LOAN, ITEM, item_name=self.ITEM_NAME)
+        source = self._seed_return_row(self.ITEM_NAME)
+        self.blocked(Code.EVIDENCE,
+                     lambda: adapter.resolve_return_form_loan(source, first.ref))
 
 
 if __name__ == '__main__':
