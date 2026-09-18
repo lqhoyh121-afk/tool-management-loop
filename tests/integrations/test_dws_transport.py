@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from t031_fake_dws import load_state, save_state
 from t03_layout import entry_fields_from
-from t03_live_cells import declared_kinds
+from t03_live_cells import SINGLE_SELECT, declared_kinds
 from t03_memory_transport import MemoryTransport
 
 from contracts.flow import plan, verify
@@ -25,13 +25,13 @@ from contracts.model import (Action, Code, ContractError, Identity, Outcome,
 from contracts.ports import (LedgerScope, RuntimeBinding, StageRequest,
                              stage_operation_id, verify_stage)
 from integrations.dingtalk.adapter import DingTalkAdapter, stage_title
-from integrations.dingtalk.codec import encode_inventory, encode_loan
+from integrations.dingtalk.codec import _put_identity, encode_inventory, encode_loan
 from integrations.dingtalk.dws_transport import (DwsTransport, split_container,
                                                  todo_internal_id,
                                                  windows_native_path)
 from integrations.dingtalk.envelope import extract_records, record_cells
 from integrations.dingtalk.errors import UnsupportedShapeError
-from integrations.dingtalk.layout import SYNTHETIC_FIELDS
+from integrations.dingtalk.layout import SYNTHETIC_FIELDS, SYNTHETIC_RETURN_FORM_FIELDS
 
 
 def _load(name, path):
@@ -704,6 +704,103 @@ class DwsTransportTests(unittest.TestCase):
         state['records'][slot] = cells
         save_state(self.state_path, state)
         self.blocked(Code.EVIDENCE, lambda: self._borrowed_query(borrower))
+
+
+class ReturnItemRoutingOverDwsTests(unittest.TestCase):
+    """#77: the optional「归还物品」answer, read through the real dws read path.
+
+    The item question is a single-select: the fake stores the option name and the
+    read materializes ``{id, name}`` exactly as live aitable does, so this proves
+    the adapter matches on the *option name* shape and not on a double-only one.
+    """
+
+    OTHER = Resource('record', LOAN.tenant_id, LOAN.container_id, 'recOther')
+    OTHER_ITEM = Resource('record', LOAN.tenant_id, 'baseStock/tblStock', 'recItem2')
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.work = Path(self.temp.name)
+        self.state_path = self.work / 'fake-state.json'
+        self.fields = SYNTHETIC_FIELDS
+        self.entry_fields = entry_fields_from(self.fields)
+        self.return_form_fields = SYNTHETIC_RETURN_FORM_FIELDS
+        kinds = declared_kinds(self.fields, self.entry_fields, self.return_form_fields)
+        kinds[self.return_form_fields.item] = SINGLE_SELECT
+        state = load_state(self.state_path)
+        state['kinds'] = kinds
+        save_state(self.state_path, state)
+        self.journal = SyntheticJournal()
+        self.leases = SyntheticLease()
+        self.lease = self.leases.acquire(LedgerScope.from_record(ITEM), MANAGER)
+        self.binding = RuntimeBinding(
+            MANAGER, LedgerScope.from_record(ITEM), 'synthetic-config-v1',
+            MANAGER, MANAGER, 'synthetic-readback', True, True, True, True)
+        self.transport = DwsTransport(
+            [sys.executable, str(FAKE_DWS)], self.fields,
+            form_container=FORM_CONTAINER, todo_container=TODO_CONTAINER,
+            work_dir=self.work / 'runtime', entry_fields=self.entry_fields,
+            extra_env={'FAKE_DWS_STATE': str(self.state_path)},
+        )
+        self.adapter = DingTalkAdapter(
+            self.transport, self.journal, self.leases, self.fields, self.entry_fields,
+            return_form_fields=self.return_form_fields,
+            loan_container=LOAN.container_id)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def blocked(self, code, fn):
+        with self.assertRaises(ContractError) as raised:
+            fn()
+        self.assertEqual(raised.exception.code, code)
+
+    def _seed_loan(self, ref, item):
+        current = replace(loan(), ref=ref, item=item, state=State.BORROWED)
+        state = load_state(self.state_path)
+        state['records'][f'{ref.container_id}/{ref.resource_id}'] = encode_loan(
+            current, self.fields)
+        state['records'][f'{item.container_id}/{item.resource_id}'] = encode_inventory(
+            replace(stock(), ref=item), self.fields)
+        save_state(self.state_path, state)
+        return current
+
+    def _seed_return_row(self, item_name=None, row_id='recReturnRow'):
+        cells = {
+            self.return_form_fields.borrower: _put_identity(_fixtures.BORROWER),
+            self.return_form_fields.occurred_at: _fixtures.NOW.isoformat(),
+        }
+        if item_name is not None:
+            cells[self.return_form_fields.item] = item_name
+        state = load_state(self.state_path)
+        state['records'][f'{FORM_CONTAINER}/{row_id}'] = cells
+        save_state(self.state_path, state)
+        return Resource('form', LOAN.tenant_id, FORM_CONTAINER, row_id)
+
+    def _row_cells(self, source):
+        payload = self.transport.exchange('record.query', {
+            'tenant_id': source.tenant_id,
+            'container_id': source.container_id,
+            'resource_id': source.resource_id,
+        })
+        return record_cells(extract_records(payload)[0])
+
+    def test_item_answer_routes_to_the_open_loan_of_that_item(self):
+        first = self._seed_loan(LOAN, ITEM)
+        second = self._seed_loan(self.OTHER, self.OTHER_ITEM)
+        source = self._seed_return_row(self.OTHER_ITEM.resource_id)
+        self.assertIsInstance(self._row_cells(source)[self.return_form_fields.item], dict)
+        self.assertEqual(
+            self.adapter.resolve_return_form_loan(source, first.ref), second.ref)
+        self.assertEqual(self.adapter.read_event(second, source).action,
+                         Action.REQUEST_RETURN)
+        self.blocked(Code.WRONG_LOAN, lambda: self.adapter.read_event(first, source))
+
+    def test_two_open_loans_without_an_item_answer_still_block(self):
+        first = self._seed_loan(LOAN, ITEM)
+        self._seed_loan(self.OTHER, self.OTHER_ITEM)
+        source = self._seed_return_row()
+        self.blocked(Code.EVIDENCE,
+                     lambda: self.adapter.resolve_return_form_loan(source, first.ref))
 
 
 if __name__ == '__main__':
