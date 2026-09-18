@@ -84,7 +84,12 @@ def require_complete(binding):
 
 
 def field_maps_from_document(data):
-    """Ledger FieldMap and stage-entry EntryFieldMap are both required. No fallback."""
+    """Ledger FieldMap and stage-entry EntryFieldMap are both required. No fallback.
+
+    ``return_form_fields.item`` is the one optional key: it is the「归还物品」
+    question (#77). Leaving it out (or empty) is a config, not a defect — the
+    return form then matches on the borrower alone, as it did before #77.
+    """
     require(isinstance(data, dict), Code.INVALID)
     raw_fields = data.get('fields')
     raw_entry = data.get('entry_fields')
@@ -101,6 +106,9 @@ def field_maps_from_document(data):
         return_form_fields = ReturnFormFieldMap(**raw_return)
     except TypeError as exc:
         raise ContractError(Code.CONFIG) from exc
+    # A key that is bound to something that is not a field id must not read as
+    # "not bound": that would silently drop the item narrowing the operator asked for.
+    require(isinstance(return_form_fields.item, str), Code.CONFIG)
     return fields, entry_fields, apply_fields, return_form_fields
 
 

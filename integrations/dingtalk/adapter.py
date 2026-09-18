@@ -451,7 +451,13 @@ class DingTalkAdapter:
         return IdentityBinding(contact, internal, source, created, readback)
 
     def resolve_return_form_loan(self, source, hint_ref):
-        """Return the sole borrowed loan for a minimal return-form row, else None."""
+        """Return the sole borrowed loan a return-form row names, else None.
+
+        ``#77``: when the row also carries the optional「归还物品」answer, the
+        match narrows from "this borrower's only open loan" to "this borrower's
+        only open loan of that item". Only the borrower knows which tool comes
+        back, so the answer is read, never guessed.
+        """
         if source.kind != 'form' or self.return_form_fields is None:
             return None
         cells = self._record_cells(source)
@@ -460,10 +466,54 @@ class DingTalkAdapter:
         actor = _identity(cells, self.return_form_fields.borrower, source.tenant_id)
         loan_container = self.loan_container or hint_ref.container_id
         text(loan_container)
-        matches = self._borrowed_loan_ids(source.tenant_id, loan_container, actor.user_id)
+        matches = self._matching_borrowed_loans(
+            source.tenant_id, loan_container, actor.user_id, cells)
         require(len(matches) == 1, Code.EVIDENCE)
         matched = Resource('record', source.tenant_id, loan_container, matches[0])
         return matched
+
+    def _matching_borrowed_loans(self, tenant_id, loan_container, borrower_user_id, cells):
+        """Open loans of one borrower, narrowed by the「归还物品」answer when given.
+
+        No usable answer: exactly the pre-#77 borrower-only list. With one, only
+        loans whose item is that item survive, and the caller still demands a
+        single match — two loans of the *same* item stay blocked, they are not a
+        tie we may break.
+
+        Candidates are re-read one by one rather than filtered platform-side so
+        that a row we cannot read fails closed (``EVIDENCE``). Silently dropping
+        an unreadable row would turn "more than one open loan" into a confident
+        single match.
+        """
+        loan_ids = self._borrowed_loan_ids(tenant_id, loan_container, borrower_user_id)
+        wanted = self._return_item_value(cells)
+        if not wanted:
+            return loan_ids
+        matched = []
+        for loan_id in loan_ids:
+            ref = Resource('record', tenant_id, loan_container, loan_id)
+            if self.read_loan(ref).item.resource_id == wanted:
+                matched.append(loan_id)
+        return matched
+
+    def _return_item_value(self, cells):
+        """Optional「归还物品」answer as text; ``''`` when unbound or unfilled.
+
+        Absent or null means the human left the question empty (that is how the
+        platform reports an unfilled cell), so the pre-#77 path applies. Anything
+        present but unreadable is a shape we have not observed: fail closed
+        instead of matching on a guess.
+        """
+        field_id = self.return_form_fields.item
+        if not field_id or field_id not in cells or cells[field_id] is None:
+            return ''
+        value = cells[field_id]
+        if isinstance(value, str):
+            return value.strip()
+        try:
+            return read_single_select(cells, field_id).name.strip()
+        except DingTalkShapeError as exc:
+            _closed(exc)
 
     def _cell_has_text(self, cells, field_id):
         if field_id not in cells or cells[field_id] is None:
@@ -518,7 +568,8 @@ class DingTalkAdapter:
             actor = _identity(cells, fields.borrower, loan.ref.tenant_id)
             occurred = read_datetime(cells, fields.occurred_at)
             loan_container = self.loan_container or loan.ref.container_id
-            matches = self._borrowed_loan_ids(source.tenant_id, loan_container, actor.user_id)
+            matches = self._matching_borrowed_loans(
+                source.tenant_id, loan_container, actor.user_id, cells)
             require(len(matches) == 1, Code.EVIDENCE)
             require(matches[0] == loan.ref.resource_id, Code.WRONG_LOAN)
             require(actor == loan.borrower, Code.WRONG_PERSON)
