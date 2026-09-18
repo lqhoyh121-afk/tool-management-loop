@@ -64,9 +64,17 @@ class ApplicationFieldMap:
 
 @dataclass(frozen=True)
 class ReturnFormFieldMap:
-    """Return form view on the stage-entry table; only borrower and return time."""
+    """Return form view on the stage-entry table: borrower and return time.
+
+    ``item`` is the optional「归还物品」question (#77). Bound *and* filled on the
+    row, it narrows matching from "this borrower's only open loan" to "this
+    borrower's only open loan of that item". Unbound, or bound but empty on the
+    row, keeps the pre-#77 borrower-only match. Name it after the field the
+    operator adds on the live form view; there is no default field id.
+    """
     borrower: str
     occurred_at: str
+    item: str = ''
 
 
 SYNTHETIC_FIELDS = FieldMap(
@@ -128,4 +136,5 @@ SYNTHETIC_APPLY_FIELDS = ApplicationFieldMap(
 SYNTHETIC_RETURN_FORM_FIELDS = ReturnFormFieldMap(
     borrower='fldSYN-return-borrower',
     occurred_at='fldSYN-return-occurred',
+    item='fldSYN-return-item',
 )

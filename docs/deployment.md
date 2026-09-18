@@ -176,10 +176,19 @@ python -m bootstrap --drive --runtime 运行目录 --lock-root 锁目录
 - `fields`：台账字段 ID（`FieldMap` 全套键），必填
 - `entry_fields`：阶段入口字段 ID（`EntryFieldMap`），必填
 - `apply_fields`：申请收集表字段 ID（`ApplicationFieldMap`），必填
-- `return_form_fields`：归还表单视图字段 ID（`ReturnFormFieldMap`：借用人、归还时间），必填
+- `return_form_fields`：归还表单视图字段 ID（`ReturnFormFieldMap`：借用人、归还时间，以及**可选**的「归还物品」），前两键必填
 - `loan_container`：台账借用单表容器 ID（归还表单按借用人匹配 `borrowed` 单时使用），必填
 
 缺上述映射、键不完整、或把台账整表拷进 `entry_fields`/`apply_fields`/`return_form_fields`，都是 `CONFIG`。读申请行用 `apply_fields`；读归还表单行（无 loan_id）用 `return_form_fields` 并按借用人唯一匹配；读引擎预建阶段入口行仍用 `entry_fields`。真实字段 ID 只放本机绑定，不进仓库。
+
+### 归还表单的「归还物品」格（可选，不绑也能跑）
+
+归还表单的前两格是**借用人 + 归还时间**，引擎据此按借用人唯一匹配名下 `borrowed` 单；同一借用人同时借了多件时 ≥2 张，按 `EVIDENCE_REQUIRED` 拦下（标「待指定单据」），不猜是哪一张。#77 给表单加一格**可选**的「归还物品」（单选题，题干与选项由人在网页端维护；开放接口不提供建题能力，见上），把匹配条件升级为 **(借用人 + 物品) 唯一**：
+
+- `return_form_fields.item` 是该格的字段 ID；**可缺省**。缺省、或绑定了但该行这一格没填 → 行为与 #49 完全一致（按借用人唯一匹配），老行不受影响。
+- 绑定了且行里有值 → 只保留「物品就是这一件」的候选单；仍然是**恰好 1 张才定性**，同一物品借了多件（≥2 张）继续 `EVIDENCE_REQUIRED`。
+- 候选项逐单回读，读不出来的单**不算命中**而是整条判 `EVIDENCE_REQUIRED` —— 静默丢掉一行会把「多张」变成「恰好一张」。
+- 该格的值要与该借出单指向的**物品台账记录 ID** 对得上（单选选项名写记录 ID，或直接用引用/文本字段填记录 ID）。按**物品名称**匹配需要「名称 → 记录 ID」的映射，本机绑定里没有这份映射，所以名称对不上时按 `EVIDENCE_REQUIRED` 拦下 —— 拦下不会错路由，但要走通就得把这一格的值口径定成记录 ID（操作员侧决定）。
 
 工作队列是运行目录下的 `sources.json`（Git 忽略），只存单据/来源引用，不是第二本库存账。`kind` 为 `apply` 或 `event`。`apply` 走 `admit_application` 后建立审批入口；`event` 走 `execute`，同意后系统预留，再按状态建借出/归还入口。回执落 `runtime/operations/<operation_id>.json`。阶段入口行由引擎创建，但**决定与发生时间两格必须由真人填**（引擎不预填时间，否则时间就不代表真人的实际动作时刻）：只填一格驱动会判 `EVIDENCE_REQUIRED` 并指明缺哪一格。每轮驱动先做一次**阶段对账**：凡是队列或日志里出现过的单据，若其当前状态本该有人工入口（待审批 / 待领用确认 / 待归还请求 / 待归还确认）而入口不存在，驱动按 `stage_operation_id` 幂等补齐 —— 已建过的（含 `UNKNOWN` 回执）不重建。
 
