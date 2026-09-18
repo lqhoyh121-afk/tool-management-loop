@@ -70,7 +70,7 @@ class ShapeChangingTransport(MemoryTransport):
         self.list_payload = None
 
     def exchange(self, command, arguments):
-        if command == 'application.list' and self.list_payload is not None:
+        if command == 'row.list' and self.list_payload is not None:
             self.calls.append((command, dict(arguments)))
             return self.list_payload
         return super().exchange(command, arguments)

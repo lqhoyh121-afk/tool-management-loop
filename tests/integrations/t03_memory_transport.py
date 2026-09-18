@@ -118,7 +118,7 @@ class MemoryTransport(Transport):
             'todo.get': self._todo_get,
             'stage.query': self._stage_query,
             'loan.query_borrowed': self._loan_query_borrowed,
-            'application.list': self._application_list,
+            'row.list': self._row_list,
             'loan.create': self._loan_create,
             'loan.find_application': self._loan_find_application,
             'title.names': self._title_names,
@@ -274,11 +274,13 @@ class MemoryTransport(Transport):
         todo = self.todos[task_id]
         return todo_ok_envelope(result={'todoDetailModel': deepcopy(todo['detail'])})
 
-    def _application_list(self, arguments):
-        """All rows of the application result table, read-shaped.
+    def _row_list(self, arguments):
+        """One container result table, every row, read-shaped.
 
+        Both the application table (issue #78) and the return form's table (issue #87)
+        are listed through this one command: the transport never filters rows.
         Live ``record query --all`` on an empty table returns ``records: null``
-        with ``hasMore: false``; that is what "no application yet" looks like.
+        with ``hasMore: false``; that is what "no rows yet" looks like.
         """
         tenant = arguments['tenant_id']
         container = arguments['container_id']

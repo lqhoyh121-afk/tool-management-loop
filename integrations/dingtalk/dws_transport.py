@@ -263,8 +263,9 @@ class DwsTransport:
                     '--base-id', base_id, '--table-id', table_id,
                     '--records-file', self._records_file(records),
                     '--yes'] + common
-        if command == 'application.list':
-            # 申请收集表结果表全量列出：只回行 id 与单元格，不在传输层过滤。
+        if command == 'row.list':
+            # 一张结果表的全部行（申请行、归还行都在各自的表里）：只回行与单元格，
+            # 不在传输层过滤 —— 过滤会把「读不出来」静默变成「没有新行」。
             base_id, table_id = split_container(arguments['container_id'])
             return ['aitable', 'record', 'query',
                     '--base-id', base_id, '--table-id', table_id,

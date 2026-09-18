@@ -28,6 +28,7 @@ from .envelope import (created_record_id, extract_records, query_rows,
 from .errors import (BusinessErrorResponse, DingTalkShapeError,
                      UnknownResultError)
 from .identity import TODO
+from .returnform import ReturnDraft
 from .todo import (completion_at, completion_events, executor_refs, finish_time,
                    read_todo_detail)
 from .transport import require_envelope, require_todo_envelope
@@ -615,6 +616,92 @@ class DingTalkAdapter:
             cleaned.append(item)
         return cleaned
 
+    def _return_form_scope(self):
+        """归还发现的读范围：结果表容器 + 归还两格映射，三样都得声明过。
+
+        缺一样都不是「没有新归还」而是配置缺失：归还行与本机建的阶段入口行共用一张表，
+        没有「借用人 / 归还时间」两格的映射就分不出哪一行是归还提交 —— 那是**静默**
+        把每一行都读成「不是归还提交」。所以这里 fail closed 报 ``CONFIG``。
+        """
+        container = self._declared(self.entry_container)
+        fields = self.return_form_fields
+        require(fields is not None, Code.CONFIG)
+        self._declared(fields.borrower)
+        self._declared(fields.occurred_at)
+        return container, fields
+
+    def pending_returns(self, tenant_id):
+        """归还收集表结果表的行引用（只回不透明行 id，不带单元格）。
+
+        归还表单与本机建的阶段入口行共用这张表，所以这里如实列出**每一行**、不在传输层
+        过滤：哪一行是归还提交由 :meth:`read_return` 逐行判（入口行带台账单据指向）。
+        过滤会把「表格读不出来」静默变成「今天没有归还」，调用方（发现）自己持有幂等
+        判据，这里回答的只是「有哪些行」。
+        """
+        container, _fields = self._return_form_scope()
+        text(tenant_id)
+        try:
+            payload = self.transport.exchange('row.list', {
+                'tenant_id': tenant_id,
+                'container_id': container,
+            })
+            rows = query_rows(payload)
+        except UnknownResultError as exc:
+            _closed(exc, Code.UNKNOWN)
+        except BusinessErrorResponse as exc:
+            _closed(exc, _business_code(exc))
+        except DingTalkShapeError as exc:
+            _closed(exc)
+        return tuple(Resource('form', tenant_id, container, row['recordId'])
+                     for row in rows)
+
+    def read_return(self, source):
+        """一行归还提交校验成 :class:`ReturnDraft`；不是归还提交时返回 ``None``。
+
+        这张表同时住着本机建的阶段入口行（带 ``loan_container`` / ``loan_id`` 指向）：
+        两者必须一眼分开，否则发现会把入口行当成新归还。判据与 ``_is_return_form_submission``
+        同源，顺序不能调：
+
+        * 带单据指向 → ``None``（阶段入口行，不是归还提交）；
+        * 两格归还答案（借用人 / 归还时间）一格都没填 → ``None``（没用过/空白行）;
+        * 有任一格 → 按归还提交处理，另一格缺、读不出、形态没见过一律 fail closed。
+
+        注意「入口行」的判据必须**先**判：本机为待归还请求建的入口行也带「借用人」，
+        而且它的「归还时间」要等真人填 —— 先判归还答案就会把每一张未填的入口行都报成
+        「必填缺」。
+        """
+        container, fields = self._return_form_scope()
+        require(source.kind == 'form' and source.container_id == container, Code.EVIDENCE)
+        cells = self._record_cells(source)
+        entry = self.entry_fields
+        if _is_declared(entry.loan_id) and self._cell_has_text(cells, entry.loan_id):
+            return None
+        if _is_declared(entry.loan_container) and self._cell_has_text(cells, entry.loan_container):
+            return None
+        if not self._return_answers(cells, fields):
+            return None
+        try:
+            borrower = _identity(cells, fields.borrower, source.tenant_id)
+            occurred = read_datetime(cells, fields.occurred_at)
+        except ContractError:
+            raise
+        except (DingTalkShapeError, KeyError) as exc:
+            _closed(exc)
+        return ReturnDraft(source, borrower, occurred)
+
+    def _return_answers(self, cells, fields):
+        """归还的两格里填过哪几格；缺键或 ``null`` 表示没填。
+
+        出现但读不出来的格（空串这类未观察形态）在这里**不算**「没填」：它会被后面的
+        解码按 ``EVIDENCE_REQUIRED`` 拦下，不能静默读成「这行不是归还提交」。
+        """
+        present = []
+        for name in ('borrower', 'occurred_at'):
+            field_id = getattr(fields, name)
+            if field_id in cells and cells[field_id] is not None:
+                present.append(name)
+        return tuple(present)
+
     def pending_applications(self, tenant_id):
         """Row refs of the application collection result table (no cells).
 
@@ -626,7 +713,7 @@ class DingTalkAdapter:
         require(bool(self.application_container.strip()), Code.CONFIG)
         text(tenant_id)
         try:
-            payload = self.transport.exchange('application.list', {
+            payload = self.transport.exchange('row.list', {
                 'tenant_id': tenant_id,
                 'container_id': self.application_container,
             })

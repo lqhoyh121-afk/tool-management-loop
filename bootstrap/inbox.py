@@ -317,14 +317,18 @@ class ApplicationIntake:
                 intent, receipt = self.store.load(operation_id)
             except KeyError:
                 continue
-            for ref in _referenced_sources(intent, receipt):
+            for ref in referenced_sources(intent, receipt):
                 if ref.kind == 'form' and ref.container_id == container:
                     known.add(ref.resource_id)
         return known
 
 
-def _referenced_sources(intent, receipt):
-    """Journal 条目里出现的来源引用：读侧 intent 的事件来源与阶段回执来源。"""
+def referenced_sources(intent, receipt):
+    """Journal 条目里出现的来源引用：读侧 intent 的事件来源与阶段回执来源。
+
+    申请发现（#78）与归还发现（#87）共用这一份口径：本机「已经认识」哪些来源行，
+    只由工作队列与操作日志回答，不靠第二本登记册。
+    """
     refs = []
     event = getattr(intent, 'event', None)
     source = getattr(event, 'source', None)
