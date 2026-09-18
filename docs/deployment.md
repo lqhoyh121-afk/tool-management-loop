@@ -153,7 +153,8 @@ https://docs.dingtalk.com/notable/share/form/<shareUuid>?source=link
 
 - **钉钉审批收集表只是填写前端**：不新增第二份申请入口，结论必须落到入口行的「决定」列（同一张入口表、同一行）。引擎建入口行时只预填单号、数量、物资编号、三方身份与阶段动作，**「决定」与「发生时间」两格留空**，由真人填；只填一格驱动会判 `EVIDENCE_REQUIRED` 并指明缺哪一格。
 - **决定值以词表为准**：`agree` / `同意` = 同意，`reject` / `拒绝` = 拒绝。表里写了词表以外的值一律 fail closed（`EVIDENCE_REQUIRED`），不从标题、选项顺序或阶段名反推。
-- **待审批阶段同时给审批人发一条待办**：标题沿用阶段标题（`【待审批】请审批借出 …`），收件人 = 台账行的审批人。它只是催办，不是第二份结论来源 —— 入口行建出来后才发出，它的成败不进阶段回执、也不占用阶段索引（催办用带后缀的操作号，阶段索引里本阶段的操作号仍指向入口行）。所以催办丢了只等于「没提醒」。
+- **待审批阶段同时给审批人发一条待办**：标题沿用阶段标题（`【待审批】请审批借出 <物品> ×<数量> ｜ 借用人 <借用人> ｜ 到期 <到期> ｜ 单号 <单号> ｜ 填：决定 + 发生时间`），收件人 = 台账行的审批人。绑定给了 `title_display.approve_entry_url` 时标题末尾还带 `｜ 填表→ <链接>`，让审批人点得进去；没配就没有这段。它只是催办，不是第二份结论来源 —— 入口行建出来后才发出，它的成败不进阶段回执、也不占用阶段索引（催办用带后缀的操作号，阶段索引里本阶段的操作号仍指向入口行）。所以催办丢了只等于「没提醒」。
+- **领用确认 / 归还确认待办的标题也带「谁 / 什么 / 什么时候」**：`【待领用确认】请确认已领用 <物品> ×<数量> ｜ 借用人 <借用人> ｜ 到期 <到期> ｜ 单号 <单号>`。物品与借用人优先用显示名（见上一节 `title_display`），查不到就退回资源 id / `userId`；`到期` 与「待归还」一样按北京时间渲染。
 
 `待归还请求`（`REQUEST_RETURN`）仍然只有入口行、不发待办。
 
@@ -178,6 +179,14 @@ python -m bootstrap --drive --runtime 运行目录 --lock-root 锁目录
 - `apply_fields`：申请收集表字段 ID（`ApplicationFieldMap`），必填
 - `return_form_fields`：归还表单视图字段 ID（`ReturnFormFieldMap`：借用人、归还时间，以及**可选**的「归还物品」），前两键必填
 - `loan_container`：台账借用单表容器 ID（归还表单按借用人匹配 `borrowed` 单时使用），必填
+
+可选的一段 `title_display`（只为把阶段待办标题写成人话，不参与任何结论；三个键都可缺，缺了按下面的口径退回，绝不会因为配置不全而让阶段建不出来）：
+
+- `title_display.item_name_field`：库存表里**物品名称**那一列（文本）的字段 ID。给了才在发待办前多读一次库存行，读不到就用物品记录 ID。
+- `title_display.borrower_names`：布尔。为 `true` 时才查一次通讯录显示名（`contact user get --ids`），查不到（无权限、离职、格式不认识）就用 `userId`。
+- `title_display.approve_entry_url`：审批收集表的分享链接。给了就拼进审批待办标题（`… ｜ 填表→ <链接>`），不给就保持不带链接的老标题。
+
+这三个键的值都是本机真值（字段 ID / 表单链接），**只放本机绑定，不进仓库**。链接只把人送到填写处：审批结论的真源仍是入口行的「决定」列。查名与拼链接都是纯装饰：读超时、报错、没回包一律退回 id / 老标题，阶段与结论都不受影响。
 
 缺上述映射、键不完整、或把台账整表拷进 `entry_fields`/`apply_fields`/`return_form_fields`，都是 `CONFIG`。读申请行用 `apply_fields`；读归还表单行（无 loan_id）用 `return_form_fields` 并按借用人唯一匹配；读引擎预建阶段入口行仍用 `entry_fields`。真实字段 ID 只放本机绑定，不进仓库。
 
@@ -263,3 +272,23 @@ python -B -m unittest discover -s tests/bootstrap -p "test_*.py" -v
 - `APPROVE` 的待办只是催办，不是结论来源：三条口径见上文「审批结论的唯一真源」。
 - `runtime/dws-stage-index.json` 是阶段索引（操作号 ↔ 钉钉 task id）：`todo task create` 没有描述字段可以放操作号，**该文件不可删**，删了就再也对不回「unknown 但待办已建出」的单。
 - **一单一行一轮**：`stage_operation_id` 对同一条台账行永久唯一，所以同一条行二次借出（人工把状态与 `consumed_events` 清回再走一遍）**不会再建任何入口** —— 需要重跑时请新建台账行，而不是复用旧行。
+
+## 0 命中不等于「没建出」
+
+**只看标题的回查是有前提的**，前提不成立时 0 命中什么也证明不了。两条口径都写在 `integrations/dingtalk/dws_transport.py` 的常量注释里，改这块前先读它们：
+
+- **`--status` 永不省略**：真机 `todo task list --help` 写的是 `--status string  true=已完成, false=未完成`，**没写默认值**；实测（2026-09-18，登录账号）`--status true` 47 条、不带 flag 也是 47 条、`--status false` 0 条 —— 账号当前没有未完成待办，所以「默认全部」和「默认仅已完成」在实测里**长得一模一样**。回查因此固定发两次（`--status false` + `--status true`）再按 `taskId` 合并：待办可能在建出后被真人点完成，只在第二个查询里。
+- **列表只覆盖登录账号自己作为执行者的待办**：真机 help 原文「自己创建但交给他人执行的待办不在返回范围内」，而阶段待办是用 `--executors <业务当事人>` 建的，**不保证等于登录账号**（多人流程下 actor 是借用人/审批人）。actor ＝ 登录账号时（单人部署，也是当前部署）0 命中才算「确认没建出」；actor ≠ 登录账号时待办建出来了、人也收到了，但列表里看不见。
+
+所以恢复失败会被**写成记录**，不再与「没建出」同形。`runtime/dws-stage-index.json` 的 pending 记录里：
+
+| 字段 | 含义 |
+| --- | --- |
+| `executor_contact` / `login_user_id` / `executor_scope` | 建出（或尝试建出）时的 actor、当时观测到的 dws 登录账号、以及两者关系（`self` / `other` / `unknown`）。登录账号来自 `dws auth status`，读不到就记 `unknown`，**不猜**。 |
+| `recovery_state` | `not_attempted`（还没回查）/ `not_built`（两个状态都查了、actor ＝ 登录账号、仍然 0 命中 —— 这一种才算确认没建出）/ `needs_manual_confirmation`（0 命中但范围不成立，或列表读不到，或同标题 2 条以上） |
+| `needs_manual_confirmation` / `recovery_reason` | 是否必须人工先确认；原因：`executor_scope` / `todo_list_unreadable` / `title_ambiguous` |
+| `recovery_attempts` / `recovery_matches` / `recovery_statuses` | 回查次数、命中条数、本次查过的状态（恒为 `["false","true"]`） |
+
+**运维出口**：`python -c "from integrations.dingtalk.dws_transport import pending_stage_report; ..."`（`pending_stage_report(runtime 目录)`，只读）把上面这些字段按一阶段一行列出来。`needs_manual_confirmation=True` 的单，请**先到钉钉里按标题/`claimed_task_id` 找那条待办**，确认真的没有，再清掉索引里的 pending 重来；驱动自己不会替你建第二条。
+
+`claimed_task_id`（建出回执到手、紧随其后的 `todo task get` 失败）走的是**另一条路**：按 task id 精确读回，`todo task get` 不受执行人范围限制，所以那条路与 actor、与登录账号都无关。

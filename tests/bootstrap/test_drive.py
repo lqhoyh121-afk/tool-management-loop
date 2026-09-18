@@ -649,6 +649,52 @@ class DriveTests(unittest.TestCase):
             self.runtime, FileJournal(self.runtime / 'operations'),
             MachineLock(self.locks), data))
 
+    def test_title_display_is_absent_unless_the_binding_asks_for_it(self):
+        from bootstrap.drive import live_adapter, title_display_from_document
+        from bootstrap.journal import FileJournal
+        data = binding_document(
+            dws_cmd=[sys.executable, '-c', 'pass'],
+            form_container='baseForm/tblForm',
+            todo_container='todoSpace/executors',
+        )
+        self.assertIsNone(title_display_from_document(data))
+        # 段在、但三个键都是空的：等于没配，标题保持老样子。
+        self.assertIsNone(title_display_from_document(
+            binding_document(title_display={'item_name_field': '',
+                                            'borrower_names': False,
+                                            'approve_entry_url': '  '})))
+        adapter = live_adapter(
+            self.runtime, FileJournal(self.runtime / 'operations'),
+            MachineLock(self.locks), data)
+        self.assertIsNone(adapter.title_display)
+
+    def test_title_display_reads_the_optional_keys(self):
+        from bootstrap.drive import title_display_from_document
+        display = title_display_from_document(binding_document(title_display={
+            'item_name_field': 'fldSYN-item-name',
+            'borrower_names': True,
+            'approve_entry_url': 'https://example.invalid/synthetic-entry',
+        }))
+        self.assertEqual(display.item_name_field, 'fldSYN-item-name')
+        self.assertTrue(display.borrower_names)
+        self.assertEqual(display.approve_entry_url,
+                         'https://example.invalid/synthetic-entry')
+        self.assertTrue(display.names_enabled)
+        # 只给链接：仍然要拼链接，但不查名。
+        link_only = title_display_from_document(binding_document(title_display={
+            'approve_entry_url': 'https://example.invalid/synthetic-entry'}))
+        self.assertFalse(link_only.names_enabled)
+        self.assertTrue(link_only.approve_entry_url)
+
+    def test_broken_title_display_blocked_as_config(self):
+        from bootstrap.drive import title_display_from_document
+        for broken in ({'item_name_field': 7},
+                       {'borrower_names': 'yes'},
+                       {'approve_entry_url': ['https://example.invalid/x']},
+                       'synthetic-not-a-block'):
+            self.blocked(Code.CONFIG, lambda broken=broken: title_display_from_document(
+                binding_document(title_display=broken)))
+
 
     def test_hand_edited_stock_snapshot_blocks_the_heal_without_moving_stock(self):
         """库存行已是「已预留」而借出行仍停在 reservation_pending：不许再迁一次库存。
