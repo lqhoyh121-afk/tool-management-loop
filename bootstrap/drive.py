@@ -22,6 +22,7 @@ from workflow.engine import LendingEngine
 from .binding import (binding_from_document, field_maps_from_document,
                       read_binding_document, require_complete)
 from .gate import assert_business_allowed
+from .inbox import REGISTER_NAME, ApplicationIntake, format_intake_lines
 from .instance import MachineLock
 from .journal import FileJournal
 from .snapshot import decode_resource, encode_resource
@@ -73,6 +74,11 @@ class DriveReport:
     (operation ids) and never mixed into the recovery count. ``stage_checked``
     holds the known loan refs the reconcile examined. Reconcile skips travel in
     ``skipped`` like every other skip, tagged ``kind='stage'``.
+
+    ``intake`` is the application discovery account for this pass (issue #78) or
+    None when discovery is not wired. Discovered applications enter the queue
+    like any other work item; the account only says what was scanned,
+    registered and skipped.
     """
 
     recovered: tuple
@@ -81,6 +87,7 @@ class DriveReport:
     blocked: tuple
     stage_checked: tuple = ()
     stage_created: tuple = ()
+    intake: object = None
 
 
 def _drive_outcome(item, code):
@@ -154,6 +161,8 @@ def format_drive_lines(report):
     if waiting:
         ids = '，'.join(o.source_id for o in waiting)
         lines.append(f'  其中待人工 {len(waiting)} 条（阶段待办尚未完成，不是证据不足）：{ids}')
+    if report.intake is not None:
+        lines.extend(format_intake_lines(report.intake))
     for label, outcomes in (('跳过', report.skipped), ('挂起', report.blocked)):
         for outcome in outcomes:
             lines.append(
@@ -181,6 +190,34 @@ class FileSources:
                                   decode_resource(raw['source'])))
         return tuple(items)
 
+    def append(self, registrations):
+        """Register discovered applications in the queue; existing pairs are kept.
+
+        This is the durable half of 「登记 apply 引用」: the queue is what the next
+        pass reconciles stages from, so a pair that is already there is never
+        written twice (idempotent under restarts and re-scans).
+        """
+        current = list(self.pending())
+        seen = {(item.kind, item.loan_ref, item.source) for item in current}
+        added = []
+        for registration in registrations:
+            item = WorkItem(registration.kind, registration.loan_ref, registration.source)
+            key = (item.kind, item.loan_ref, item.source)
+            if key in seen:
+                continue
+            seen.add(key)
+            added.append(item)
+        if not added:
+            return ()
+        payload = [{'kind': item.kind, 'loan': encode_resource(item.loan_ref),
+                    'source': encode_resource(item.source)} for item in current + added]
+        payload_text = json.dumps(payload, ensure_ascii=True, indent=2) + '\n'
+        tmp = self.path.with_suffix('.tmp')
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(payload_text, encoding='utf-8')
+        tmp.replace(self.path)
+        return tuple(added)
+
 
 class StaticSources:
     def __init__(self, items):
@@ -193,22 +230,28 @@ class StaticSources:
 class DriveLoop:
     """One non-interactive pass. Restart always reconciles unresolved ops first."""
 
-    def __init__(self, engine, sources, store, locks):
+    def __init__(self, engine, sources, store, locks, intake=None):
         self.engine = engine
         self.sources = sources
         self.store = store
         self.locks = locks
+        self.intake = intake
 
     def run(self):
         assert_business_allowed(self.engine.binding, self.engine.lease, self.locks)
         processed = []
         skipped = []
         blocked = []
+        # 申请发现先于队列消费：真人新提交的行必须在**同一轮**里变成审批入口，
+        # 而不是等操作员登记。发现本身也只写本机队列与台账行，闸门照旧。
+        reported = None if self.intake is None else self.intake.run()
+        discovered = tuple(WorkItem(finding.kind, finding.loan_ref, finding.source)
+                           for finding in getattr(reported, 'findings', ()))
         recovered = self._recover()
-        stage_checked, stages_created, stage_skips = self._reconcile_stages()
+        stage_checked, stages_created, stage_skips = self._reconcile_stages(discovered)
         skipped.extend(stage_skips)
         blocked_loans = set(self._unresolved_loans())
-        for item in self._work():
+        for item in self._work(discovered):
             if item.loan_ref in blocked_loans:
                 blocked.append(_drive_outcome(item, Code.UNKNOWN.value))
                 continue
@@ -229,7 +272,7 @@ class DriveLoop:
                 continue
             processed.append(item)
         return DriveReport(tuple(recovered), tuple(processed), tuple(skipped), tuple(blocked),
-                           tuple(stage_checked), tuple(stages_created))
+                           tuple(stage_checked), tuple(stages_created), reported)
 
     def _recover(self):
         recovered = []
@@ -249,10 +292,10 @@ class DriveLoop:
                 refs.append(intent.before.ref)
         return tuple(refs)
 
-    def _work(self):
+    def _work(self, extra=()):
         seen = set()
         items = []
-        for item in tuple(self.sources.pending()) + self._stage_items():
+        for item in tuple(self.sources.pending()) + tuple(extra) + self._stage_items():
             key = (item.kind, item.loan_ref, item.source)
             if key in seen:
                 continue
@@ -365,7 +408,7 @@ class DriveLoop:
             found.append(intent.event)
         return found[0] if len(found) == 1 else None
 
-    def _known_loans(self):
+    def _known_loans(self, extra=()):
         """Loan refs the queue or the journal already mentions, first-seen order.
 
         Both journal entry kinds count: a verified stage receipt names the loan
@@ -374,10 +417,14 @@ class DriveLoop:
         stage receipts missed every loan whose sole trace is a write intent —
         the local index dropping that one record is enough — and such a loan
         never got its entry point rebuilt.
+
+        Applications discovered this pass count too: their ledger row is brand
+        new, so the reconcile is what gives it a human entry point even if the
+        `apply` item itself is skipped later in the same pass.
         """
         refs = []
         seen = set()
-        for item in self._work():
+        for item in self._work(extra):
             if item.loan_ref not in seen:
                 seen.add(item.loan_ref)
                 refs.append(item.loan_ref)
@@ -400,7 +447,7 @@ class DriveLoop:
             refs.append(intent.before.ref)
         return tuple(refs)
 
-    def _reconcile_stages(self):
+    def _reconcile_stages(self, extra=()):
         """Create the current stage for known loans that no item drives here.
 
         A loan can reach a stage-bearing state without this pass witnessing the
@@ -424,7 +471,7 @@ class DriveLoop:
         checked = []
         created = []
         skipped = []
-        for ref in self._known_loans():
+        for ref in self._known_loans(extra):
             checked.append(ref)
             operation_id = None
             try:
@@ -505,6 +552,21 @@ def live_adapter(runtime, journal, locks, document, fields=None, entry_fields=No
     )
 
 
+def application_intake(engine, reader, sources, store, locks, runtime):
+    """Discovery port when the injected reader can scan applications, else None.
+
+    Feature-detected on purpose: an injected port that has no application read
+    side (a query-only double, a mirror reader) keeps the drive exactly as it
+    was, and a live adapter always has both halves.
+    """
+    if not (hasattr(reader, 'pending_applications') and hasattr(reader, 'read_application')
+            and hasattr(reader, 'create_application_loan')
+            and hasattr(reader, 'find_application_loan')):
+        return None
+    return ApplicationIntake(engine, reader, sources, store, locks,
+                             Path(runtime) / REGISTER_NAME)
+
+
 def run_bound_drive(runtime, lock_root, reader=None, writer=None, stages=None,
                     sources=None, locks=None, store=None):
     runtime = Path(runtime)
@@ -525,7 +587,9 @@ def run_bound_drive(runtime, lock_root, reader=None, writer=None, stages=None,
         sources = FileSources(runtime / 'sources.json')
     engine = start_engine(reader, writer, stages, store, locks, binding)
     try:
-        return DriveLoop(engine, sources, store, locks).run()
+        return DriveLoop(engine, sources, store, locks,
+                         intake=application_intake(engine, reader, sources, store, locks,
+                                                   runtime)).run()
     finally:
         engine.stop()
 

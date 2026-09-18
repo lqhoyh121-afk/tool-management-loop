@@ -108,7 +108,10 @@ SPECS = {
     'aitable record query': {
         'required': {'--base-id', '--table-id', '--format'},
         'optional': {'--all', '--record-ids', '--filters', '--field-ids'},
-        'one_of': ({'--record-ids', '--filters'},),
+        # 三种选择器至少一种：按行 id、按过滤条件，或整表列出（发现扫描只发 --all）。
+        # ``--all`` 可以与行 id / 过滤条件同时出现（翻页），但行 id 与过滤条件互斥。
+        'required_any': ({'--record-ids'}, {'--filters'}, {'--all'}),
+        'forbid_together': ({'--record-ids', '--filters'},),
     },
     'aitable record update': {
         'required': {'--base-id', '--table-id', '--records-file', '--yes', '--format'},
@@ -174,6 +177,12 @@ def require_spec(verb, argv):
         present = [name for name in group if name in flags]
         if len(present) != 1:
             return err('MISSING_FLAG', sorted(group)[0])
+    any_groups = spec.get('required_any', ())
+    if any_groups and not any(group <= set(flags) for group in any_groups):
+        return err('MISSING_FLAG', sorted(min(any_groups, key=len))[0])
+    for group in spec.get('forbid_together', ()):
+        if group <= set(flags):
+            return err('UNKNOWN_FLAG', sorted(group)[0])
     return None
 
 
@@ -216,6 +225,17 @@ def main(argv):
             'cells': live_cells(item, kinds),
         }]
         raw_filters = flag(argv, '--filters')
+        if record_id is None and not raw_filters and has(argv, '--all'):
+            # 全量列出整张表：申请发现扫描走的形状，空表回 records: null。
+            prefix = f'{base_id}/{table_id}/'
+            listed = []
+            for slot, cells in sorted(state['records'].items()):
+                if not slot.startswith(prefix):
+                    continue
+                listed.append({'recordId': slot[len(prefix):],
+                               'cells': live_cells(cells, kinds)})
+            print(json.dumps(ok(records=listed or None, hasMore=False), ensure_ascii=True))
+            return 0
         if raw_filters:
             wanted = filter_pairs(raw_filters)
             field_ids = [f for f in (flag(argv, '--field-ids') or '').split(',') if f]
@@ -262,7 +282,8 @@ def main(argv):
     if argv[:3] == ['aitable', 'record', 'create']:
         records = json.loads(Path(flag(argv, '--records-file')).read_text(encoding='utf-8'))
         state['seq']['form'] += 1
-        form_id = f'SYNTHETIC-form-{state["seq"]["form"]:04d}'
+        # 建行不区分表：入口行、台账行都走这一条命令，id 由服务端给。
+        form_id = f'SYNTHETIC-rec-{state["seq"]["form"]:04d}'
         base_id = flag(argv, '--base-id')
         table_id = flag(argv, '--table-id')
         cells = dict(records[0]['cells'])
@@ -271,6 +292,9 @@ def main(argv):
             return 0
         state['records'][key(base_id, table_id, form_id)] = cells
         save_state(state_path, state)
+        if 'aitable record create' in state.get('late_write', ()):
+            # The live write can land while the envelope never comes back.
+            time.sleep(120)
         print(json.dumps(ok(data={'newRecordIds': [form_id]}), ensure_ascii=True))
         return 0
     if argv[:3] == ['todo', 'task', 'create']:

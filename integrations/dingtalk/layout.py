@@ -55,11 +55,22 @@ class EntryFieldMap:
 
 @dataclass(frozen=True)
 class ApplicationFieldMap:
-    """Application collection table field IDs. Distinct from stage-entry EntryFieldMap."""
+    """Application collection table field IDs. Distinct from stage-entry EntryFieldMap.
+
+    ``item_container`` / ``item_id`` / ``due_at`` are what turns an application row
+    into a ledger row (issue #78). They are optional only so an existing binding
+    keeps loading: a missing or ``unset:``-prefixed value means "this instance has
+    not declared that question", and the discovery then fails closed and reports
+    the row as unregistered instead of inventing an item or a due time.
+    """
+
     quantity: str
     physical_ids: str
     borrower: str
     occurred_at: str
+    item_container: str = ''
+    item_id: str = ''
+    due_at: str = ''
 
 
 @dataclass(frozen=True)
@@ -123,6 +134,9 @@ SYNTHETIC_APPLY_FIELDS = ApplicationFieldMap(
     physical_ids='fldSYN-apply-pids',
     borrower='fldSYN-apply-borrower',
     occurred_at='fldSYN-apply-occurred',
+    item_container='fldSYN-apply-item-container',
+    item_id='fldSYN-apply-item-id',
+    due_at='fldSYN-apply-due',
 )
 
 SYNTHETIC_RETURN_FORM_FIELDS = ReturnFormFieldMap(

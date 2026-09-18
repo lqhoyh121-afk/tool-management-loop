@@ -67,10 +67,11 @@ class MemoryTransport(Transport):
     """
 
     def __init__(self, fields, entry_fields, form_container='synthetic-forms',
-                 todo_container='synthetic-todos', apply_container='synthetic-apply-forms'):
+                 todo_container='synthetic-todos', apply_container='synthetic-apply-forms',
+                 apply_fields=None):
         self.fields = fields
         self.entry_fields = entry_fields
-        self.kinds = declared_kinds(fields, entry_fields)
+        self.kinds = declared_kinds(fields, entry_fields, apply_fields)
         self.form_container = form_container
         self.apply_container = apply_container
         self.todo_container = todo_container
@@ -85,6 +86,7 @@ class MemoryTransport(Transport):
         self.drop_after_updates = None
         self.update_count = 0
         self._forms = 0
+        self._loans = 0
         self._todos = 0
         self._activities = 0
         self._next_internal = 9000000100
@@ -113,6 +115,9 @@ class MemoryTransport(Transport):
             'todo.get': self._todo_get,
             'stage.query': self._stage_query,
             'loan.query_borrowed': self._loan_query_borrowed,
+            'application.list': self._application_list,
+            'loan.create': self._loan_create,
+            'loan.find_application': self._loan_find_application,
         }.get(command)
         if handler is None:
             return error_envelope('UNSUPPORTED_COMMAND')
@@ -264,6 +269,42 @@ class MemoryTransport(Transport):
             return todo_error_envelope('TASK_NOT_EXIST')
         todo = self.todos[task_id]
         return todo_ok_envelope(result={'todoDetailModel': deepcopy(todo['detail'])})
+
+    def _application_list(self, arguments):
+        """All rows of the application result table, read-shaped.
+
+        Live ``record query --all`` on an empty table returns ``records: null``
+        with ``hasMore: false``; that is what "no application yet" looks like.
+        """
+        tenant = arguments['tenant_id']
+        container = arguments['container_id']
+        rows = []
+        for (record_tenant, record_container, resource_id), cells in sorted(self.records.items()):
+            if record_tenant != tenant or record_container != container:
+                continue
+            rows.append({'recordId': resource_id, 'cells': self._live_cells(cells)})
+        return ok_envelope(records=rows or None, hasMore=False)
+
+    def _loan_create(self, arguments):
+        """Create a ledger row from the write payload; live ids are server-side."""
+        self._loans += 1
+        record_id = f'SYNTHETIC-loan-{self._loans:04d}'
+        key = (arguments['tenant_id'], arguments['container_id'], record_id)
+        self.records[key] = dict(arguments['cells'])
+        return ok_envelope(data={'newRecordIds': [record_id]})
+
+    def _loan_find_application(self, arguments):
+        """Rows whose application-evidence cell equals the marker (server-side eq)."""
+        tenant = arguments['tenant_id']
+        container = arguments['container_id']
+        field_id = self.fields.application_evidence
+        rows = []
+        for (record_tenant, record_container, resource_id), cells in sorted(self.records.items()):
+            if record_tenant != tenant or record_container != container:
+                continue
+            if cells.get(field_id) == arguments['marker']:
+                rows.append({'recordId': resource_id, 'cells': self._live_cells(cells)})
+        return ok_envelope(records=rows or None, hasMore=False)
 
     def _loan_query_borrowed(self, arguments):
         tenant = arguments['tenant_id']

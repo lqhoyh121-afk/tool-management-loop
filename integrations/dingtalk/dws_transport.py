@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .cells import read_creator, read_single_select
 from .codec import _put_identity
+from .envelope import query_rows
 from .errors import DingTalkShapeError, UnsupportedShapeError, UnknownResultError
 from contracts.model import Code, ContractError, Identity, require, text
 
@@ -32,38 +33,6 @@ def split_container(container_id):
     if not base_id or not table_id:
         raise UnsupportedShapeError('container_id 须为 baseId/tableId')
     return base_id, table_id
-
-
-def _query_records(payload):
-    """Rows from ``record query --all``; odd shapes and truncation fail closed.
-
-    Live observation: an empty result set comes back as ``records: null``
-    (present key, null value), not ``[]``. A *missing* key stays an error —
-    that is a shape change, not an empty set.
-    """
-    if not isinstance(payload, dict):
-        raise UnsupportedShapeError('record query 未返回对象报文')
-    if payload.get('hasMore'):
-        raise UnsupportedShapeError('record query 分页未拉完，拒绝按不完整结果匹配')
-    if 'records' not in payload:
-        raise UnsupportedShapeError('record query 报文缺少 records 键')
-    records = payload['records']
-    if records is None:
-        records = []
-    elif not isinstance(records, list):
-        raise UnsupportedShapeError('record query 的 records 不是数组')
-    rows = []
-    for item in records:
-        if not isinstance(item, dict):
-            raise UnsupportedShapeError('record query 的记录不是对象')
-        record_id = item.get('recordId')
-        cells = item.get('cells')
-        if not isinstance(record_id, str) or not record_id.strip():
-            raise UnsupportedShapeError('record query 的记录缺少 recordId')
-        if not isinstance(cells, dict):
-            raise UnsupportedShapeError('record query 的记录缺少 cells')
-        rows.append({'recordId': record_id, 'cells': cells})
-    return rows
 
 
 def windows_native_path(path):
@@ -212,6 +181,30 @@ class DwsTransport:
             records = [{'recordId': arguments['resource_id'],
                         'cells': arguments['cells']}]
             return ['aitable', 'record', 'update',
+                    '--base-id', base_id, '--table-id', table_id,
+                    '--records-file', self._records_file(records),
+                    '--yes'] + common
+        if command == 'application.list':
+            # 申请收集表结果表全量列出：只回行 id 与单元格，不在传输层过滤。
+            base_id, table_id = split_container(arguments['container_id'])
+            return ['aitable', 'record', 'query',
+                    '--base-id', base_id, '--table-id', table_id,
+                    '--all'] + common
+        if command == 'loan.find_application':
+            # 按台账「申请证据」格精确匹配链路键；只取该列，避免把整行读进来。
+            base_id, table_id = split_container(arguments['container_id'])
+            marker_field = self.fields.application_evidence
+            filters = {'operator': 'and', 'operands': [
+                {'operator': 'eq', 'operands': [marker_field, arguments['marker']]}]}
+            return ['aitable', 'record', 'query',
+                    '--base-id', base_id, '--table-id', table_id,
+                    '--filters', json.dumps(filters, ensure_ascii=True),
+                    '--field-ids', marker_field,
+                    '--all'] + common
+        if command == 'loan.create':
+            base_id, table_id = split_container(arguments['container_id'])
+            records = [{'cells': arguments['cells']}]
+            return ['aitable', 'record', 'create',
                     '--base-id', base_id, '--table-id', table_id,
                     '--records-file', self._records_file(records),
                     '--yes'] + common
@@ -522,7 +515,7 @@ class DwsTransport:
                 '--all', '--format', 'json']
         payload = self._run(argv)
         try:
-            rows = _query_records(payload)
+            rows = query_rows(payload)
             loan_ids = []
             for row in rows:
                 cells = row['cells']

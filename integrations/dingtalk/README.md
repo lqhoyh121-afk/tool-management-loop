@@ -18,6 +18,7 @@ Refs #3。在冻结的 `contracts/` 之上实现 ReadPort / WritePort / StagePor
 | `transport.py` | 注入传输接口。`None` 表示超时/掉线，结果未知。 |
 | `dws_transport.py` | 真实 dws CLI 驱动。调用方注入 `node`+`dws.js`（或测试假脚本）；不读凭据、不猜安装路径。`--records-file` 只传 Windows 原生路径。`form.create` 是向**已有**收集结果表 `record create`，不是 `view create`。`stage.query` 只读本机阶段索引。 |
 | `adapter.py` | Read/Write/Stage 端口。每次写入检查 lease 与 `check_binding`；发前将回执标为 unknown；不明结果只 query，不盲重发。 |
+| `application.py` | 申请行 → 台账行的发现形态：`ApplicationDraft` 与链路键 `application_marker`（台账行「申请证据」格里的 `form:<申请行 id>`）。发现、建行、认领都靠这一个键，不建第二本登记。 |
 
 ## 注入命令名（仅测试/适配器内部）
 
@@ -31,6 +32,9 @@ Refs #3。在冻结的 `contracts/` 之上实现 ReadPort / WritePort / StagePor
 | `todo.create` | `todo task create --executors` 接受通讯录 userId |
 | `todo.get` | `todo task get` → `result.todoDetailModel` |
 | `stage.query` | 适配器保存的原单/阶段绑定回读；平台没有同名命令 |
+| `application.list` | `record query --all`（无行 id、无过滤条件）：列整张申请表结果表，只回行 id 与单元格；空表回 `records: null` |
+| `loan.create` | `record create`（台账借用单表）：申请自动建行，写后必须精确回读，回读不通过即 `WRITE_UNKNOWN_QUERY_FIRST` |
+| `loan.find_application` | `record query --filters`（`申请证据` eq `form:<申请行 id>`，带 `--all`）：写入结果不明时按链路键认领，命中 0 条为「没有」，多条按歧义 fail closed |
 
 ## 字段映射（T01）
 

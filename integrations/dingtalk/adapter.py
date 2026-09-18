@@ -18,11 +18,13 @@ from contracts.model import (Action, Code, ContractError, Event, Identity,
                              IdentityBinding, Outcome, Resource, State, require, text)
 from contracts.ports import StageReceipt, StageRequest, check_binding, verify_stage
 
+from .application import ApplicationDraft, application_marker
 from .cells import (MissingFieldError, read_datetime, read_single_select,
                     read_text)
 from .codec import (_identity, _int_count, _text_list, decode_inventory,
                     decode_loan, encode_inventory, encode_loan)
-from .envelope import extract_records, record_cells, record_id
+from .envelope import (created_record_id, extract_records, query_rows,
+                       record_cells, record_id)
 from .errors import (BusinessErrorResponse, DingTalkShapeError,
                      UnknownResultError)
 from .identity import TODO
@@ -395,6 +397,153 @@ class DingTalkAdapter:
             require(isinstance(item, str) and item.strip(), Code.EVIDENCE)
             cleaned.append(item)
         return cleaned
+
+    def pending_applications(self, tenant_id):
+        """Row refs of the application collection result table (no cells).
+
+        The result table is the application's source of truth; this scan answers
+        "which rows exist", never "which rows are new" — the caller owns the
+        idempotency register. Only opaque record ids travel back, so a scan
+        result can be reported without names or business numbers.
+        """
+        require(bool(self.application_container.strip()), Code.CONFIG)
+        text(tenant_id)
+        try:
+            payload = self.transport.exchange('application.list', {
+                'tenant_id': tenant_id,
+                'container_id': self.application_container,
+            })
+            rows = query_rows(payload)
+        except UnknownResultError as exc:
+            _closed(exc, Code.UNKNOWN)
+        except BusinessErrorResponse as exc:
+            _closed(exc, _business_code(exc))
+        except DingTalkShapeError as exc:
+            _closed(exc)
+        return tuple(Resource('form', tenant_id, self.application_container, row['recordId'])
+                     for row in rows)
+
+    def read_application(self, source):
+        """One application row as a validated draft; every gap fails closed.
+
+        缺项、缺失字段映射、形态未观察过都不补默认值：调用方据此按跳过记账。
+        """
+        fields = self.apply_fields
+        require(fields is not None, Code.CONFIG)
+        require(source.kind == 'form' and source.container_id == self.application_container,
+                Code.EVIDENCE)
+        cells = self._record_cells(source)
+        try:
+            borrower = _identity(cells, fields.borrower, source.tenant_id)
+            occurred = read_datetime(cells, fields.occurred_at)
+            quantity = _int_count(cells, fields.quantity, zero=False)
+            if fields.physical_ids in cells and cells[fields.physical_ids] is not None:
+                physical_ids = _text_list(cells, fields.physical_ids)
+            else:
+                physical_ids = ()
+            item_container = read_text(cells, self._declared(fields.item_container))
+            item_id = read_text(cells, self._declared(fields.item_id))
+            due_at = read_datetime(cells, self._declared(fields.due_at))
+        except ContractError:
+            raise
+        except (DingTalkShapeError, KeyError) as exc:
+            _closed(exc)
+        return ApplicationDraft(
+            source=source,
+            item=Resource('record', source.tenant_id, item_container, item_id),
+            borrower=borrower,
+            quantity=quantity,
+            physical_ids=physical_ids,
+            occurred_at=occurred,
+            due_at=due_at,
+        )
+
+    def create_application_loan(self, draft: ApplicationDraft, binding, lease):
+        """Create the ledger row for one application and prove it by readback.
+
+        The row starts at ``awaiting_approval`` with the application marker in
+        「申请证据」, so a later pass can adopt a half-finished attempt by exact
+        search instead of creating a second row. Approver, manager and config
+        version come from the binding only — never from the application row.
+        """
+        self.leases.assert_held(lease)
+        container = self._declared(self.loan_container)
+        intended = draft.loan(draft.pending_ref(container), binding)
+        check_binding(binding, intended)
+        try:
+            payload = self.transport.exchange('loan.create', {
+                'tenant_id': intended.ref.tenant_id,
+                'container_id': container,
+                'cells': encode_loan(intended, self.fields),
+            })
+            created_id = created_record_id(payload)
+        except UnknownResultError as exc:
+            _closed(exc, Code.UNKNOWN)
+        except BusinessErrorResponse as exc:
+            _closed(exc, _business_code(exc))
+        except DingTalkShapeError as exc:
+            # 受理形态不明：可能已建出，交给下一次对账认领，绝不重发。
+            _closed(exc, Code.UNKNOWN)
+        ref = Resource('record', intended.ref.tenant_id, container, created_id)
+        return self._readback_loan(ref, intended)
+
+    def find_application_loan(self, source, lease):
+        """The ledger row already carrying this application's marker, else None.
+
+        Exact marker match only: zero matches mean "no row carries it", several
+        matches are ambiguous and fail closed. A match is still read back in full
+        before it is handed out.
+        """
+        self.leases.assert_held(lease)
+        container = self._declared(self.loan_container)
+        marker = application_marker(source)
+        try:
+            payload = self.transport.exchange('loan.find_application', {
+                'tenant_id': source.tenant_id,
+                'container_id': container,
+                'marker': marker,
+            })
+            found = [row['recordId'] for row in query_rows(payload)]
+        except UnknownResultError as exc:
+            _closed(exc, Code.UNKNOWN)
+        except BusinessErrorResponse as exc:
+            _closed(exc, _business_code(exc))
+        except DingTalkShapeError as exc:
+            _closed(exc)
+        require(len(found) <= 1, Code.EVIDENCE)
+        if not found:
+            return None
+        ref = Resource('record', source.tenant_id, container, found[0])
+        loan = self.read_loan(ref)
+        require(loan.application_evidence == marker, Code.EVIDENCE)
+        return ref
+
+    def _readback_loan(self, ref, intended):
+        """Read the just-created row back; only an exact match is a success.
+
+        Unreadable or mismatching readback keeps the attempt UNKNOWN: the row may
+        exist, so the caller must adopt it later rather than write a second one.
+        """
+        try:
+            created = self.read_loan(ref)
+        except ContractError as exc:
+            if exc.code == Code.IDENTITY:
+                raise
+            raise ContractError(Code.UNKNOWN) from exc
+        require(created == replace(intended, ref=ref), Code.READBACK)
+        return ref
+
+    def _declared(self, field_id):
+        """Field id from a map, or fail closed when this instance never set it.
+
+        ``unset:<key>`` is how a binding says "this instance has no such
+        question" (same convention the application read side already uses for
+        逐件编号); it is not a field id and must never be queried as one.
+        """
+        if (not isinstance(field_id, str) or not field_id.strip()
+                or field_id.startswith('unset:')):
+            raise ContractError(Code.CONFIG)
+        return field_id
 
     def _read_form_event(self, loan, source):
         cells = self._record_cells(source)

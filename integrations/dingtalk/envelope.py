@@ -166,3 +166,56 @@ def record_cells(record):
     if not isinstance(cells, dict):
         raise UnsupportedShapeError(f'cells 应为对象，收到 {type(cells).__name__}')
     return cells
+
+
+def query_rows(payload):
+    """Rows from a ``record query --all`` reply, filtered or unfiltered.
+
+    Live observation (T01/T07): the ``--all`` reply is not the single-record
+    envelope — a filtered query has no ``success``/``status``/``error`` at all,
+    and an empty result set is ``records: null`` (present key, null value), not
+    ``[]``. A *missing* key stays an error: that is a shape change, not an empty
+    set. Truncation fails closed instead of matching on an incomplete list.
+    """
+    if not isinstance(payload, dict):
+        raise UnsupportedShapeError('record query 未返回对象报文')
+    if payload.get('hasMore'):
+        raise UnsupportedShapeError('record query 分页未拉完，拒绝按不完整结果匹配')
+    if 'records' not in payload:
+        raise UnsupportedShapeError('record query 报文缺少 records 键')
+    records = payload['records']
+    if records is None:
+        records = []
+    elif not isinstance(records, list):
+        raise UnsupportedShapeError('record query 的 records 不是数组')
+    rows = []
+    for item in records:
+        if not isinstance(item, dict):
+            raise UnsupportedShapeError('record query 的记录不是对象')
+        row_id = item.get('recordId')
+        cells = item.get('cells')
+        if not isinstance(row_id, str) or not row_id.strip():
+            raise UnsupportedShapeError('record query 的记录缺少 recordId')
+        if not isinstance(cells, dict):
+            raise UnsupportedShapeError('record query 的记录缺少 cells')
+        rows.append({'recordId': row_id, 'cells': cells})
+    return rows
+
+
+def created_record_id(payload):
+    """单个新建记录的 id（``data.newRecordIds``）。
+
+    新建回执只用来定位刚写的行；真正的成功判据是随后的精确回读，不是这里。
+    空数组、多元素或非字符串都按未观察形态 fail closed。
+    """
+    envelope = read_envelope(payload)
+    data = envelope.get('data')
+    if not isinstance(data, dict):
+        raise UnsupportedShapeError('新建回执缺少 data 对象')
+    ids = data.get('newRecordIds')
+    if not isinstance(ids, list) or len(ids) != 1:
+        raise UnsupportedShapeError('新建回执的 newRecordIds 不是单元素数组')
+    record = ids[0]
+    if not isinstance(record, str) or not record.strip():
+        raise UnsupportedShapeError('新建回执的 newRecordIds 不是非空字符串')
+    return record
